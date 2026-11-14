@@ -10,6 +10,10 @@
 // signed_in} once ytcfg has INNERTUBE_CONTEXT, and requests sent before that wait in a queue.
 // The answer is {t: "apiresult", req, ok, status, body}, with the raw response text in body.
 //
+// View: {t: "setviewmode", video} switches between the video view (only the player's <video>
+// fills the webview) and the full page. The video view is applied only while a player exists, so
+// a page without one (sign-in, say) always shows in full. See applyView below.
+//
 // Audio is not handled here on macOS: the EQ and the analyser run in Rust on a Core Audio tap of
 // the WebKit process. There is no Web Audio graph in this file.
 (() => {
@@ -28,6 +32,9 @@
     statsAt: 0,
     video: null,
     timer: null,
+    viewMode: true,
+    keepRoot: null,
+    markedAt: 0,
   });
 
   // TODO(windows): attach the Web Audio EQ graph here, once the Windows backend lands:
@@ -96,9 +103,86 @@
     });
   };
 
+  // ---- View ------------------------------------------------------------------------------------
+
+  // The video view hides everything with `visibility` (keeps layout, so nothing reflows), then
+  // shows the player's subtree and its ancestors again. Those are marked with KEEP. The rule for
+  // hidden elements is `body *`, so an element inside a marked subtree is shown only if it is
+  // marked too, which markView does. Only the outline of the page is marked, not its siblings.
+  const KEEP = "data-tubeamp-keep";
+  const VIEW_STYLE_ID = "tubeamp-view-style";
+  const VIEW_CSS = `
+html.tubeamp-video,
+html.tubeamp-video body { background: #000 !important; overflow: hidden !important; }
+html.tubeamp-video body * { visibility: hidden !important; }
+html.tubeamp-video [${KEEP}] { visibility: visible !important; background: transparent !important; }
+html.tubeamp-video #movie_player,
+html.tubeamp-video video {
+  position: fixed !important; top: 0 !important; left: 0 !important;
+  width: 100vw !important; height: 100vh !important;
+  max-width: none !important; max-height: none !important;
+  margin: 0 !important; transform: none !important;
+  z-index: 2147483000 !important; background: #000 !important;
+}
+html.tubeamp-video video { object-fit: contain !important; }
+`;
+
+  const parentOf = (el) => el.parentElement || (el.parentNode && el.parentNode.host) || null;
+
+  const clearView = () => {
+    for (const el of document.querySelectorAll(`[${KEEP}]`)) el.removeAttribute(KEEP);
+  };
+
+  const markView = (root) => {
+    clearView();
+    for (let el = root; el && el !== document.documentElement; el = parentOf(el)) {
+      el.setAttribute(KEEP, "");
+    }
+    for (const el of root.querySelectorAll("*")) el.setAttribute(KEEP, "");
+    root.setAttribute(KEEP, "");
+  };
+
+  // Brings the page in line with T.viewMode. Cheap enough for every tick: it re-marks the player
+  // when the player element changes, and at least once a second.
+  const applyView = () => {
+    const root = document.documentElement;
+    if (!root) return;
+    if (!document.getElementById(VIEW_STYLE_ID)) {
+      const style = document.createElement("style");
+      style.id = VIEW_STYLE_ID;
+      style.textContent = VIEW_CSS;
+      (document.head || root).appendChild(style);
+    }
+    const keepRoot = T.viewMode
+      ? document.getElementById("movie_player") || document.querySelector("video")
+      : null;
+    if (keepRoot) {
+      const now = Date.now();
+      if (keepRoot !== T.keepRoot || now - T.markedAt > 1000) {
+        markView(keepRoot);
+        T.keepRoot = keepRoot;
+        T.markedAt = now;
+      }
+    } else if (T.keepRoot) {
+      clearView();
+      T.keepRoot = null;
+    }
+    root.classList.toggle("tubeamp-video", !!keepRoot);
+  };
+
+  // Escape goes to the page while the webview has focus. Rust uses it to leave fullscreen.
+  document.addEventListener(
+    "keydown",
+    (e) => {
+      if (e.key === "Escape") post({ t: "escape" });
+    },
+    true
+  );
+
   const tick = () => {
     let ps = null;
     try {
+      applyView();
       watchVideo();
       const msg = snapshot(player(), Date.now());
       ps = msg.ps;
@@ -194,6 +278,15 @@
   T.cmd = (c) => {
     if (c.t === "api") {
       request(c);
+      return;
+    }
+    if (c.t === "setviewmode") {
+      T.viewMode = !!c.video;
+      try {
+        applyView();
+      } catch (e) {
+        post({ t: "error", where: "cmd:setviewmode", msg: String(e) });
+      }
       return;
     }
     const p = player();

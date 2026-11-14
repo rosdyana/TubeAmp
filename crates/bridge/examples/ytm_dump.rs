@@ -358,7 +358,7 @@ impl ApplicationHandler<Evt> for Capture {
                 }
                 self.advance(event_loop);
             }
-            Evt::State { .. } | Evt::Ended | Evt::Error { .. } => {}
+            Evt::State { .. } | Evt::Ended | Evt::Escape | Evt::Error { .. } => {}
         }
     }
 

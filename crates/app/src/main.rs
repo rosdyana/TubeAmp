@@ -35,9 +35,10 @@ use tubeamp_skin::Skin;
 use tubeamp_ui::eq_window as eqw;
 use tubeamp_ui::playlist_window::PlaylistWindowState;
 use tubeamp_ui::playlist_window::{self as plw, MAX_STEPS};
+use tubeamp_ui::video_window::{self as vw, VideoWindowState};
 use tubeamp_ui::{
-    render_eq, render_library, render_main, render_playlist, Canvas, LibraryState, MainState,
-    PlMenu, HEIGHT, WIDTH,
+    render_eq, render_library, render_main, render_playlist, render_video_frame, Canvas,
+    LibraryState, MainState, PlMenu, HEIGHT, WIDTH,
 };
 
 /// The built-in default skin (TubeAmp Classic), embedded at build time.
@@ -53,10 +54,13 @@ const USAGE: &str = "usage:
   tubeamp --render-eq SKIN.wsz OUT.png [--zoom N] [--eq-preset NAME]
   tubeamp --render-pl SKIN.wsz OUT.png [--zoom N] [--size-steps SX,SY] [--open-menu add|rem|sel|misc|list]
   tubeamp --render-library SKIN.wsz OUT.png [--zoom N] [--fixture PATH.json]
+  tubeamp --render-video SKIN.wsz OUT.png [--zoom N] [--size WxH]
 
   --zoom N                 integer scale of the 275x116 window (1..=8, default 1)
   --screenshot-after S F   save the live main window (2x) to F after S seconds, and the
-                           equalizer (2x) to F-eq.png and the playlist to F-pl.png when open
+                           equalizer (2x) to F-eq.png and the playlist to F-pl.png when open,
+                           the video frame to F-video.png and the real video window (macOS,
+                           screencapture) to F-video-live.png when it is showing
   --quit-after S           exit after S seconds
   --open-eq                open the equalizer window below the main window at startup
   --eq-preset NAME         apply a built-in EQ preset (e.g. \"Rock\") at startup or in a render
@@ -67,10 +71,17 @@ const USAGE: &str = "usage:
   --open-library           open the media library window at startup (Alt+L toggles it)
   --library-search QUERY   run QUERY in the media library once the page is ready
   --fixture PATH.json      with --render-library: a captured response to render instead
+  --open-video             open the video window at startup (Alt+V toggles it)
+  --video-mode MODE        video (default: only the video shows) or browser (the whole
+                           YouTube Music page, and a larger window)
+  --size WxH               with --render-video: the frame size in skin pixels (default 275x232)
 
 environment:
   TUBEAMP_AUTOLOAD=ID      load YouTube video ID six seconds after start
   TUBEAMP_LOG=1            print bridge events and state changes to stderr";
+
+/// The info line a headless `--render-video` shows under the frame (a fake track).
+const RENDER_VIDEO_INFO: &str = "Luis Fonsi - Despacito";
 
 /// Time shown by the headless render, in seconds (01:23).
 const RENDER_TIME_SECS: u32 = 83;
@@ -94,6 +105,11 @@ struct Args {
     open_pl: bool,
     add: Vec<String>,
     eq_preset: Option<Preset>,
+    render_video: Option<(PathBuf, PathBuf)>,
+    /// `--size WxH` for `--render-video`, in skin pixels.
+    size: Option<(u32, u32)>,
+    open_video: bool,
+    video_browser: bool,
     help: bool,
 }
 
@@ -148,6 +164,36 @@ fn parse_steps(value: &str) -> Result<(u32, u32), String> {
         Ok(n)
     };
     Ok((parse(sx)?, parse(sy)?))
+}
+
+/// Parses `--video-mode`: `video` or `browser`. Returns true for the browser view.
+fn parse_video_mode(value: &str) -> Result<bool, String> {
+    match value {
+        "video" => Ok(false),
+        "browser" => Ok(true),
+        other => Err(format!("--video-mode takes video or browser, got {other}")),
+    }
+}
+
+/// Parses `WxH` for `--size`: the frame size in skin pixels, at least the frame's minimum.
+fn parse_frame_size(value: &str) -> Result<(u32, u32), String> {
+    let (w, h) = value
+        .split_once(['x', 'X'])
+        .ok_or_else(|| format!("--size needs WxH, got {value}"))?;
+    let parse = |v: &str| -> Result<u32, String> {
+        v.trim()
+            .parse()
+            .map_err(|_| format!("invalid --size value: {value}"))
+    };
+    let (w, h) = (parse(w)?, parse(h)?);
+    if w < vw::MIN_W || h < vw::MIN_H {
+        return Err(format!(
+            "--size must be at least {}x{}, got {value}",
+            vw::MIN_W,
+            vw::MIN_H
+        ));
+    }
+    Ok((w, h))
 }
 
 /// Parses `--add`: comma-separated video ids or YouTube links.
@@ -208,6 +254,20 @@ fn parse_args(mut args: impl Iterator<Item = String>) -> Result<Args, String> {
                 out.add.extend(parse_add(&value)?);
             }
             "--open-eq" => out.open_eq = true,
+            "--render-video" => {
+                let skin = next_path(&mut args, "--render-video")?;
+                let png = next_path(&mut args, "--render-video")?;
+                out.render_video = Some((skin, png));
+            }
+            "--size" => {
+                let value = args.next().ok_or("--size needs WxH")?;
+                out.size = Some(parse_frame_size(&value)?);
+            }
+            "--open-video" => out.open_video = true,
+            "--video-mode" => {
+                let value = args.next().ok_or("--video-mode needs video or browser")?;
+                out.video_browser = parse_video_mode(&value)?;
+            }
             "--eq-preset" => {
                 let name = args.next().ok_or("--eq-preset needs a preset name")?;
                 let preset = presets::find(&name).ok_or_else(|| {
@@ -320,6 +380,24 @@ fn run() -> Result<(), Box<dyn Error>> {
         return Ok(());
     }
 
+    if let Some((skin_path, png_path)) = args.render_video {
+        let skin = Skin::load_path(&skin_path)?;
+        let (w, h) = args.size.unwrap_or((vw::DEFAULT_W, vw::DEFAULT_H));
+        let state = VideoWindowState {
+            w,
+            h,
+            focused: true,
+            pressed: None,
+            info_text: RENDER_VIDEO_INFO.to_string(),
+        };
+        let mut canvas = Canvas::new(w, h);
+        render_video_frame(&skin, &state, &mut canvas);
+        let pixels = skinned::scaled(&canvas, zoom);
+        save_png(&pixels, w * zoom, h * zoom, &png_path)?;
+        println!("wrote {}", png_path.display());
+        return Ok(());
+    }
+
     if let Some((skin_path, png_path)) = args.render_pl {
         let skin = Skin::load_path(&skin_path)?;
         let steps = args.size_steps.unwrap_or(plw::DEFAULT_STEPS);
@@ -355,6 +433,8 @@ fn run() -> Result<(), Box<dyn Error>> {
         eq_preset: args.eq_preset,
         open_library: args.open_library,
         library_search: args.library_search,
+        open_video: args.open_video,
+        video_browser: args.video_browser,
     };
     window::run(skin, options)?;
     Ok(())
@@ -367,5 +447,27 @@ fn main() -> ExitCode {
             eprintln!("tubeamp: {e}");
             ExitCode::FAILURE
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn frame_sizes_parse_and_respect_the_minimum() {
+        assert_eq!(parse_frame_size("350x260"), Ok((350, 260)));
+        assert_eq!(parse_frame_size("275X232"), Ok((275, 232)));
+        assert!(parse_frame_size("200x260").is_err());
+        assert!(parse_frame_size("350x100").is_err());
+        assert!(parse_frame_size("350").is_err());
+        assert!(parse_frame_size("widexhigh").is_err());
+    }
+
+    #[test]
+    fn video_modes_parse_to_the_browser_flag() {
+        assert_eq!(parse_video_mode("video"), Ok(false));
+        assert_eq!(parse_video_mode("browser"), Ok(true));
+        assert!(parse_video_mode("both").is_err());
     }
 }

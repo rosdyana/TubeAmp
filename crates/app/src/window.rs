@@ -3,10 +3,10 @@
 //! wired together. The playlist decides what plays next: the main window's previous and next
 //! buttons, Z and B, and the end of each track all go through it.
 //!
-//! The bridge webview lives in a hidden host window. The Eject button and the L key show it.
+//! The bridge webview is a child of the video window. The Eject button, the L key and Alt+V show
+//! and hide that window. Closing it only hides it, so the playback goes on.
 
 use std::path::{Path, PathBuf};
-use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 use tubeamp_audio::vis::{Vis, VisFrame};
@@ -21,6 +21,7 @@ use tubeamp_ui::gen_window as gen;
 use tubeamp_ui::library_window as lw;
 use tubeamp_ui::main_window::{BALANCE, CLUTTER_O, POSITION, VOLUME};
 use tubeamp_ui::playlist_window as plw;
+use tubeamp_ui::video_window::{self as vw, VideoHit, VideoWindowState};
 use tubeamp_ui::{
     displayed_secs, hit_test_eq, hit_test_library, hit_test_main, hit_test_playlist, labels,
     marquee_period_px, menu_button_rect, press_grab, render_eq, render_library, render_main,
@@ -34,13 +35,13 @@ use winit::event::{ElementState, KeyEvent, MouseButton, MouseScrollDelta, Window
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
 use winit::keyboard::{Key, ModifiersState, NamedKey};
 use winit::platform::modifier_supplement::KeyEventExtModifierSupplement;
-use winit::window::{WindowAttributes, WindowId};
+use winit::window::{Fullscreen, WindowAttributes, WindowId};
 
 use crate::eq::{self, EqCommand};
 use crate::library::{self, Action, LibCommand, Library};
-use crate::player::{Playback, FALLBACK_KHZ};
+use crate::player::{Playback, RateMeter, FALLBACK_KHZ};
 use crate::playlist::{self as pl_app, PlAction, SortCommand};
-use crate::skinned::{self, scaled, SharedWindow, SkinnedWindow};
+use crate::skinned::{self, scaled, SkinnedWindow};
 
 /// Marquee step: one character cell, as in Webamp's `Marquee.tsx`.
 const MARQUEE_STEP_PX: u32 = 5;
@@ -58,9 +59,11 @@ const AUTOLOAD_DELAY: Duration = Duration::from_secs(6);
 const SEEK_STEP_SECS: f64 = 5.0;
 /// Arrow-key volume step (the plan's ±2).
 const VOLUME_STEP: i32 = 2;
-/// Host window size (logical pixels).
-const HOST_WIDTH: f64 = 480.0;
-const HOST_HEIGHT: f64 = 360.0;
+/// The 1× and 2× buttons' content sizes, in skin pixels (the video itself, not the frame).
+const VIDEO_1X: (u32, u32) = (320, 180);
+const VIDEO_2X: (u32, u32) = (640, 360);
+/// The browser view makes the video window at least this big on screen (logical pixels).
+const BROWSER_MIN: (u32, u32) = (800, 600);
 /// Two clicks on the same playlist row this close together play it.
 const DOUBLE_CLICK: Duration = Duration::from_millis(500);
 /// Rows scrolled per wheel notch, as Winamp does.
@@ -92,6 +95,10 @@ pub struct Options {
     pub open_library: bool,
     /// Run this search in the media library once the page is ready.
     pub library_search: Option<String>,
+    /// Show the video window at startup.
+    pub open_video: bool,
+    /// Start the video window in the browser view (the full YouTube Music page), not video only.
+    pub video_browser: bool,
 }
 
 /// Events posted to the event loop from outside it.
@@ -119,6 +126,13 @@ enum Drag {
 struct EqDrag {
     slider: EqSlider,
     grab: f64,
+}
+
+/// A video window resize in progress: the size at the press, and where the pointer was.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct VideoResize {
+    start: (u32, u32),
+    start_cursor: PhysicalPosition<f64>,
 }
 
 /// A media library drag in progress.
@@ -192,10 +206,25 @@ struct App {
     /// Whether the current entry's end has already moved the playlist on. Cleared once the entry
     /// is seen playing again, so a late end report cannot skip a track twice.
     ended_done: bool,
-    // Dropped before `host`, because the webview is a child of the host window.
+    // Dropped before `video`, because the webview is a child of the video window.
     bridge: Option<Bridge>,
-    host: Option<SharedWindow>,
-    host_visible: bool,
+    /// The video window, which hosts the webview. It is a skinned frame; closing it hides it.
+    video: Option<SkinnedWindow>,
+    video_visible: bool,
+    /// Whether the video window has been placed beside the main window (on its first show).
+    video_placed: bool,
+    /// The video frame's size, focus, pressed control and info line.
+    video_state: VideoWindowState,
+    /// The video frame's control under a press that has not been released yet.
+    video_press: Option<VideoHit>,
+    video_resize: Option<VideoResize>,
+    /// Whether the page shows the whole YouTube Music page (the browser view) instead of the video.
+    video_browser: bool,
+    /// The video window's size before the browser view enlarged it.
+    video_saved_size: Option<(u32, u32)>,
+    video_fullscreen: bool,
+    /// Gaps between the bridge's state updates, for the log.
+    state_rate: RateMeter,
     audio: Option<AudioEngine>,
     audio_given_up: bool,
     audio_error_shown: bool,
@@ -268,8 +297,17 @@ pub fn run(skin: Skin, opts: Options) -> Result<(), winit::error::EventLoopError
         rng: fastrand::Rng::new(),
         ended_done: false,
         bridge: None,
-        host: None,
-        host_visible: false,
+        video: None,
+        video_visible: false,
+        video_placed: false,
+        video_state: VideoWindowState::default(),
+        video_press: None,
+        video_resize: None,
+        // Set in `resumed`, which can only send the view to a page that exists.
+        video_browser: false,
+        video_saved_size: None,
+        video_fullscreen: false,
+        state_rate: RateMeter::default(),
         audio: None,
         audio_given_up: false,
         audio_error_shown: false,
@@ -340,6 +378,11 @@ impl App {
         if self.lib_visible {
             if let Some(lib) = &self.lib {
                 lib.request_redraw();
+            }
+        }
+        if self.video_visible {
+            if let Some(video) = &self.video {
+                video.request_redraw();
             }
         }
     }
@@ -486,7 +529,7 @@ impl App {
                 MainButton::Pause => self.send(Cmd::Pause),
                 MainButton::Stop => self.send(Cmd::Stop),
                 MainButton::Next => self.next_track(),
-                MainButton::Eject => self.toggle_host(),
+                MainButton::Eject => self.toggle_video(),
                 MainButton::Shuffle => self.state.shuffle = !self.state.shuffle,
                 MainButton::Repeat => self.state.repeat = !self.state.repeat,
                 MainButton::EqToggle => self.toggle_eq(),
@@ -527,20 +570,27 @@ impl App {
             self.request_redraw();
             return;
         }
-        // Alt+L opens the media library (Winamp's shortcut). Other Alt keys are left alone.
-        if self.modifiers.alt_key()
-            && !event.repeat
-            && matches!(event.key_without_modifiers(), Key::Character(c) if c.eq_ignore_ascii_case("l"))
-        {
-            self.toggle_library();
-            self.request_redraw();
-            return;
+        // Alt+L opens the media library and Alt+V the video window (Winamp's shortcuts). Other Alt
+        // keys are left alone.
+        if self.modifiers.alt_key() && !event.repeat {
+            let key = event.key_without_modifiers();
+            if matches!(&key, Key::Character(c) if c.eq_ignore_ascii_case("l")) {
+                self.toggle_library();
+                self.request_redraw();
+                return;
+            }
+            if matches!(&key, Key::Character(c) if c.eq_ignore_ascii_case("v")) {
+                self.toggle_video();
+                self.request_redraw();
+                return;
+            }
         }
         match event.key_without_modifiers() {
             Key::Named(NamedKey::ArrowLeft) => self.seek_relative(-SEEK_STEP_SECS),
             Key::Named(NamedKey::ArrowRight) => self.seek_relative(SEEK_STEP_SECS),
             Key::Named(NamedKey::ArrowUp) => self.nudge_volume(VOLUME_STEP),
             Key::Named(NamedKey::ArrowDown) => self.nudge_volume(-VOLUME_STEP),
+            Key::Named(NamedKey::Escape) if self.video_fullscreen => self.toggle_video_fullscreen(),
             _ if event.repeat => return,
             Key::Character(c) => match c.to_ascii_lowercase().as_str() {
                 "z" => self.prev_track(),
@@ -548,7 +598,7 @@ impl App {
                 "c" => self.send(Cmd::Pause),
                 "v" => self.send(Cmd::Stop),
                 "b" => self.next_track(),
-                "l" => self.toggle_host(),
+                "l" => self.toggle_video(),
                 _ => return,
             },
             _ => return,
@@ -556,8 +606,8 @@ impl App {
         self.request_redraw();
     }
 
-    /// Doubles (or halves) both windows. The docked equalizer follows the main window's new
-    /// bottom edge in `on_main_resized`.
+    /// Doubles (or halves) the windows. The docked equalizer follows the main window's new bottom
+    /// edge in `on_main_resized`.
     fn set_doubled(&mut self, on: bool) {
         let zoom = if on { 2 } else { 1 };
         self.state.doubled = on;
@@ -573,22 +623,11 @@ impl App {
         if let Some(lib) = self.lib.as_mut() {
             lib.set_zoom(zoom);
         }
-        self.request_redraw();
-    }
-
-    fn toggle_host(&mut self) {
-        self.host_visible = !self.host_visible;
-        self.apply_host_visibility();
-    }
-
-    fn apply_host_visibility(&self) {
-        if let Some(host) = &self.host {
-            host.set_visible(self.host_visible);
-            if self.host_visible {
-                host.focus_window();
-            }
+        if let Some(video) = self.video.as_mut() {
+            video.set_zoom(zoom);
         }
-        self.log(format!("video host visible = {}", self.host_visible));
+        self.update_video_bounds();
+        self.request_redraw();
     }
 
     // Playlist window.
@@ -867,7 +906,7 @@ impl App {
             PlTransport::Pause => self.send(Cmd::Pause),
             PlTransport::Stop => self.send(Cmd::Stop),
             PlTransport::Next => self.next_track(),
-            PlTransport::Eject => self.toggle_host(),
+            PlTransport::Eject => self.toggle_video(),
         }
     }
 
@@ -1596,6 +1635,297 @@ impl App {
         }
     }
 
+    // Video window.
+
+    /// The video frame's control under the pointer.
+    fn video_hit_under_cursor(&self) -> Option<VideoHit> {
+        let (x, y) = self.video.as_ref()?.skin_pixel()?;
+        vw::hit_test_video(x, y, self.video_state.w, self.video_state.h)
+    }
+
+    /// The video window's zoom (1 or 2), or 1 before the window exists.
+    fn video_zoom(&self) -> u32 {
+        self.video.as_ref().map_or(1, |video| video.zoom())
+    }
+
+    /// Shows the video window. The first time, it goes to the right of the main window.
+    fn show_video(&mut self) {
+        if self.video.is_none() {
+            return;
+        }
+        if !self.video_placed {
+            let place = self.main.as_ref().and_then(|main| {
+                let pos = main.window.outer_position().ok()?;
+                let x = pos.x + main.window.inner_size().width as i32 + 8;
+                Some(PhysicalPosition::new(x, pos.y))
+            });
+            if let (Some(place), Some(video)) = (place, self.video.as_ref()) {
+                video.window.set_outer_position(place);
+            }
+            self.video_placed = true;
+        }
+        if let Some(video) = self.video.as_ref() {
+            video.window.set_visible(true);
+        }
+        self.video_visible = true;
+        self.update_video_bounds();
+        self.request_redraw();
+    }
+
+    /// Hides the video window. The page keeps playing: the window is only hidden, and it is
+    /// kept out of fullscreen first, so a hidden window never stays fullscreen.
+    fn hide_video(&mut self) {
+        if self.video_fullscreen {
+            self.toggle_video_fullscreen();
+        }
+        self.video_visible = false;
+        self.video_press = None;
+        self.video_resize = None;
+        self.video_state.pressed = None;
+        if let Some(video) = self.video.as_ref() {
+            video.window.set_visible(false);
+        }
+        self.request_redraw();
+    }
+
+    fn toggle_video(&mut self) {
+        if self.video_visible {
+            self.hide_video();
+        } else {
+            self.show_video();
+        }
+    }
+
+    /// Sets the video frame's size in skin pixels. The window and the webview follow.
+    fn set_video_size(&mut self, size: (u32, u32)) {
+        let (w, h) = vw::clamp_size(size.0 as i32, size.1 as i32);
+        self.video_state.w = w;
+        self.video_state.h = h;
+        if let Some(video) = self.video.as_mut() {
+            video.set_base((w, h));
+        }
+        self.update_video_bounds();
+        self.request_redraw();
+    }
+
+    /// Puts the webview where the frame's content area is, in logical pixels of the video window.
+    /// In fullscreen it covers the whole screen instead.
+    fn update_video_bounds(&self) {
+        let (Some(bridge), Some(video)) = (self.bridge.as_ref(), self.video.as_ref()) else {
+            return;
+        };
+        let (x, y, w, h) = if self.video_fullscreen {
+            let size = video
+                .window
+                .inner_size()
+                .to_logical::<f64>(video.window.scale_factor());
+            (0.0, 0.0, size.width, size.height)
+        } else {
+            let zoom = f64::from(video.zoom());
+            let r = vw::content_rect(self.video_state.w, self.video_state.h);
+            (
+                f64::from(r.x) * zoom,
+                f64::from(r.y) * zoom,
+                f64::from(r.w) * zoom,
+                f64::from(r.h) * zoom,
+            )
+        };
+        if let Err(e) = bridge.set_bounds(x, y, w, h) {
+            eprintln!("tubeamp: could not place the YouTube Music view: {e}");
+        }
+    }
+
+    /// Fullscreen for the video window (borderless). Esc leaves it.
+    fn toggle_video_fullscreen(&mut self) {
+        let Some(video) = self.video.as_ref() else {
+            return;
+        };
+        self.video_fullscreen = !self.video_fullscreen;
+        let mode = self
+            .video_fullscreen
+            .then_some(Fullscreen::Borderless(None));
+        video.window.set_fullscreen(mode);
+        self.update_video_bounds();
+        self.request_redraw();
+    }
+
+    /// Switches the page between the video view and the browser view, and tells the page. The
+    /// browser view makes the window at least 800 × 600 on screen, and leaving it restores the
+    /// size it had.
+    fn set_video_browser(&mut self, browser: bool) {
+        if browser && !self.video_browser {
+            self.video_saved_size = Some((self.video_state.w, self.video_state.h));
+            let zoom = self.video_zoom();
+            let min_w = BROWSER_MIN.0.div_ceil(zoom);
+            let min_h = BROWSER_MIN.1.div_ceil(zoom);
+            let size = (self.video_state.w.max(min_w), self.video_state.h.max(min_h));
+            self.set_video_size(size);
+        } else if !browser && self.video_browser {
+            if let Some(size) = self.video_saved_size.take() {
+                self.set_video_size(size);
+            }
+        }
+        self.video_browser = browser;
+        self.send(Cmd::SetViewMode { video: !browser });
+    }
+
+    /// Runs the bottom button `index` of the video frame.
+    fn video_button(&mut self, index: usize) {
+        match index {
+            0 => self.toggle_video_fullscreen(),
+            1 => {
+                let (w, h) = vw::window_for_content(VIDEO_1X.0, VIDEO_1X.1);
+                self.set_video_size((w, h));
+            }
+            2 => {
+                let (w, h) = vw::window_for_content(VIDEO_2X.0, VIDEO_2X.1);
+                self.set_video_size((w, h));
+            }
+            // The TV/misc button has no action yet.
+            3 => {}
+            _ => {
+                let browser = !self.video_browser;
+                self.set_video_browser(browser);
+            }
+        }
+    }
+
+    fn on_video_press(&mut self) {
+        let hit = self.video_hit_under_cursor();
+        self.video_press = hit;
+        self.video_state.pressed = match hit {
+            Some(VideoHit::Close | VideoHit::Button(_)) => hit,
+            _ => None,
+        };
+        match hit {
+            Some(VideoHit::TitleBar) => {
+                if let Some(video) = self.video.as_ref() {
+                    if let Err(e) = video.window.drag_window() {
+                        eprintln!("tubeamp: video window drag failed: {e}");
+                    }
+                }
+            }
+            Some(VideoHit::Resize) => {
+                let start = (self.video_state.w, self.video_state.h);
+                if let Some(cursor) = self.video.as_ref().and_then(|v| v.cursor_position()) {
+                    self.video_resize = Some(VideoResize {
+                        start,
+                        start_cursor: cursor,
+                    });
+                }
+            }
+            _ => {}
+        }
+        self.request_redraw();
+    }
+
+    fn on_video_release(&mut self) {
+        let target = self.video_press.take();
+        let hit = self.video_hit_under_cursor();
+        self.video_state.pressed = None;
+        self.video_resize = None;
+        if let Some(target) = target {
+            if Some(target) == hit {
+                self.activate_video(target);
+            }
+        }
+        self.request_redraw();
+    }
+
+    /// Runs the action of a control pressed and released on the same spot.
+    fn activate_video(&mut self, hit: VideoHit) {
+        match hit {
+            VideoHit::Close => self.hide_video(),
+            VideoHit::Button(index) => self.video_button(index),
+            _ => {}
+        }
+    }
+
+    /// Moves the video window's size to the pointer while its corner is dragged. One skin pixel
+    /// per step, as the playlist's resize does, and never below the frame's minimum.
+    fn update_video_resize(&mut self) {
+        let Some(drag) = self.video_resize else {
+            return;
+        };
+        let Some(video) = self.video.as_ref() else {
+            return;
+        };
+        let Some(cursor) = video.cursor_position() else {
+            return;
+        };
+        let factor = f64::from(video.factor());
+        let w = f64::from(drag.start.0) + (cursor.x - drag.start_cursor.x) / factor;
+        let h = f64::from(drag.start.1) + (cursor.y - drag.start_cursor.y) / factor;
+        let size = vw::clamp_size(w.round() as i32, h.round() as i32);
+        if size != (self.video_state.w, self.video_state.h) {
+            self.set_video_size(size);
+        }
+    }
+
+    /// Copies the playing track into the video frame's info line.
+    fn refresh_video_info(&mut self) {
+        self.video_state.info_text =
+            labels::video_info_text(&self.playback.author, &self.playback.title);
+    }
+
+    fn video_canvas(&self) -> Canvas {
+        let mut canvas = Canvas::new(self.video_state.w, self.video_state.h);
+        vw::render_video_frame(&self.skin, &self.video_state, &mut canvas);
+        canvas
+    }
+
+    fn redraw_video(&mut self) {
+        if !self.video_visible {
+            return;
+        }
+        let canvas = self.video_canvas();
+        if let Some(video) = self.video.as_mut() {
+            video.present(&canvas);
+        }
+    }
+
+    fn video_event(&mut self, event: WindowEvent) {
+        match event {
+            // Closing the video window hides it. The playback keeps going.
+            WindowEvent::CloseRequested => self.hide_video(),
+            WindowEvent::RedrawRequested => self.redraw_video(),
+            WindowEvent::Resized(_) | WindowEvent::ScaleFactorChanged { .. } => {
+                self.update_video_bounds();
+                self.request_redraw();
+            }
+            WindowEvent::Focused(focused) => {
+                self.video_state.focused = focused;
+                self.request_redraw();
+            }
+            WindowEvent::ModifiersChanged(modifiers) => self.modifiers = modifiers.state(),
+            WindowEvent::CursorMoved { position, .. } => {
+                if let Some(video) = self.video.as_mut() {
+                    video.set_cursor(Some(position));
+                }
+                if self.video_resize.is_some() {
+                    self.update_video_resize();
+                }
+                self.request_redraw();
+            }
+            WindowEvent::CursorLeft { .. } => {
+                if let Some(video) = self.video.as_mut() {
+                    video.set_cursor(None);
+                }
+                self.request_redraw();
+            }
+            WindowEvent::MouseInput {
+                state,
+                button: MouseButton::Left,
+                ..
+            } => match state {
+                ElementState::Pressed => self.on_video_press(),
+                ElementState::Released => self.on_video_release(),
+            },
+            WindowEvent::KeyboardInput { event, .. } => self.on_key(&event),
+            _ => {}
+        }
+    }
+
     // Equalizer window.
 
     fn toggle_eq(&mut self) {
@@ -1889,8 +2219,15 @@ impl App {
         self.log(format!("event {evt:?}"));
         match &evt {
             Evt::State { .. } => {
+                let now = Instant::now();
+                if let Some(report) = self.state_rate.record(now) {
+                    self.log(format!(
+                        "bridge: {report}; video window visible {}",
+                        self.video_visible
+                    ));
+                }
                 let before = self.playback.clone();
-                self.playback.apply(&evt);
+                self.playback.apply(&evt, now);
                 self.library.set_playing(self.playback.video_id.as_deref());
                 self.log_transitions(&before);
                 // Push the slider's volume to the player once the player exists.
@@ -1906,7 +2243,18 @@ impl App {
                 self.on_track_ended();
             }
             Evt::Error { at, msg } => eprintln!("tubeamp: YouTube Music error at {at}: {msg}"),
+            // Escape reaches us from the page when the webview has focus. It leaves fullscreen.
+            Evt::Escape => {
+                if self.video_fullscreen {
+                    self.toggle_video_fullscreen();
+                }
+            }
             Evt::Ready { signed_in } => {
+                // A page that has just loaded starts in the video view, so tell it the view we
+                // are in (the page was loaded from scratch, or the view was changed earlier).
+                self.send(Cmd::SetViewMode {
+                    video: !self.video_browser,
+                });
                 let actions = self.library.on_ready(*signed_in);
                 self.apply_library(actions);
             }
@@ -2068,10 +2416,11 @@ impl App {
     }
 
     /// Copies playback and drag state into the main window's state.
-    fn refresh_display(&mut self) {
+    fn refresh_display(&mut self, now: Instant) {
         let p = &self.playback;
+        let time = p.time_at(now);
         self.state.status = p.status;
-        self.state.time_secs = p.time_secs;
+        self.state.time_secs = time;
         self.state.duration_secs = p.duration_secs;
         self.state.kbps = p.kbps_for_display().or(self.state.kbps);
         self.state.khz = Some(
@@ -2083,7 +2432,7 @@ impl App {
         self.state.stereo = p.status == Status::Play;
         if !matches!(self.drag, Some(Drag::Position { .. })) {
             self.state.position = if p.duration_secs > 0 {
-                p.time_secs as f32 / p.duration_secs as f32
+                time as f32 / p.duration_secs as f32
             } else {
                 0.0
             };
@@ -2104,6 +2453,7 @@ impl App {
         self.pl_state.mini_time_secs =
             (self.state.status != Status::Stop).then(|| displayed_secs(&self.state));
         self.pl_state.mini_remaining = self.state.remaining_mode;
+        self.refresh_video_info();
     }
 
     fn try_start_audio(&mut self, now: Instant) {
@@ -2219,6 +2569,28 @@ impl App {
                 &suffixed_path(path, "lib"),
             );
         }
+        if self.video_visible {
+            let canvas = self.video_canvas();
+            save_one(
+                &scaled(&canvas, 2),
+                canvas.w * 2,
+                canvas.h * 2,
+                &suffixed_path(path, "video"),
+            );
+            // The real window, webview included. Needs the window number (macOS) and the screen
+            // recording permission for the terminal.
+            if let Some(number) = self
+                .video
+                .as_ref()
+                .and_then(|v| skinned::window_number(&v.window))
+            {
+                let live = suffixed_path(path, "video-live");
+                match skinned::capture_window(number, &live) {
+                    Ok(()) => eprintln!("tubeamp: wrote {}", live.display()),
+                    Err(e) => eprintln!("tubeamp: could not capture the video window: {e}"),
+                }
+            }
+        }
     }
 
     fn next_wake(&self, playing: bool) -> Instant {
@@ -2262,7 +2634,7 @@ impl App {
             if playing {
                 self.step_vis();
             }
-            self.refresh_display();
+            self.refresh_display(now);
             self.request_redraw();
             let active = playing || self.drag.is_some() || self.eq_drag.is_some();
             self.next_frame = now + if active { FRAME_ACTIVE } else { FRAME_IDLE };
@@ -2278,25 +2650,6 @@ impl App {
         }
 
         el.set_control_flow(ControlFlow::WaitUntil(self.next_wake(playing)));
-    }
-
-    fn host_event(&mut self, event: WindowEvent) {
-        match event {
-            // Closing the video window hides it. The playback keeps going.
-            WindowEvent::CloseRequested => {
-                self.host_visible = false;
-                self.apply_host_visibility();
-            }
-            WindowEvent::Resized(size) => {
-                if let (Some(bridge), Some(host)) = (&self.bridge, &self.host) {
-                    let logical = size.to_logical::<f64>(host.scale_factor());
-                    if let Err(e) = bridge.set_bounds(logical.width, logical.height) {
-                        eprintln!("tubeamp: could not resize the video view: {e}");
-                    }
-                }
-            }
-            _ => {}
-        }
     }
 
     fn main_event(&mut self, event_loop: &ActiveEventLoop, event: WindowEvent) {
@@ -2447,20 +2800,25 @@ impl ApplicationHandler<UserEvent> for App {
                 }
             };
 
-        let host_attributes = WindowAttributes::default()
+        // The video window is a skinned frame. The webview is its child, filling the content area.
+        let (vid_w, vid_h) = (self.video_state.w, self.video_state.h);
+        let video_attributes = WindowAttributes::default()
             .with_title("TubeAmp Video")
-            .with_inner_size(LogicalSize::new(HOST_WIDTH, HOST_HEIGHT))
-            .with_visible(false);
-        let host: SharedWindow = match event_loop.create_window(host_attributes) {
-            Ok(host) => Rc::new(host),
+            .with_decorations(false)
+            // Not resizable by the OS: the bottom-right corner resizes it, as the playlist does.
+            .with_resizable(false)
+            .with_visible(false)
+            .with_inner_size(LogicalSize::new(vid_w * zoom, vid_h * zoom));
+        let video = match SkinnedWindow::new(event_loop, video_attributes, (vid_w, vid_h), zoom) {
+            Ok(video) => video,
             Err(e) => {
-                eprintln!("tubeamp: could not create the video window: {e}");
+                eprintln!("tubeamp: {e}");
                 event_loop.exit();
                 return;
             }
         };
         let proxy = self.proxy.clone();
-        let bridge = match Bridge::new(&host, move |evt| {
+        let bridge = match Bridge::new(&video.window, move |evt| {
             let _ = proxy.send_event(UserEvent::Bridge(evt));
         }) {
             Ok(bridge) => bridge,
@@ -2470,6 +2828,10 @@ impl ApplicationHandler<UserEvent> for App {
                 return;
             }
         };
+        self.log(format!(
+            "video view: WebKit occlusion detection off = {}",
+            bridge.occlusion_detection_off()
+        ));
 
         self.main_rect = main
             .window
@@ -2478,9 +2840,12 @@ impl ApplicationHandler<UserEvent> for App {
             .map(|p| (p, main.window.inner_size()));
         self.main = Some(main);
         self.eq = Some(eq);
-        self.host = Some(host);
+        self.video = Some(video);
         self.bridge = Some(bridge);
-        self.host_visible = false;
+        self.update_video_bounds();
+        if self.opts.video_browser {
+            self.set_video_browser(true);
+        }
 
         // The audio starts from the flat curve, or from the preset named on the command line.
         self.apply_eq_settings();
@@ -2501,6 +2866,9 @@ impl ApplicationHandler<UserEvent> for App {
         if self.opts.open_library {
             self.show_library();
         }
+        if self.opts.open_video {
+            self.show_video();
+        }
         self.request_redraw();
     }
 
@@ -2517,6 +2885,8 @@ impl ApplicationHandler<UserEvent> for App {
                     self.run_library_command(cmd);
                 } else if id == library::MAIN_LIBRARY {
                     self.show_library();
+                } else if id == library::MAIN_VIDEO {
+                    self.toggle_video();
                 }
             }
         }
@@ -2528,8 +2898,8 @@ impl ApplicationHandler<UserEvent> for App {
         window_id: WindowId,
         event: WindowEvent,
     ) {
-        if self.host.as_ref().is_some_and(|h| h.id() == window_id) {
-            self.host_event(event);
+        if self.video.as_ref().is_some_and(|v| v.id() == window_id) {
+            self.video_event(event);
         } else if self.eq.as_ref().is_some_and(|e| e.id() == window_id) {
             self.eq_event(event);
         } else if self.pl.as_ref().is_some_and(|p| p.id() == window_id) {

@@ -101,6 +101,25 @@ impl Canvas {
         }
     }
 
+    /// Draws a whole sprite stretched to `dw` × `dh` with its top-left corner at `(dx, dy)`,
+    /// nearest neighbour, clipped to the canvas. Used for the stretched remainder tiles.
+    pub fn blit_scaled(&mut self, sv: &SpriteView<'_>, dx: i32, dy: i32, dw: u32, dh: u32) {
+        if sv.w == 0 || sv.h == 0 || dw == 0 || dh == 0 {
+            return;
+        }
+        let x1 = (dx + dw as i32).min(self.w as i32);
+        let y1 = (dy + dh as i32).min(self.h as i32);
+        for y in dy.max(0)..y1 {
+            let sy = (((y - dy) as u64 * u64::from(sv.h)) / u64::from(dh)) as u32;
+            for x in dx.max(0)..x1 {
+                let sx = (((x - dx) as u64 * u64::from(sv.w)) / u64::from(dw)) as u32;
+                let src = sv.pixel(sx.min(sv.w - 1), sy.min(sv.h - 1));
+                let i = (y as u32 * self.w + x as u32) as usize;
+                self.px[i] = composite(src, self.px[i]);
+            }
+        }
+    }
+
     /// Fills a rectangle (clipped to the canvas) with an opaque colour.
     pub fn fill(&mut self, rect: Rect, color: u32) {
         let clip = self.full_clip();
@@ -183,6 +202,27 @@ mod tests {
                 assert_eq!(drawn, inside, "pixel ({x},{y})");
             }
         }
+    }
+
+    #[test]
+    fn blit_scaled_stretches_nearest_neighbour_and_clips() {
+        let skin = testkit::synthetic_skin();
+        let sv = skin
+            .sprite(tubeamp_skin::Sheet::Cbuttons, "MAIN_PLAY_BUTTON")
+            .expect("sprite");
+        // Twice as wide: each source column covers two canvas columns.
+        let mut c = Canvas::new(46, 18);
+        c.blit_scaled(&sv, 0, 0, 46, 18);
+        for x in 0..46u32 {
+            assert_eq!(c.px[x as usize], sv.pixel(x / 2, 0), "column {x}");
+        }
+        // Partly off the canvas: nothing outside is written and nothing panics.
+        let mut small = Canvas::new(10, 10);
+        small.blit_scaled(&sv, 5, -4, 40, 30);
+        assert_eq!(small.px.len(), 100);
+        let mut untouched = Canvas::new(4, 4);
+        untouched.blit_scaled(&sv, 0, 0, 0, 5);
+        assert_eq!(untouched, Canvas::new(4, 4));
     }
 
     #[test]

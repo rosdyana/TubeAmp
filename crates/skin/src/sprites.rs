@@ -2028,7 +2028,146 @@ pub const GEN: &[SpriteRect] = &[
 ];
 
 pub const GENEX: &[SpriteRect] = &[];
-pub const VIDEO: &[SpriteRect] = &[];
+
+// VIDEO.BMP, the classic video window. Added by hand for M5a: these rectangles come from
+// docs/VIDEO-BMP.md (Winamp's classic layout), not from Webamp, which has no video window.
+// The title bar is 20 px tall: row y = 0 when focused and y = 21 when unfocused.
+pub const VIDEO: &[SpriteRect] = &[
+    SpriteRect {
+        name: "VIDEO_TITLE_LEFT",
+        x: 0,
+        y: 0,
+        w: 25,
+        h: 20,
+    },
+    SpriteRect {
+        name: "VIDEO_TITLE_LEFT_INACTIVE",
+        x: 0,
+        y: 21,
+        w: 25,
+        h: 20,
+    },
+    SpriteRect {
+        name: "VIDEO_TITLE_FILL",
+        x: 127,
+        y: 0,
+        w: 25,
+        h: 20,
+    },
+    SpriteRect {
+        name: "VIDEO_TITLE_FILL_INACTIVE",
+        x: 127,
+        y: 21,
+        w: 25,
+        h: 20,
+    },
+    SpriteRect {
+        name: "VIDEO_TITLE",
+        x: 26,
+        y: 0,
+        w: 100,
+        h: 20,
+    },
+    SpriteRect {
+        name: "VIDEO_TITLE_INACTIVE",
+        x: 26,
+        y: 21,
+        w: 100,
+        h: 20,
+    },
+    SpriteRect {
+        name: "VIDEO_TITLE_RIGHT",
+        x: 153,
+        y: 0,
+        w: 25,
+        h: 20,
+    },
+    SpriteRect {
+        name: "VIDEO_TITLE_RIGHT_INACTIVE",
+        x: 153,
+        y: 21,
+        w: 25,
+        h: 20,
+    },
+    SpriteRect {
+        name: "VIDEO_CLOSE_PRESSED",
+        x: 148,
+        y: 42,
+        w: 9,
+        h: 9,
+    },
+    SpriteRect {
+        name: "VIDEO_LEFT",
+        x: 127,
+        y: 42,
+        w: 11,
+        h: 29,
+    },
+    SpriteRect {
+        name: "VIDEO_RIGHT",
+        x: 139,
+        y: 42,
+        w: 8,
+        h: 29,
+    },
+    SpriteRect {
+        name: "VIDEO_BOTTOM_LEFT",
+        x: 0,
+        y: 42,
+        w: 125,
+        h: 38,
+    },
+    SpriteRect {
+        name: "VIDEO_BOTTOM_RIGHT",
+        x: 0,
+        y: 81,
+        w: 125,
+        h: 38,
+    },
+    SpriteRect {
+        name: "VIDEO_BOTTOM_FILL",
+        x: 127,
+        y: 81,
+        w: 25,
+        h: 38,
+    },
+    // Pressed bottom buttons, in the classic order. The normal art is part of VIDEO_BOTTOM_LEFT.
+    SpriteRect {
+        name: "VIDEO_BUTTON_FULLSCREEN_PRESSED",
+        x: 158,
+        y: 42,
+        w: 15,
+        h: 18,
+    },
+    SpriteRect {
+        name: "VIDEO_BUTTON_1X_PRESSED",
+        x: 173,
+        y: 42,
+        w: 15,
+        h: 18,
+    },
+    SpriteRect {
+        name: "VIDEO_BUTTON_2X_PRESSED",
+        x: 188,
+        y: 42,
+        w: 15,
+        h: 18,
+    },
+    SpriteRect {
+        name: "VIDEO_BUTTON_MISC_PRESSED",
+        x: 203,
+        y: 42,
+        w: 15,
+        h: 18,
+    },
+    SpriteRect {
+        name: "VIDEO_BUTTON_OPTIONS_PRESSED",
+        x: 218,
+        y: 42,
+        w: 15,
+        h: 18,
+    },
+];
 pub const MB: &[SpriteRect] = &[];
 
 /// TEXT.BMP glyph cells: `(char, (row, col))`, cells are 5x6 px (Webamp FONT_LOOKUP).
@@ -2209,6 +2348,84 @@ mod tests {
             (0, 30),
             "unknown characters become a space"
         );
+    }
+
+    #[test]
+    fn video_rects_follow_docs_video_bmp() {
+        let r = |name: &str| lookup(Sheet::Video, name).expect(name);
+        // Title bar: focused row 0, unfocused row 21.
+        assert_eq!((r("VIDEO_TITLE_LEFT").x, r("VIDEO_TITLE_LEFT").y), (0, 0));
+        assert_eq!(
+            (
+                r("VIDEO_TITLE_LEFT_INACTIVE").x,
+                r("VIDEO_TITLE_LEFT_INACTIVE").y
+            ),
+            (0, 21)
+        );
+        assert_eq!(r("VIDEO_TITLE").w, 100);
+        assert_eq!(r("VIDEO_TITLE_FILL").x, 127);
+        assert_eq!(r("VIDEO_TITLE_RIGHT").x, 153);
+        assert_eq!(
+            r("VIDEO_CLOSE_PRESSED"),
+            SpriteRect {
+                name: "VIDEO_CLOSE_PRESSED",
+                x: 148,
+                y: 42,
+                w: 9,
+                h: 9
+            }
+        );
+        // Sides and bottom.
+        assert_eq!(
+            r("VIDEO_LEFT"),
+            SpriteRect {
+                name: "VIDEO_LEFT",
+                x: 127,
+                y: 42,
+                w: 11,
+                h: 29
+            }
+        );
+        assert_eq!(
+            r("VIDEO_RIGHT"),
+            SpriteRect {
+                name: "VIDEO_RIGHT",
+                x: 139,
+                y: 42,
+                w: 8,
+                h: 29
+            }
+        );
+        assert_eq!(r("VIDEO_BOTTOM_LEFT").w, 125);
+        assert_eq!(r("VIDEO_BOTTOM_RIGHT").y, 81);
+        assert_eq!(
+            r("VIDEO_BOTTOM_FILL"),
+            SpriteRect {
+                name: "VIDEO_BOTTOM_FILL",
+                x: 127,
+                y: 81,
+                w: 25,
+                h: 38
+            }
+        );
+        // Pressed buttons step by 15 px, starting at x 158.
+        for (i, name) in [
+            "VIDEO_BUTTON_FULLSCREEN_PRESSED",
+            "VIDEO_BUTTON_1X_PRESSED",
+            "VIDEO_BUTTON_2X_PRESSED",
+            "VIDEO_BUTTON_MISC_PRESSED",
+            "VIDEO_BUTTON_OPTIONS_PRESSED",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let b = r(name);
+            assert_eq!(
+                (b.x, b.y, b.w, b.h),
+                (158 + 15 * i as u32, 42, 15, 18),
+                "{name}"
+            );
+        }
     }
 
     #[test]

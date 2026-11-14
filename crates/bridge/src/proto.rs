@@ -26,6 +26,9 @@ pub enum Cmd {
     Volume { level: u8 },
     /// `loadVideoById(video_id)`: load and start a video.
     Load { video_id: String },
+    /// Switches the page between the video view and the full YouTube Music page. `video: true`
+    /// shows only the player's video, filling the view. `false` shows the whole page (browser mode).
+    SetViewMode { video: bool },
     /// Calls YouTube Music's InnerTube `endpoint` (e.g. `"search"`, `"browse"`, `"next"`) from
     /// inside the page with `body` merged over the page's `INNERTUBE_CONTEXT`. Waits until the page
     /// is ready. The answer comes back as `Evt::ApiResult` with the same `req`.
@@ -66,6 +69,9 @@ pub enum Evt {
     },
     /// The current video reached its end (player state 0).
     Ended,
+    /// Escape was pressed while the page had focus. The video window uses it to leave fullscreen,
+    /// since the webview takes the key events once it has focus.
+    Escape,
     /// Something failed in the page. `at` names the place, `msg` is the message.
     Error {
         #[serde(rename = "where")]
@@ -110,6 +116,8 @@ mod tests {
         round_trip_cmd(Cmd::Prev);
         round_trip_cmd(Cmd::Seek { secs: 83.25 });
         round_trip_cmd(Cmd::Volume { level: 75 });
+        round_trip_cmd(Cmd::SetViewMode { video: true });
+        round_trip_cmd(Cmd::SetViewMode { video: false });
         round_trip_cmd(Cmd::Load {
             video_id: "kJQP7kiw5Fk".to_string(),
         });
@@ -164,6 +172,23 @@ mod tests {
     }
 
     #[test]
+    fn set_view_mode_wire_format_matches_bridge_js() {
+        assert_eq!(
+            serde_json::to_string(&Cmd::SetViewMode { video: true }).unwrap(),
+            r#"{"t":"setviewmode","video":true}"#
+        );
+        assert_eq!(
+            serde_json::from_str::<Cmd>(r#"{"t":"setviewmode","video":false}"#).unwrap(),
+            Cmd::SetViewMode { video: false }
+        );
+        assert!(serde_json::from_str::<Cmd>(r#"{"t":"setviewmode"}"#).is_err());
+        assert_eq!(
+            serde_json::from_str::<Evt>(r#"{"t":"escape"}"#).unwrap(),
+            Evt::Escape
+        );
+    }
+
+    #[test]
     fn every_evt_round_trips() {
         round_trip_evt(Evt::State {
             video_id: Some("kJQP7kiw5Fk".to_string()),
@@ -186,6 +211,7 @@ mod tests {
             codec: None,
         });
         round_trip_evt(Evt::Ended);
+        round_trip_evt(Evt::Escape);
         round_trip_evt(Evt::Error {
             at: "cmd:seek".to_string(),
             msg: "boom".to_string(),

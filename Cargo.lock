@@ -3240,6 +3240,7 @@ dependencies = [
  "fastrand",
  "image",
  "muda",
+ "objc2 0.6.5",
  "raw-window-handle",
  "rfd",
  "serde_json",
@@ -3268,6 +3269,7 @@ dependencies = [
 name = "tubeamp-bridge"
 version = "0.0.0"
 dependencies = [
+ "objc2 0.6.5",
  "serde",
  "serde_json",
  "tubeamp-ytm",

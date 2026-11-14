@@ -28,7 +28,9 @@ pub fn sheet_size(sheet: Sheet) -> (u32, u32) {
         Sheet::Eqmain => (275, 315),
         Sheet::EqEx => (275, 60),
         Sheet::Gen => (275, 100),
-        Sheet::Genex | Sheet::Video | Sheet::Mb => (16, 16),
+        // Large enough for every VIDEO.BMP rectangle (the bottom-right piece ends at 250, 119).
+        Sheet::Video => (344, 120),
+        Sheet::Genex | Sheet::Mb => (16, 16),
     }
 }
 

@@ -668,6 +668,8 @@ pub const CMD_ENQUEUE: &str = "lib.enqueue";
 pub const CMD_RADIO: &str = "lib.radio";
 /// The main window's O menu: opens the library.
 pub const MAIN_LIBRARY: &str = "main.library";
+/// The O menu's Video item: shows or hides the video window.
+pub const MAIN_VIDEO: &str = "main.video";
 
 /// Maps a menu id from the library's menus to its command.
 pub fn command_for_id(id: &str) -> Option<LibCommand> {
@@ -701,6 +703,7 @@ pub fn build_main_menu() -> Result<muda::Menu, muda::Error> {
         true,
         None,
     ))?;
+    menu.append(&MenuItem::with_id(MAIN_VIDEO, "Video", true, None))?;
     Ok(menu)
 }
 

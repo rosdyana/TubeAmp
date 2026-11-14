@@ -306,6 +306,17 @@ pub fn render_frame(
         right_x,
         0,
     );
+    // The title box sits on the centre fill (Webamp puts GEN_TOP_CENTER_FILL behind the whole
+    // `.gen-top` row), so the title is not drawn over black.
+    tile_x(
+        skin,
+        canvas,
+        sel("GEN_TOP_CENTER_FILL", "GEN_TOP_CENTER_FILL_SELECTED"),
+        title_x,
+        right_end_x,
+        0,
+        false,
+    );
     draw_title(skin, canvas, font, title, title_x + TITLE_PAD_L);
     gen_piece(skin, canvas, "GEN_CLOSE_SELECTED", w - 11, 3);
 
@@ -600,6 +611,34 @@ mod tests {
             grip.pixel(0, 0),
             "the bottom-right corner piece"
         );
+    }
+
+    #[test]
+    fn title_box_is_tiled_with_the_centre_fill() {
+        let skin = testkit::synthetic_skin();
+        let title = "MEDIA";
+        for focused in [true, false] {
+            let c = render(&skin, (0, 0), title, focused);
+            let box_w = title_width(&skin, title, focused);
+            // The left fill takes what the title does not, split evenly; the left end is 25 px.
+            let fill_l = (275 - 4 * 25 - box_w) / 2;
+            let title_x = 25 + fill_l + 25;
+            let name = if focused {
+                "GEN_TOP_CENTER_FILL_SELECTED"
+            } else {
+                "GEN_TOP_CENTER_FILL"
+            };
+            let fill = skin.sprite(Sheet::Gen, name).expect("fill");
+            // Row 0 is above the letters (they start at y 2), so the fill shows there, across
+            // more than one tile.
+            for x in [title_x, title_x + 25, title_x + box_w - 1] {
+                assert_eq!(
+                    px(&c, x, 0),
+                    fill.pixel((x - title_x) as u32 % 25, 0),
+                    "focused {focused}, x {x}"
+                );
+            }
+        }
     }
 
     #[test]

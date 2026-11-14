@@ -8,6 +8,7 @@ pub mod main_window;
 pub mod playlist_window;
 pub mod sliders;
 pub mod text;
+pub mod video_window;
 pub mod vis;
 
 pub use canvas::{Canvas, Rect};
@@ -27,4 +28,7 @@ pub use playlist_window::{
     PlaylistWindowState,
 };
 pub use text::{draw_text, marquee_frame, marquee_period_px};
+pub use video_window::{
+    hit_test_video, render_video_frame, VideoHit, VideoWindowState,
+};
 pub use vis::{render_vis, VisMode, VIS_RECT};

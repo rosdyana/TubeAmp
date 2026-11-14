@@ -35,6 +35,21 @@ pub fn now_playing_numbered(
     ))
 }
 
+/// The video window's info line: `Artist - Title`, or just the title when there is no artist.
+/// Nothing playing gives the app name, as the main window's marquee does.
+pub fn video_info_text(author: &str, title: &str) -> String {
+    let title = title.trim();
+    if title.is_empty() {
+        return IDLE_TEXT.to_string();
+    }
+    let author = author.trim();
+    if author.is_empty() {
+        title.to_string()
+    } else {
+        format!("{author} - {title}")
+    }
+}
+
 /// While dragging the position bar: `Seek to: mm:ss/mm:ss (pct%)`.
 pub fn seek_text(duration_secs: u32, percent: u32) -> String {
     let elapsed = (u64::from(duration_secs) * u64::from(percent) / 100) as u32;

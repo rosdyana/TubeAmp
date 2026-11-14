@@ -201,6 +201,62 @@ pub fn show_context_menu(
     Err("context menus need macOS or Windows".to_string())
 }
 
+/// The window's number as `screencapture -l` takes it (the CGWindowID), on macOS.
+#[cfg(target_os = "macos")]
+pub fn window_number(window: &Window) -> Option<isize> {
+    use objc2::msg_send;
+    use objc2::runtime::AnyObject;
+    use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+
+    let handle = window.window_handle().ok()?;
+    let RawWindowHandle::AppKit(appkit) = handle.as_raw() else {
+        return None;
+    };
+    let view = appkit.ns_view.as_ptr().cast::<AnyObject>();
+    // SAFETY: the NSView belongs to `window`, which is alive here, and this runs on the main
+    // thread that owns the view. Both messages are plain getters.
+    unsafe {
+        let view: &AnyObject = &*view;
+        let ns_window: *mut AnyObject = msg_send![view, window];
+        if ns_window.is_null() {
+            return None;
+        }
+        let number: isize = msg_send![&*ns_window, windowNumber];
+        Some(number)
+    }
+}
+
+/// Other platforms have no window numbers for `screencapture`.
+#[cfg(not(target_os = "macos"))]
+pub fn window_number(_window: &Window) -> Option<isize> {
+    None
+}
+
+/// Saves one window to `path` with macOS's `screencapture`, which includes the webview. The
+/// capture needs the screen recording permission for the terminal or app that runs TubeAmp.
+#[cfg(target_os = "macos")]
+pub fn capture_window(number: isize, path: &std::path::Path) -> Result<(), String> {
+    let status = std::process::Command::new("screencapture")
+        .arg("-x")
+        .arg("-o")
+        .arg("-l")
+        .arg(number.to_string())
+        .arg(path)
+        .status()
+        .map_err(|e| format!("could not run screencapture: {e}"))?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!("screencapture exited with {status}"))
+    }
+}
+
+/// Window capture is macOS only.
+#[cfg(not(target_os = "macos"))]
+pub fn capture_window(_number: isize, _path: &std::path::Path) -> Result<(), String> {
+    Err("window capture needs macOS".to_string())
+}
+
 /// Centres `size` pixels within `total`, cropping if it does not fit.
 /// Returns `(offset, visible)`. Shared by presentation and cursor mapping.
 fn fit(total: u32, size: u32) -> (u32, u32) {

@@ -1,10 +1,18 @@
 //! GEN.BMP (194×109): the generic (gen) window frame: title tiles selected (y 0)
 //! and normal (y 21), bottom bars, side pieces and the close pip.
 
+use crate::font;
 use crate::paint::{
-    pip, title_strip, Canvas, Strip, BODY_BOT, BODY_FLAT, BODY_TOP, ICON_CLOSE, INK, METAL_HI,
-    METAL_LO, TITLE_ACTIVE, TITLE_INACTIVE,
+    hex, pip, title_strip, Canvas, Rgb, Strip, BODY_BOT, BODY_FLAT, BODY_TOP, ICON_CLOSE, INK,
+    METAL_HI, METAL_LO, TITLE_ACTIVE, TITLE_INACTIVE,
 };
+
+/// Title letters: row 88 holds the selected (bright) A–Z, row 96 the normal (dim) ones. A
+/// reader splits a row into letters at the single background column between them, so each
+/// letter has a solid top bar across its width, with its glyph below.
+const LETTER_ROWS: [(i32, Rgb); 2] = [(88, hex(0xFFFFFF)), (96, hex(0xB4BAC6))];
+/// The sheet width, which the letter row must fit in.
+const SHEET_W: i32 = 194;
 
 pub fn render() -> Canvas {
     let mut c = Canvas::new(194, 109);
@@ -26,7 +34,38 @@ pub fn render() -> Canvas {
 
     // Close pip (selected) at (148,42).
     pip(&mut c, 148, 42, &ICON_CLOSE, true, INK);
+
+    title_letters(&mut c);
     c
+}
+
+/// Draws the A–Z title letters on rows 88 (selected) and 96 (normal).
+fn title_letters(c: &mut Canvas) {
+    for (row, colour) in LETTER_ROWS {
+        let mut x = 1;
+        for ch in 'A'..='Z' {
+            let rows = font::glyph(ch);
+            let w = glyph_width(&rows) + 1;
+            c.fill(x, row, w, 1, colour); // solid top bar keeps the letter one run
+            for (ry, line) in rows.iter().take(5).enumerate() {
+                for (cx, b) in line.chars().enumerate() {
+                    if b == '#' {
+                        c.set(x + cx as i32, row + 1 + ry as i32, colour);
+                    }
+                }
+            }
+            x += w + 1; // one background column before the next letter
+        }
+        assert!(x - 1 <= SHEET_W, "the 26 letters fit in the sheet width");
+    }
+}
+
+/// Ink width of a glyph in columns.
+fn glyph_width(rows: &font::Glyph) -> i32 {
+    rows.iter()
+        .map(|r| r.rfind('#').map_or(0, |i| i as i32 + 1))
+        .max()
+        .unwrap_or(0)
 }
 
 /// One row of top tiles: left corner, left end, centre fill, right end, the fill that

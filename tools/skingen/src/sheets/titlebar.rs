@@ -3,9 +3,10 @@
 
 use crate::font;
 use crate::paint::{
-    flat_key, glyph, hex, pip, wordmark_bar, Canvas, BODY_BOT, BODY_TOP, GROOVE, ICON_CLOSE,
-    ICON_MENU, ICON_MIN, ICON_SHADE, INK, LCD_ON, METAL_LO, SILVER_BOT, SILVER_HI, SILVER_LO,
-    SILVER_TOP, TITLE_ACTIVE, TITLE_BRONZE_ACTIVE, TITLE_BRONZE_INACTIVE, TITLE_INACTIVE,
+    bevel_sunken, flat_key, glyph, hex, pip, title_strip, wordmark_bar, Canvas, Strip, BODY_BOT,
+    BODY_TOP, GROOVE, ICON_CLOSE, ICON_MENU, ICON_MIN, ICON_SHADE, INK, LCD_BG, LCD_ON, METAL_HI,
+    METAL_LO, SILVER_BOT, SILVER_HI, SILVER_LO, SILVER_TOP, TITLE_ACTIVE, TITLE_BRONZE_ACTIVE,
+    TITLE_BRONZE_INACTIVE, TITLE_INACTIVE,
 };
 
 pub fn render() -> Canvas {
@@ -47,11 +48,11 @@ pub fn render() -> Canvas {
     pip(&mut c, 9, 27, &ICON_SHADE, true, LCD_ON);
 
     // Shade-mode strips: selected at (27,29), normal at (27,42).
-    wordmark_bar(&mut c, 27, 29, 275, 14, &TITLE_ACTIVE, None);
-    wordmark_bar(&mut c, 27, 42, 275, 14, &TITLE_INACTIVE, None);
+    shade_strip(&mut c, 27, 29, &TITLE_ACTIVE);
+    shade_strip(&mut c, 27, 42, &TITLE_INACTIVE);
 
     // Shade position track (0,36) 17×7 and its three thumb pieces.
-    c.frame(0, 36, 17, 7, METAL_LO);
+    bevel_sunken(&mut c, 0, 36, 17, 7);
     c.vgrad(1, 37, 15, 5, GROOVE, hex(0x1A2030));
     c.fill(8, 38, 1, 3, SILVER_BOT);
     shade_thumb(&mut c, 17, 36, true, false);
@@ -68,6 +69,18 @@ pub fn render() -> Canvas {
     lit_key(&mut c, 328, 69, 8, 8, 'd');
     lit_key(&mut c, 336, 77, 8, 7, 'v');
     c
+}
+
+/// A shade-mode strip (275×14) at `(x0, y0)`: a plain title strip with a recessed well for the
+/// mini time (window x 125..=158, rows 3..=10). The TEXT cells are LCD black, so they sit in the
+/// well without a visible box. A colon sits in the gap between the minute and second digits.
+fn shade_strip(c: &mut Canvas, x0: i32, y0: i32, s: &Strip) {
+    title_strip(c, x0, y0, 275, 14, s);
+    let (wx, wy) = (x0 + 125, y0 + 3);
+    c.bevel(wx, wy, 34, 8, METAL_LO, METAL_HI);
+    c.fill(wx + 1, wy + 1, 32, 6, LCD_BG);
+    c.set(x0 + 145, y0 + 5, LCD_ON);
+    c.set(x0 + 145, y0 + 8, LCD_ON);
 }
 
 /// One 3×7 piece of the shade-mode thumb: silver with a highlight and shadow line,

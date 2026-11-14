@@ -4,6 +4,7 @@
 //! (MIT, © Jordan Eldredge). See `sprites.rs` and `skin.rs`.
 
 pub mod bitmap;
+pub mod genex;
 pub mod parse;
 pub mod sheet;
 pub mod skin;
@@ -12,6 +13,7 @@ pub mod sprites;
 pub mod testkit;
 
 pub use bitmap::Rgba;
+pub use genex::GenExColors;
 pub use parse::{PlEditColors, Regions};
 pub use sheet::Sheet;
 pub use skin::{Skin, SkinError, SpriteView};

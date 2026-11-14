@@ -1,6 +1,9 @@
 pub mod canvas;
 pub mod eq_window;
+pub mod font;
+pub mod gen_window;
 pub mod labels;
+pub mod library_window;
 pub mod main_window;
 pub mod playlist_window;
 pub mod sliders;
@@ -8,6 +11,9 @@ pub mod text;
 pub mod vis;
 
 pub use canvas::{Canvas, Rect};
+pub use library_window::{
+    hit_test_library, render_library, LibHit, LibKind, LibRow, LibraryState, NavItem, NavKind,
+};
 pub use eq_window::{
     hit_test_eq, press_grab, render_eq, slider_rect, slider_value_at, EqHit, EqSlider,
     EqWindowState, PRESETS_BTN,

@@ -5,6 +5,8 @@
 //! - `tubeamp --render-eq SKIN.wsz OUT.png [--zoom N] [--eq-preset NAME]` renders the equalizer.
 //! - `tubeamp --render-pl SKIN.wsz OUT.png [--zoom N] [--size-steps SX,SY]` renders the playlist
 //!   editor with a sample list.
+//! - `tubeamp --render-library SKIN.wsz OUT.png [--zoom N] [--fixture PATH.json]` renders the media
+//!   library from a captured response (search_daft_punk.json by default), without the network.
 //!
 //! Test hooks: `--screenshot-after SECS OUT.png` saves the live main window (2×) and keeps running,
 //! and the equalizer (`OUT-eq.png`) and playlist (`OUT-pl.png`) too while they are open. `--open-eq`
@@ -13,8 +15,10 @@
 //! `--quit-after SECS` exits after a while, `TUBEAMP_AUTOLOAD=<videoId>` loads a video six seconds
 //! after start, and `TUBEAMP_LOG=1` prints bridge events and state changes to stderr.
 
+mod api;
 mod demo;
 mod eq;
+mod library;
 mod player;
 mod playlist;
 mod skinned;
@@ -29,9 +33,12 @@ use tubeamp_eq::{presets, Preset};
 use tubeamp_playlist::parse_video_id;
 use tubeamp_skin::Skin;
 use tubeamp_ui::eq_window as eqw;
-use tubeamp_ui::playlist_window::{self as plw, MAX_STEPS};
 use tubeamp_ui::playlist_window::PlaylistWindowState;
-use tubeamp_ui::{render_eq, render_main, render_playlist, Canvas, MainState, PlMenu, HEIGHT, WIDTH};
+use tubeamp_ui::playlist_window::{self as plw, MAX_STEPS};
+use tubeamp_ui::{
+    render_eq, render_library, render_main, render_playlist, Canvas, LibraryState, MainState,
+    PlMenu, HEIGHT, WIDTH,
+};
 
 /// The built-in default skin (TubeAmp Classic), embedded at build time.
 const DEFAULT_SKIN: &[u8] = include_bytes!(concat!(
@@ -45,6 +52,7 @@ const USAGE: &str = "usage:
   tubeamp --render-main SKIN.wsz OUT.png [--zoom N]
   tubeamp --render-eq SKIN.wsz OUT.png [--zoom N] [--eq-preset NAME]
   tubeamp --render-pl SKIN.wsz OUT.png [--zoom N] [--size-steps SX,SY] [--open-menu add|rem|sel|misc|list]
+  tubeamp --render-library SKIN.wsz OUT.png [--zoom N] [--fixture PATH.json]
 
   --zoom N                 integer scale of the 275x116 window (1..=8, default 1)
   --screenshot-after S F   save the live main window (2x) to F after S seconds, and the
@@ -56,6 +64,9 @@ const USAGE: &str = "usage:
   --add ID1,ID2,...        append YouTube videos (ids or links) to the playlist at startup
   --size-steps SX,SY       playlist size in resize steps (width 275+25*SX, height 116+29*SY)
   --open-menu NAME         with --render-pl: open the add, rem, sel, misc or list popup
+  --open-library           open the media library window at startup (Alt+L toggles it)
+  --library-search QUERY   run QUERY in the media library once the page is ready
+  --fixture PATH.json      with --render-library: a captured response to render instead
 
 environment:
   TUBEAMP_AUTOLOAD=ID      load YouTube video ID six seconds after start
@@ -70,6 +81,10 @@ struct Args {
     render: Option<(PathBuf, PathBuf)>,
     render_eq: Option<(PathBuf, PathBuf)>,
     render_pl: Option<(PathBuf, PathBuf)>,
+    render_library: Option<(PathBuf, PathBuf)>,
+    fixture: Option<PathBuf>,
+    open_library: bool,
+    library_search: Option<String>,
     size_steps: Option<(u32, u32)>,
     open_menu: Option<PlMenu>,
     zoom: Option<u32>,
@@ -109,7 +124,9 @@ fn parse_menu(value: &str) -> Result<PlMenu, String> {
         "sel" => Ok(PlMenu::Select),
         "misc" => Ok(PlMenu::Misc),
         "list" => Ok(PlMenu::List),
-        other => Err(format!("--open-menu takes add, rem, sel, misc or list, got {other}")),
+        other => Err(format!(
+            "--open-menu takes add, rem, sel, misc or list, got {other}"
+        )),
     }
 }
 
@@ -164,12 +181,25 @@ fn parse_args(mut args: impl Iterator<Item = String>) -> Result<Args, String> {
                 let png = next_path(&mut args, "--render-pl")?;
                 out.render_pl = Some((skin, png));
             }
+            "--render-library" => {
+                let skin = next_path(&mut args, "--render-library")?;
+                let png = next_path(&mut args, "--render-library")?;
+                out.render_library = Some((skin, png));
+            }
+            "--fixture" => out.fixture = Some(next_path(&mut args, "--fixture")?),
+            "--open-library" => out.open_library = true,
+            "--library-search" => {
+                let query = args.next().ok_or("--library-search needs a query")?;
+                out.library_search = Some(query);
+            }
             "--size-steps" => {
                 let value = args.next().ok_or("--size-steps needs SX,SY")?;
                 out.size_steps = Some(parse_steps(&value)?);
             }
             "--open-menu" => {
-                let value = args.next().ok_or("--open-menu needs add, rem, sel, misc or list")?;
+                let value = args
+                    .next()
+                    .ok_or("--open-menu needs add, rem, sel, misc or list")?;
                 out.open_menu = Some(parse_menu(&value)?);
             }
             "--open-pl" => out.open_pl = true,
@@ -261,6 +291,35 @@ fn run() -> Result<(), Box<dyn Error>> {
         return Ok(());
     }
 
+    if let Some((skin_path, png_path)) = args.render_library {
+        let skin = Skin::load_path(&skin_path)?;
+        let (name, body) = match &args.fixture {
+            Some(path) => {
+                let body = std::fs::read_to_string(path)?;
+                let name = path
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_default();
+                (name, body)
+            }
+            None => (
+                "search_daft_punk.json".to_string(),
+                library::DEFAULT_FIXTURE.to_string(),
+            ),
+        };
+        let state = LibraryState {
+            focused: true,
+            ..library::fixture_state(&name, &body, library::RENDER_QUERY)?
+        };
+        let (w, h) = tubeamp_ui::gen_window::window_size(state.size_steps);
+        let mut canvas = Canvas::new(w, h);
+        render_library(&skin, &state, &mut canvas);
+        let pixels = skinned::scaled(&canvas, zoom);
+        save_png(&pixels, w * zoom, h * zoom, &png_path)?;
+        println!("wrote {}", png_path.display());
+        return Ok(());
+    }
+
     if let Some((skin_path, png_path)) = args.render_pl {
         let skin = Skin::load_path(&skin_path)?;
         let steps = args.size_steps.unwrap_or(plw::DEFAULT_STEPS);
@@ -294,6 +353,8 @@ fn run() -> Result<(), Box<dyn Error>> {
         open_pl: args.open_pl,
         add: args.add,
         eq_preset: args.eq_preset,
+        open_library: args.open_library,
+        library_search: args.library_search,
     };
     window::run(skin, options)?;
     Ok(())

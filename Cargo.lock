@@ -3242,6 +3242,7 @@ dependencies = [
  "muda",
  "raw-window-handle",
  "rfd",
+ "serde_json",
  "softbuffer",
  "tubeamp-audio",
  "tubeamp-bridge",
@@ -3249,6 +3250,7 @@ dependencies = [
  "tubeamp-playlist",
  "tubeamp-skin",
  "tubeamp-ui",
+ "tubeamp-ytm",
  "winit",
 ]
 

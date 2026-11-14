@@ -17,14 +17,16 @@ use tubeamp_eq::{Preset, BANDS_HZ, BUILTIN};
 use tubeamp_playlist::{Entry, Playlist};
 use tubeamp_skin::Skin;
 use tubeamp_ui::eq_window as eqw;
-use tubeamp_ui::main_window::{BALANCE, POSITION, VOLUME};
+use tubeamp_ui::gen_window as gen;
+use tubeamp_ui::library_window as lw;
+use tubeamp_ui::main_window::{BALANCE, CLUTTER_O, POSITION, VOLUME};
 use tubeamp_ui::playlist_window as plw;
 use tubeamp_ui::{
-    displayed_secs, hit_test_eq, hit_test_main, hit_test_playlist, labels, marquee_period_px,
-    menu_button_rect, press_grab, render_eq, render_main, render_playlist, render_vis,
-    row_index_at, slider_value_at, sliders, Canvas, EqHit, EqSlider, EqWindowState, MainButton,
-    MainHit, MainState, PlHit, PlMenu, PlTransport, PlaylistWindowState, Status, HEIGHT,
-    PRESETS_BTN, WIDTH,
+    displayed_secs, hit_test_eq, hit_test_library, hit_test_main, hit_test_playlist, labels,
+    marquee_period_px, menu_button_rect, press_grab, render_eq, render_library, render_main,
+    render_playlist, render_vis, row_index_at, slider_value_at, sliders, Canvas, EqHit, EqSlider,
+    EqWindowState, LibHit, LibKind, MainButton, MainHit, MainState, PlHit, PlMenu, PlTransport,
+    PlaylistWindowState, Status, HEIGHT, PRESETS_BTN, WIDTH,
 };
 use winit::application::ApplicationHandler;
 use winit::dpi::{LogicalSize, PhysicalPosition, PhysicalSize};
@@ -35,6 +37,7 @@ use winit::platform::modifier_supplement::KeyEventExtModifierSupplement;
 use winit::window::{WindowAttributes, WindowId};
 
 use crate::eq::{self, EqCommand};
+use crate::library::{self, Action, LibCommand, Library};
 use crate::player::{Playback, FALLBACK_KHZ};
 use crate::playlist::{self as pl_app, PlAction, SortCommand};
 use crate::skinned::{self, scaled, SharedWindow, SkinnedWindow};
@@ -85,6 +88,10 @@ pub struct Options {
     pub open_pl: bool,
     /// Video ids (or links, already validated) appended to the playlist at startup.
     pub add: Vec<String>,
+    /// Open the media library window at startup.
+    pub open_library: bool,
+    /// Run this search in the media library once the page is ready.
+    pub library_search: Option<String>,
 }
 
 /// Events posted to the event loop from outside it.
@@ -112,6 +119,18 @@ enum Drag {
 struct EqDrag {
     slider: EqSlider,
     grab: f64,
+}
+
+/// A media library drag in progress.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum LibDrag {
+    /// The scrollbar thumb follows the pointer.
+    Scroll,
+    /// The bottom-right grip resizes the window, as for the playlist.
+    Resize {
+        start_steps: (u32, u32),
+        start_cursor: PhysicalPosition<f64>,
+    },
 }
 
 /// A playlist window drag in progress.
@@ -157,6 +176,17 @@ struct App {
     pl_drag: Option<PlDrag>,
     /// The last row press, for double-click detection.
     pl_click: Option<(usize, Instant)>,
+    /// The media library window, and whether it is showing.
+    lib: Option<SkinnedWindow>,
+    lib_visible: bool,
+    /// Whether the library has been placed beside the main window (on its first show).
+    lib_placed: bool,
+    /// The library's state and requests (see `library.rs`).
+    library: Library,
+    lib_press: Option<LibHit>,
+    lib_drag: Option<LibDrag>,
+    /// The last row press in the library, for double-click detection.
+    lib_click: Option<(usize, Instant)>,
     /// Random order for shuffle and randomize.
     rng: fastrand::Rng,
     /// Whether the current entry's end has already moved the playlist on. Cleared once the entry
@@ -192,6 +222,10 @@ pub fn run(skin: Skin, opts: Options) -> Result<(), winit::error::EventLoopError
     let screenshot_at = opts.screenshot.as_ref().map(|(after, _)| started + *after);
     let quit_at = opts.quit_after.map(|after| started + after);
     let autoload_at = opts.autoload.as_ref().map(|_| started + AUTOLOAD_DELAY);
+    let mut library = Library::new();
+    if let Some(query) = opts.library_search.clone() {
+        library.set_startup_search(query);
+    }
 
     // PRESETS menu items arrive as menu events. Forward them into the event loop.
     let menu_proxy = event_loop.create_proxy();
@@ -224,6 +258,13 @@ pub fn run(skin: Skin, opts: Options) -> Result<(), winit::error::EventLoopError
         pl_press: None,
         pl_drag: None,
         pl_click: None,
+        lib: None,
+        lib_visible: false,
+        lib_placed: false,
+        library,
+        lib_press: None,
+        lib_drag: None,
+        lib_click: None,
         rng: fastrand::Rng::new(),
         ended_done: false,
         bridge: None,
@@ -294,6 +335,11 @@ impl App {
         if self.pl_visible {
             if let Some(pl) = &self.pl {
                 pl.request_redraw();
+            }
+        }
+        if self.lib_visible {
+            if let Some(lib) = &self.lib {
+                lib.request_redraw();
             }
         }
     }
@@ -445,6 +491,7 @@ impl App {
                 MainButton::Repeat => self.state.repeat = !self.state.repeat,
                 MainButton::EqToggle => self.toggle_eq(),
                 MainButton::PlToggle => self.toggle_pl(),
+                MainButton::ClutterO => self.open_main_menu(),
                 MainButton::ClutterD => {
                     let on = !self.state.doubled;
                     self.set_doubled(on);
@@ -474,8 +521,18 @@ impl App {
                 Key::Character(c) if c.eq_ignore_ascii_case("t") => {
                     self.state.remaining_mode = !self.state.remaining_mode;
                 }
+                Key::Character(c) if c.eq_ignore_ascii_case("l") => self.toggle_library(),
                 _ => return,
             }
+            self.request_redraw();
+            return;
+        }
+        // Alt+L opens the media library (Winamp's shortcut). Other Alt keys are left alone.
+        if self.modifiers.alt_key()
+            && !event.repeat
+            && matches!(event.key_without_modifiers(), Key::Character(c) if c.eq_ignore_ascii_case("l"))
+        {
+            self.toggle_library();
             self.request_redraw();
             return;
         }
@@ -512,6 +569,9 @@ impl App {
         }
         if let Some(pl) = self.pl.as_mut() {
             pl.set_zoom(zoom);
+        }
+        if let Some(lib) = self.lib.as_mut() {
+            lib.set_zoom(zoom);
         }
         self.request_redraw();
     }
@@ -1088,6 +1148,454 @@ impl App {
         }
     }
 
+    // Media library window.
+
+    /// The library's hit target under the pointer.
+    fn lib_hit_under_cursor(&self) -> Option<LibHit> {
+        let (x, y) = self.lib.as_ref()?.skin_pixel()?;
+        hit_test_library(&self.library.state, x, y)
+    }
+
+    /// Shows the library. The first time, it goes to the right of the main window.
+    fn show_library(&mut self) {
+        let Some(lib) = self.lib.as_ref() else {
+            return;
+        };
+        if !self.lib_placed {
+            if let Some(main) = self.main.as_ref() {
+                if let Ok(pos) = main.window.outer_position() {
+                    let x = pos.x + main.window.inner_size().width as i32 + 8;
+                    lib.window
+                        .set_outer_position(PhysicalPosition::new(x, pos.y));
+                }
+            }
+            self.lib_placed = true;
+        }
+        lib.window.set_visible(true);
+        self.lib_visible = true;
+        self.request_redraw();
+    }
+
+    /// Closing hides the library; its state and requests stay.
+    fn hide_library(&mut self) {
+        self.lib_visible = false;
+        self.library.state.search_active = false;
+        self.lib_press = None;
+        self.lib_drag = None;
+        if let Some(lib) = self.lib.as_ref() {
+            lib.window.set_visible(false);
+        }
+        self.request_redraw();
+    }
+
+    fn toggle_library(&mut self) {
+        if self.lib_visible {
+            self.hide_library();
+        } else {
+            self.show_library();
+        }
+    }
+
+    /// Carries out what the library asked for: commands to the page, and changes to the playlist.
+    fn apply_library(&mut self, actions: Vec<Action>) {
+        for action in actions {
+            match action {
+                Action::Send(cmd) => self.send(cmd),
+                Action::AddAndPlay(entry) => {
+                    let index = self.playlist.add(entry);
+                    self.show_row(index);
+                    self.play_index(index);
+                }
+                Action::ReplaceAndPlay { entries, start } => {
+                    if entries.is_empty() {
+                        continue;
+                    }
+                    self.playlist = Playlist::from_entries(entries);
+                    self.pl_state.scroll = 0;
+                    let start = start.min(self.playlist.len() - 1);
+                    self.play_index(start);
+                }
+                Action::Append(entries) => {
+                    for entry in entries {
+                        self.playlist.add(entry);
+                    }
+                    self.pl_changed();
+                }
+            }
+        }
+        self.request_redraw();
+    }
+
+    fn run_library_command(&mut self, command: LibCommand) {
+        let actions = self.library.run_command(command);
+        self.apply_library(actions);
+    }
+
+    /// The main window's O menu: Media Library, and room for more items.
+    fn open_main_menu(&mut self) {
+        let Some(main) = self.main.as_ref() else {
+            return;
+        };
+        let zoom = f64::from(main.zoom());
+        let menu = match library::build_main_menu() {
+            Ok(menu) => menu,
+            Err(e) => {
+                eprintln!("tubeamp: could not build the menu: {e}");
+                return;
+            }
+        };
+        let x = f64::from(CLUTTER_O.x) * zoom;
+        let y = f64::from(CLUTTER_O.y + CLUTTER_O.h) * zoom;
+        if let Err(e) = skinned::show_context_menu(&main.window, &menu, x, y) {
+            eprintln!("tubeamp: could not show the menu: {e}");
+        }
+        self.request_redraw();
+    }
+
+    fn on_lib_press(&mut self) {
+        let hit = self.lib_hit_under_cursor();
+        self.lib_press = hit;
+        if hit != Some(LibHit::Search) {
+            self.library.state.search_active = false;
+        }
+        match hit {
+            Some(LibHit::TitleBar) => {
+                if let Some(lib) = self.lib.as_ref() {
+                    if let Err(e) = lib.window.drag_window() {
+                        eprintln!("tubeamp: media library drag failed: {e}");
+                    }
+                }
+            }
+            Some(LibHit::Close) => self.hide_library(),
+            Some(LibHit::Resize) => {
+                if let Some(cursor) = self.lib.as_ref().and_then(|l| l.cursor_position()) {
+                    self.lib_drag = Some(LibDrag::Resize {
+                        start_steps: self.library.state.size_steps,
+                        start_cursor: cursor,
+                    });
+                }
+            }
+            Some(LibHit::Search) => {
+                self.library.state.search_active = true;
+                let end = self.library.state.query.chars().count();
+                self.library.state.set_caret(end);
+            }
+            Some(LibHit::Nav(index)) => {
+                let actions = self.library.open_nav(index);
+                self.apply_library(actions);
+            }
+            Some(LibHit::Row(index)) => self.press_lib_row(index),
+            Some(LibHit::Scrollbar) => {
+                self.lib_drag = Some(LibDrag::Scroll);
+                self.update_lib_drag();
+            }
+            Some(LibHit::List) => {
+                if !self.modifier_held() {
+                    self.library.state.select_none();
+                }
+            }
+            Some(LibHit::Client | LibHit::Frame) | None => {}
+        }
+        self.request_redraw();
+    }
+
+    /// A press on a row. The back row goes back at once and a header does nothing. A second press
+    /// on the same row within [`DOUBLE_CLICK`] activates it (plays it, or opens the album or
+    /// playlist). Otherwise the press selects the row, as the modifier keys say.
+    fn press_lib_row(&mut self, index: usize) {
+        let Some(kind) = self.library.state.rows.get(index).map(|r| r.kind) else {
+            return;
+        };
+        match kind {
+            LibKind::Header => return,
+            LibKind::Back => {
+                let actions = self.library.activate_row(index);
+                self.apply_library(actions);
+                return;
+            }
+            _ => {}
+        }
+        let now = Instant::now();
+        if let Some((last, at)) = self.lib_click {
+            if last == index && now.duration_since(at) <= DOUBLE_CLICK {
+                self.lib_click = None;
+                let actions = self.library.activate_row(index);
+                self.apply_library(actions);
+                return;
+            }
+        }
+        self.lib_click = Some((index, now));
+        let shift = self.modifiers.shift_key();
+        let ctrl = self.modifiers.control_key() || self.modifiers.super_key();
+        let state = &mut self.library.state;
+        if shift {
+            state.shift_click(index);
+        } else if ctrl {
+            state.ctrl_click(index);
+        } else if !state.selected.contains(&index) {
+            state.click(index);
+        }
+    }
+
+    fn on_lib_release(&mut self) {
+        self.lib_press = None;
+        self.lib_drag = None;
+        self.request_redraw();
+    }
+
+    /// Moves whatever the pointer is dragging: the scrollbar thumb or the resize grip. Then asks
+    /// for the next page if the list has come near its end.
+    fn update_lib_drag(&mut self) {
+        let Some(drag) = self.lib_drag else {
+            return;
+        };
+        match drag {
+            LibDrag::Scroll => {
+                if let Some((_, y)) = self.lib.as_ref().and_then(|l| l.skin_point()) {
+                    self.library.state.scroll = lw::scroll_at(&self.library.state, y);
+                }
+            }
+            LibDrag::Resize {
+                start_steps,
+                start_cursor,
+            } => {
+                let Some(lib) = self.lib.as_ref() else {
+                    return;
+                };
+                let Some(cursor) = lib.cursor_position() else {
+                    return;
+                };
+                let factor = f64::from(lib.factor());
+                let (w0, h0) = gen::window_size(start_steps);
+                let w = f64::from(w0) + (cursor.x - start_cursor.x) / factor;
+                let h = f64::from(h0) + (cursor.y - start_cursor.y) / factor;
+                let steps = gen::steps_for_size(w.round() as i32, h.round() as i32);
+                if steps != self.library.state.size_steps {
+                    self.set_lib_steps(steps);
+                }
+            }
+        }
+        let actions = self.library.maybe_more();
+        self.apply_library(actions);
+        self.request_redraw();
+    }
+
+    /// Resizes the library to `steps`: the state and the window follow.
+    fn set_lib_steps(&mut self, steps: (u32, u32)) {
+        self.library.state.size_steps = steps;
+        self.library.state.clamp_scroll();
+        if let Some(lib) = self.lib.as_mut() {
+            lib.set_base(gen::window_size(steps));
+        }
+        self.request_redraw();
+    }
+
+    /// The wheel scrolls the list, or the nav column when the pointer is over it.
+    fn lib_wheel(&mut self, delta: MouseScrollDelta) {
+        let rows = match delta {
+            MouseScrollDelta::LineDelta(_, y) => -(y.round() as isize) * WHEEL_ROWS,
+            MouseScrollDelta::PixelDelta(p) => -((p.y / f64::from(lw::ROW_H)).round() as isize),
+        };
+        if matches!(self.lib_hit_under_cursor(), Some(LibHit::Nav(_))) {
+            self.library.state.scroll_nav_by(rows);
+        } else {
+            self.library.state.scroll_by(rows);
+        }
+        let actions = self.library.maybe_more();
+        self.apply_library(actions);
+        self.request_redraw();
+    }
+
+    /// A right press on a track row selects it (if it is not selected) and shows the row menu.
+    fn on_lib_right_press(&mut self) {
+        let Some(LibHit::Row(index)) = self.lib_hit_under_cursor() else {
+            return;
+        };
+        if !self.library.state.is_selectable(index) {
+            return;
+        }
+        if !self.library.state.selected.contains(&index) {
+            self.library.state.click(index);
+        }
+        let Some(lib) = self.lib.as_ref() else {
+            return;
+        };
+        let Some((x, y)) = lib.skin_point() else {
+            return;
+        };
+        let zoom = f64::from(lib.zoom());
+        let menu = match library::build_row_menu() {
+            Ok(menu) => menu,
+            Err(e) => {
+                eprintln!("tubeamp: could not build the menu: {e}");
+                return;
+            }
+        };
+        if let Err(e) = skinned::show_context_menu(&lib.window, &menu, x * zoom, y * zoom) {
+            eprintln!("tubeamp: could not show the menu: {e}");
+        }
+        self.request_redraw();
+    }
+
+    /// Keys for the library. While the search field is active it takes the typed text and the
+    /// editing keys, so no Winamp hotkey fires. Otherwise Up and Down move the selection and Enter
+    /// activates it. Returns whether the key was used. Ctrl and Alt combinations go to the global
+    /// hotkeys.
+    fn lib_key(&mut self, event: &KeyEvent) -> bool {
+        if event.state != ElementState::Pressed {
+            return false;
+        }
+        if self.modifiers.control_key() || self.modifiers.alt_key() || self.modifiers.super_key() {
+            return false;
+        }
+        if self.library.state.search_active {
+            let actions = match event.key_without_modifiers() {
+                Key::Named(NamedKey::Enter) => {
+                    if event.repeat {
+                        Vec::new()
+                    } else {
+                        self.library.submit_search()
+                    }
+                }
+                Key::Named(NamedKey::Escape) => {
+                    self.library.state.search_active = false;
+                    Vec::new()
+                }
+                Key::Named(NamedKey::Backspace) => {
+                    self.library.state.backspace();
+                    Vec::new()
+                }
+                Key::Named(NamedKey::Delete) => {
+                    self.library.state.delete_forward();
+                    Vec::new()
+                }
+                Key::Named(NamedKey::ArrowLeft) => {
+                    self.library.state.move_caret(-1);
+                    Vec::new()
+                }
+                Key::Named(NamedKey::ArrowRight) => {
+                    self.library.state.move_caret(1);
+                    Vec::new()
+                }
+                Key::Named(NamedKey::Home) => {
+                    self.library.state.set_caret(0);
+                    Vec::new()
+                }
+                Key::Named(NamedKey::End) => {
+                    self.library.state.set_caret(usize::MAX);
+                    Vec::new()
+                }
+                Key::Named(NamedKey::ArrowDown) => {
+                    self.library.state.search_active = false;
+                    self.library.state.move_cursor(1, false);
+                    self.library.maybe_more()
+                }
+                _ => {
+                    let Some(text) = event.text.as_ref() else {
+                        return false;
+                    };
+                    if text.chars().all(char::is_control) {
+                        return false;
+                    }
+                    self.library.state.insert_text(text);
+                    Vec::new()
+                }
+            };
+            self.apply_library(actions);
+            return true;
+        }
+        let shift = self.modifiers.shift_key();
+        let actions = match event.key_without_modifiers() {
+            Key::Named(NamedKey::ArrowUp) => {
+                self.library.state.move_cursor(-1, shift);
+                Vec::new()
+            }
+            Key::Named(NamedKey::ArrowDown) => {
+                self.library.state.move_cursor(1, shift);
+                self.library.maybe_more()
+            }
+            Key::Named(NamedKey::Enter) if !event.repeat => {
+                match self.library.state.first_selected() {
+                    Some(row) => self.library.activate_row(row),
+                    None => return false,
+                }
+            }
+            _ => return false,
+        };
+        self.apply_library(actions);
+        true
+    }
+
+    fn lib_canvas(&self) -> Canvas {
+        let (w, h) = gen::window_size(self.library.state.size_steps);
+        let mut canvas = Canvas::new(w, h);
+        render_library(&self.skin, &self.library.state, &mut canvas);
+        canvas
+    }
+
+    fn redraw_lib(&mut self) {
+        if !self.lib_visible {
+            return;
+        }
+        let canvas = self.lib_canvas();
+        if let Some(lib) = self.lib.as_mut() {
+            lib.present(&canvas);
+        }
+    }
+
+    fn lib_event(&mut self, event: WindowEvent) {
+        match event {
+            // Closing the library hides it, like the playlist.
+            WindowEvent::CloseRequested => self.hide_library(),
+            WindowEvent::RedrawRequested => self.redraw_lib(),
+            WindowEvent::Resized(_) | WindowEvent::ScaleFactorChanged { .. } => {
+                self.request_redraw()
+            }
+            WindowEvent::Focused(focused) => {
+                self.library.state.focused = focused;
+                self.request_redraw();
+            }
+            WindowEvent::ModifiersChanged(modifiers) => self.modifiers = modifiers.state(),
+            WindowEvent::CursorMoved { position, .. } => {
+                if let Some(lib) = self.lib.as_mut() {
+                    lib.set_cursor(Some(position));
+                }
+                if self.lib_drag.is_some() {
+                    self.update_lib_drag();
+                }
+                self.request_redraw();
+            }
+            WindowEvent::CursorLeft { .. } => {
+                if let Some(lib) = self.lib.as_mut() {
+                    lib.set_cursor(None);
+                }
+                self.request_redraw();
+            }
+            WindowEvent::MouseInput {
+                state,
+                button: MouseButton::Left,
+                ..
+            } => match state {
+                ElementState::Pressed => self.on_lib_press(),
+                ElementState::Released => self.on_lib_release(),
+            },
+            WindowEvent::MouseInput {
+                state: ElementState::Pressed,
+                button: MouseButton::Right,
+                ..
+            } => self.on_lib_right_press(),
+            WindowEvent::MouseWheel { delta, .. } => self.lib_wheel(delta),
+            WindowEvent::KeyboardInput { event, .. } => {
+                if self.lib_key(&event) {
+                    self.request_redraw();
+                } else {
+                    self.on_key(&event);
+                }
+            }
+            _ => {}
+        }
+    }
+
     // Equalizer window.
 
     fn toggle_eq(&mut self) {
@@ -1383,6 +1891,7 @@ impl App {
             Evt::State { .. } => {
                 let before = self.playback.clone();
                 self.playback.apply(&evt);
+                self.library.set_playing(self.playback.video_id.as_deref());
                 self.log_transitions(&before);
                 // Push the slider's volume to the player once the player exists.
                 if !self.volume_synced && self.playback.ps.is_some() {
@@ -1397,8 +1906,19 @@ impl App {
                 self.on_track_ended();
             }
             Evt::Error { at, msg } => eprintln!("tubeamp: YouTube Music error at {at}: {msg}"),
-            // Events added later (for example the API results) are not for this window.
-            _ => {}
+            Evt::Ready { signed_in } => {
+                let actions = self.library.on_ready(*signed_in);
+                self.apply_library(actions);
+            }
+            Evt::ApiResult {
+                req,
+                ok,
+                status,
+                body,
+            } => {
+                let actions = self.library.on_result(*req, *ok, *status, body);
+                self.apply_library(actions);
+            }
         }
         self.request_redraw();
     }
@@ -1690,6 +2210,15 @@ impl App {
                 &suffixed_path(path, "pl"),
             );
         }
+        if self.lib_visible {
+            let canvas = self.lib_canvas();
+            save_one(
+                &scaled(&canvas, 2),
+                canvas.w * 2,
+                canvas.h * 2,
+                &suffixed_path(path, "lib"),
+            );
+        }
     }
 
     fn next_wake(&self, playing: bool) -> Instant {
@@ -1886,6 +2415,22 @@ impl ApplicationHandler<UserEvent> for App {
                 return;
             }
         };
+        let (lib_w, lib_h) = gen::window_size(self.library.state.size_steps);
+        let lib_attributes = WindowAttributes::default()
+            .with_title("TubeAmp Media Library")
+            .with_decorations(false)
+            // Not resizable by the OS: the corner grip resizes it in steps, as the playlist does.
+            .with_resizable(false)
+            .with_visible(false)
+            .with_inner_size(LogicalSize::new(lib_w * zoom, lib_h * zoom));
+        let lib = match SkinnedWindow::new(event_loop, lib_attributes, (lib_w, lib_h), zoom) {
+            Ok(lib) => lib,
+            Err(e) => {
+                eprintln!("tubeamp: {e}");
+                event_loop.exit();
+                return;
+            }
+        };
         let eq_attributes = WindowAttributes::default()
             .with_title("TubeAmp Equalizer")
             .with_decorations(false)
@@ -1946,11 +2491,15 @@ impl ApplicationHandler<UserEvent> for App {
             self.show_eq();
         }
         self.pl = Some(pl);
+        self.lib = Some(lib);
         for id in self.opts.add.clone() {
             self.playlist.add(Entry::from_id(&id));
         }
         if self.opts.open_pl {
             self.show_pl();
+        }
+        if self.opts.open_library {
+            self.show_library();
         }
         self.request_redraw();
     }
@@ -1964,6 +2513,10 @@ impl ApplicationHandler<UserEvent> for App {
                     self.run_eq_command(cmd);
                 } else if let Some(cmd) = pl_app::sort_command_for_id(&id) {
                     self.run_sort(cmd);
+                } else if let Some(cmd) = library::command_for_id(&id) {
+                    self.run_library_command(cmd);
+                } else if id == library::MAIN_LIBRARY {
+                    self.show_library();
                 }
             }
         }
@@ -1981,6 +2534,8 @@ impl ApplicationHandler<UserEvent> for App {
             self.eq_event(event);
         } else if self.pl.as_ref().is_some_and(|p| p.id() == window_id) {
             self.pl_event(event);
+        } else if self.lib.as_ref().is_some_and(|l| l.id() == window_id) {
+            self.lib_event(event);
         } else if self.main.as_ref().is_some_and(|m| m.id() == window_id) {
             self.main_event(event_loop, event);
         }

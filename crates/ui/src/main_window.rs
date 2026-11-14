@@ -133,7 +133,8 @@ const MINIMIZE_BTN: Rect = Rect::new(244, 3, 9, 9);
 const SHADE_BTN: Rect = Rect::new(254, 3, 9, 9);
 const CLOSE_BTN: Rect = Rect::new(264, 3, 9, 9);
 const CLUTTER_BAR: Rect = Rect::new(10, 22, 8, 43);
-const CLUTTER_O: Rect = Rect::new(10, 25, 8, 8);
+/// The clutterbar's O button (options). Its menu opens from this rectangle.
+pub const CLUTTER_O: Rect = Rect::new(10, 25, 8, 8);
 const CLUTTER_A: Rect = Rect::new(10, 33, 8, 7);
 const CLUTTER_I: Rect = Rect::new(10, 40, 8, 7);
 const CLUTTER_D: Rect = Rect::new(10, 47, 8, 8);

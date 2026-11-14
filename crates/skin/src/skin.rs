@@ -5,6 +5,7 @@
 //! last one in archive order wins.
 
 use crate::bitmap::{self, Rgba};
+use crate::genex::GenExColors;
 use crate::parse::{self, PlEditColors, Regions};
 use crate::sheet::Sheet;
 use crate::sprites;
@@ -100,6 +101,8 @@ pub struct Skin {
     pub pledit: PlEditColors,
     /// Window regions from `REGION.TXT` (parsed and stored; not used for rendering yet).
     pub regions: Regions,
+    /// Generic-window colours from `GENEX.BMP`, or TubeAmp's own when the skin has none.
+    pub genex: GenExColors,
 }
 
 impl Skin {
@@ -137,11 +140,17 @@ impl Skin {
             None => Regions::new(),
         };
 
+        let genex = sheets[Sheet::Genex.index()]
+            .as_ref()
+            .and_then(GenExColors::from_sheet)
+            .unwrap_or_default();
+
         Ok(Skin {
             sheets,
             viscolor,
             pledit,
             regions,
+            genex,
         })
     }
 

@@ -10,6 +10,7 @@
 //! byte-identical across runs.
 
 mod font;
+mod icon;
 mod paint;
 mod sheets;
 mod text_files;
@@ -20,11 +21,20 @@ use std::fs;
 use std::io::{Cursor, Write};
 use std::path::PathBuf;
 
+const USAGE: &str = "usage: tubeamp-skingen <output-dir>
+       tubeamp-skingen icon <output-dir>   (writes TubeAmp.iconset/ and TubeAmp.icns)";
+
 fn main() -> Result<(), Box<dyn Error>> {
-    let out_dir = std::env::args_os()
-        .nth(1)
-        .map(PathBuf::from)
-        .ok_or("usage: tubeamp-skingen <output-dir>")?;
+    let mut args = std::env::args_os().skip(1);
+    let first = args.next().ok_or(USAGE)?;
+    if first == "icon" {
+        let out_dir = args.next().map(PathBuf::from).ok_or(USAGE)?;
+        for path in icon::write(&out_dir)? {
+            println!("wrote {}", path.display());
+        }
+        return Ok(());
+    }
+    let out_dir = PathBuf::from(first);
 
     let mut files: Vec<(String, Vec<u8>)> = Vec::new();
     for (name, img) in sheets::render_all() {

@@ -82,7 +82,8 @@ impl PlMenu {
     /// Number of items in the popup.
     pub fn len(self) -> usize {
         match self {
-            PlMenu::Add | PlMenu::Select | PlMenu::Misc | PlMenu::List => 3,
+            PlMenu::Add => 2,
+            PlMenu::Select | PlMenu::Misc | PlMenu::List => 3,
             PlMenu::Remove => 4,
         }
     }
@@ -97,7 +98,6 @@ impl PlMenu {
         match self {
             PlMenu::Add => &[
                 ("PLAYLIST_ADD_URL", "PLAYLIST_ADD_URL_SELECTED"),
-                ("PLAYLIST_ADD_DIR", "PLAYLIST_ADD_DIR_SELECTED"),
                 ("PLAYLIST_ADD_FILE", "PLAYLIST_ADD_FILE_SELECTED"),
             ],
             PlMenu::Remove => &[
@@ -845,10 +845,13 @@ fn draw_bottom_bar(
 }
 
 /// A popup: the bar on the left, then the items from the top (the hovered one in its selected
-/// sprite).
+/// sprite). The bar sprite is drawn for the most items a popup has, so it is clipped to the
+/// popup's own height: ADD has two items, and its bar shows two.
 fn draw_popup(skin: &Skin, l: Layout, menu: PlMenu, hover: Option<PlHit>, canvas: &mut Canvas) {
     let bar = l.menu_bar(menu);
-    blit_pledit(skin, canvas, menu.bar(), bar.x, bar.y);
+    if let Some(view) = skin.sprite(Sheet::Pledit, menu.bar()) {
+        canvas.blit_clipped(&view, bar.x, bar.y, bar);
+    }
     for (i, (normal, selected)) in menu.items().iter().enumerate() {
         let rect = l.menu_item(menu, i);
         let name = if hover == Some(PlHit::MenuItem(menu, i)) {
@@ -1183,6 +1186,45 @@ mod tests {
     }
 
     #[test]
+    fn add_popup_shows_two_items_and_a_bar_that_stops_at_them() {
+        let skin = testkit::synthetic_skin();
+        let closed = PlaylistWindowState {
+            size_steps: (0, 4),
+            ..PlaylistWindowState::default()
+        };
+        let open = PlaylistWindowState {
+            open_menu: Some(PlMenu::Add),
+            hover: Some(PlHit::MenuItem(PlMenu::Add, 1)),
+            ..closed.clone()
+        };
+        let base = render(&skin, &playlist(3), &closed);
+        let c = render(&skin, &playlist(3), &open);
+        let l = Layout::new((0, 4));
+        let bar = l.menu_bar(PlMenu::Add);
+        assert_eq!(bar.h, 36, "ADD's bar is two items tall");
+        // The bar's sprite is three items tall. Its top two items' rows are the ones shown.
+        let sprite = skin
+            .sprite(Sheet::Pledit, "PLAYLIST_ADD_MENU_BAR")
+            .expect("bar");
+        assert_eq!(sprite.h, 54);
+        assert_sprite_rows(&c, &skin, "PLAYLIST_ADD_MENU_BAR", bar.x, bar.y, 0..36);
+        let url = l.menu_item(PlMenu::Add, 0);
+        let file = l.menu_item(PlMenu::Add, 1);
+        assert_sprite_at(&c, &skin, "PLAYLIST_ADD_URL", url.x, url.y);
+        assert_sprite_at(&c, &skin, "PLAYLIST_ADD_FILE_SELECTED", file.x, file.y);
+        // Nothing above the popup changes, in the popup's columns.
+        for y in 0..bar.y {
+            for x in bar.x..url.x + url.w {
+                assert_eq!(
+                    px(&c, x, y),
+                    px(&base, x, y),
+                    "({x},{y}) is above the popup"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn bottom_buttons_are_blitted_from_the_corner_art_only() {
         // A flat sheet stands in for the skin: a closed button shows exactly the corner's pixels,
         // with no border or label added by the renderer.
@@ -1296,9 +1338,9 @@ mod tests {
     fn open_popup_items_win_and_clicks_outside_still_hit_the_frame() {
         let steps = (0, 4);
         let l = Layout::new(steps);
-        let item = l.menu_item(PlMenu::Add, 2);
+        let item = l.menu_item(PlMenu::Add, 1);
         let hit = hit_test_playlist(steps, 0, 0, Some(PlMenu::Add), item.x + 1, item.y + 1);
-        assert_eq!(hit, Some(PlHit::MenuItem(PlMenu::Add, 2)));
+        assert_eq!(hit, Some(PlHit::MenuItem(PlMenu::Add, 1)));
         // The popup's top item is above the button, over the track area.
         let top = l.menu_item(PlMenu::Add, 0);
         assert_eq!(

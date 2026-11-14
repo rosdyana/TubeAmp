@@ -9,8 +9,8 @@ use serde_json::Value;
 use crate::fields::{arr, runs, str_of, subtitle, text};
 use crate::item::{author_of, card, panel_track, responsive, two_row};
 use crate::model::{
-    Continuation, HomePage, Item, LibraryPlaylists, PlaylistItem, PlaylistPage, SearchResults,
-    Shelf, Track,
+    ArtistPage, Continuation, HomePage, Item, LibraryPlaylists, PlaylistItem, PlaylistPage,
+    SearchResults, Shelf, Track,
 };
 
 /// Header renderers that carry a playlist or album title and subtitle.
@@ -58,6 +58,18 @@ pub fn parse_playlist(json: &str) -> PlaylistPage {
     }
 }
 
+/// Parses an artist's channel page: the name, the link to all the artist's songs when the page
+/// has one, and the rows of the songs shelf.
+pub fn parse_artist(json: &str) -> ArtistPage {
+    let root = load(json);
+    let songs = songs_shelf(&root);
+    ArtistPage {
+        name: artist_name(&root),
+        songs_browse_id: songs.as_ref().and_then(|s| s.browse_id.clone()),
+        tracks: songs.map(|s| s.tracks).unwrap_or_default(),
+    }
+}
+
 /// Parses the library playlists grid.
 pub fn parse_library_playlists(json: &str) -> LibraryPlaylists {
     let root = load(json);
@@ -100,6 +112,60 @@ pub fn parse_next(json: &str) -> Vec<Track> {
 }
 
 // ---- Walker ------------------------------------------------------------------------------------
+
+/// The artist's name from the page header, which is an immersive or a visual header.
+fn artist_name(root: &Value) -> String {
+    ["musicImmersiveHeaderRenderer", "musicVisualHeaderRenderer"]
+        .iter()
+        .map(|key| text(&root["header"][*key]["title"]))
+        .find(|name| !name.is_empty())
+        .or_else(|| str_of(&root["microformat"]["microformatDataRenderer"]["title"]))
+        .unwrap_or_default()
+}
+
+/// The Songs shelf of an artist page: its all-songs browse id, when it is a `VL…` playlist, and
+/// its track rows.
+struct SongsShelf {
+    browse_id: Option<String>,
+    tracks: Vec<Track>,
+}
+
+/// The first shelf whose title ends in "Songs" ("Top songs" on the artist page), in page order.
+fn songs_shelf(root: &Value) -> Option<SongsShelf> {
+    section_lists(root)
+        .into_iter()
+        .flat_map(|list| arr(&list["contents"]).iter())
+        .filter_map(shelf_parts)
+        .find(|(title, _)| text(title).to_ascii_lowercase().ends_with("songs"))
+        .map(|(title, contents)| SongsShelf {
+            browse_id: runs(title)
+                .first()
+                .and_then(|run| str_of(&run["navigationEndpoint"]["browseEndpoint"]["browseId"]))
+                .filter(|id| id.starts_with("VL")),
+            tracks: items_of(contents)
+                .into_iter()
+                .filter_map(|item| match item {
+                    Item::Track(t) => Some(t),
+                    _ => None,
+                })
+                .collect(),
+        })
+}
+
+/// The title and rows of a list-style or carousel shelf entry of a section list.
+fn shelf_parts(entry: &Value) -> Option<(&Value, &Value)> {
+    let shelf = &entry["musicShelfRenderer"];
+    if shelf.is_object() {
+        return Some((&shelf["title"], &shelf["contents"]));
+    }
+    let carousel = &entry["musicCarouselShelfRenderer"];
+    carousel.is_object().then(|| {
+        (
+            &carousel["header"]["musicCarouselShelfBasicHeaderRenderer"]["title"],
+            &carousel["contents"],
+        )
+    })
+}
 
 /// How a section lays out its items.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -452,5 +518,69 @@ fn collect_panel_tracks(v: &Value, out: &mut Vec<Track>) {
             }
         }
         _ => {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    /// A captured artist page (Daft Punk, signed out).
+    const ARTIST: &str = include_str!("../tests/fixtures/artist.json");
+
+    #[test]
+    fn artist_page_gives_the_name_the_all_songs_playlist_and_the_top_songs() {
+        let page = parse_artist(ARTIST);
+        assert_eq!(page.name, "Daft Punk");
+        assert_eq!(
+            page.songs_browse_id.as_deref(),
+            Some("VLOLAK5uy_lNVBcjNtiCwq-n95uoxJ-Gd4vsfMkyZNs"),
+            "the Top songs title links to the all-songs playlist"
+        );
+        assert_eq!(page.tracks.len(), 5, "the Top songs shelf's rows");
+        assert!(page.tracks.iter().all(|t| !t.video_id.is_empty()));
+        assert!(page.tracks.iter().all(|t| !t.title.is_empty()));
+    }
+
+    #[test]
+    fn a_songs_shelf_without_a_link_gives_its_rows_as_the_songs() {
+        let row = |id: &str, title: &str| {
+            json!({
+                "musicResponsiveListItemRenderer": {
+                    "playlistItemData": {"videoId": id},
+                    "flexColumns": [
+                        {"musicResponsiveListItemFlexColumnRenderer": {"text": {"runs": [{"text": title}]}}}
+                    ]
+                }
+            })
+        };
+        let page = json!({
+            "header": {"musicImmersiveHeaderRenderer": {"title": {"runs": [{"text": "Solo Act"}]}}},
+            "contents": {"singleColumnBrowseResultsRenderer": {"tabs": [{"tabRenderer": {"content": {
+                "sectionListRenderer": {"contents": [
+                    {"musicShelfRenderer": {
+                        "title": {"runs": [{"text": "Songs"}]},
+                        "contents": [row("aaaaaaaaaaa", "One"), row("bbbbbbbbbbb", "Two")]
+                    }}
+                ]}
+            }}}]}}
+        });
+        let page = parse_artist(&page.to_string());
+        assert_eq!(page.name, "Solo Act");
+        assert_eq!(page.songs_browse_id, None);
+        let ids: Vec<&str> = page.tracks.iter().map(|t| t.video_id.as_str()).collect();
+        assert_eq!(ids, vec!["aaaaaaaaaaa", "bbbbbbbbbbb"]);
+    }
+
+    #[test]
+    fn a_page_without_a_songs_shelf_has_no_tracks_and_bad_json_is_empty() {
+        let page = parse_artist(r#"{"contents":{}}"#);
+        assert_eq!(page.name, "");
+        assert_eq!(page.songs_browse_id, None);
+        assert!(page.tracks.is_empty());
+        let broken = parse_artist("not json");
+        assert_eq!(broken.name, "");
+        assert!(broken.tracks.is_empty());
     }
 }

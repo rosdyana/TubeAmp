@@ -110,6 +110,7 @@ impl Capture {
                 ),
                 ("home", ytm::home()),
                 ("next", ytm::next("kJQP7kiw5Fk")),
+                ("artist", ytm::artist("UC_kRDKYrUlrbtrSiyu5Tflg")),
             ],
             1 => {
                 let mut jobs = Vec::new();

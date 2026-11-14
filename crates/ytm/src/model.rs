@@ -117,3 +117,14 @@ pub struct Continuation {
     pub tracks: Vec<Track>,
     pub continuation: Option<String>,
 }
+
+/// An artist's channel page, read for importing its songs. `songs_browse_id` is the Songs shelf's
+/// "all songs" playlist (`VL…`) when the page links to one. `tracks` are the rows of the Songs
+/// shelf, which are the songs when there is no link.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ArtistPage {
+    pub name: String,
+    /// Browse id of the all-songs playlist (`VL…`), to pass to `request::playlist`.
+    pub songs_browse_id: Option<String>,
+    pub tracks: Vec<Track>,
+}

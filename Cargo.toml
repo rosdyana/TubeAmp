@@ -1,3 +1,10 @@
 [workspace]
 resolver = "2"
 members = ["spikes/m0", "crates/eq", "crates/skin", "crates/ui", "crates/audio", "crates/bridge", "crates/ytm", "crates/playlist", "crates/app", "tools/skingen"]
+
+# Smaller release binary. opt-level stays at its default (3) and panic stays "unwind": the audio
+# capture worker relies on catching a panicking thread.
+[profile.release]
+lto = "fat"
+codegen-units = 1
+strip = "symbols"

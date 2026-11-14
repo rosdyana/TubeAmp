@@ -3,11 +3,14 @@
 //! what they mean. Every effect comes back as an [`Action`] for the window to carry out, so the
 //! logic is testable without a window or a page.
 //!
-//! Artists have no browse page yet (ytmusicapi-style parsing of artist pages is not written), so
-//! an artist row runs a Songs search for the artist's name. Radio appends the up-next queue.
+//! An artist row runs a Songs search for the artist's name. Radio appends the up-next queue.
+//! Importing a playlist, album or artist link (ADD ▸ URL and ADD ▸ FILE) reads its pages without
+//! touching the list on screen: the tracks come back as [`Action::Append`].
+
+use std::collections::VecDeque;
 
 use tubeamp_bridge::Cmd;
-use tubeamp_playlist::Entry;
+use tubeamp_playlist::{Entry, Link};
 use tubeamp_ui::library_window::{LibKind, LibRow, LibraryState, NavKind};
 use tubeamp_ytm as ytm;
 use tubeamp_ytm::{
@@ -31,6 +34,8 @@ const MORE_MARGIN: usize = 8;
 const FIXED_NAV: usize = 5;
 /// The label of the row that goes back to the page before.
 const BACK_LABEL: &str = "« Back";
+/// Most tracks one import adds. A longer playlist is cut short, with a note in the log.
+pub const IMPORT_CAP: usize = 5000;
 
 /// Something for the window to do.
 #[derive(Debug, Clone, PartialEq)]
@@ -112,6 +117,10 @@ pub struct Library {
     startup_search: Option<String>,
     /// The video id that is playing, for the highlight.
     playing: Option<String>,
+    /// Links still to import after the one running, in order.
+    import_queue: VecDeque<Link>,
+    /// Tracks the import that is running has added so far.
+    imported: usize,
 }
 
 impl Default for Library {
@@ -131,6 +140,8 @@ impl Library {
             nav_playlists: Vec::new(),
             startup_search: None,
             playing: None,
+            import_queue: VecDeque::new(),
+            imported: 0,
         }
     }
 
@@ -168,10 +179,25 @@ impl Library {
             return Vec::new();
         };
         if !ok {
-            self.fail(purpose, status, body);
-            return Vec::new();
+            return self.fail(purpose, status, body);
         }
         self.apply(purpose, body)
+    }
+
+    /// Imports the playlists, albums and artists in `links`, one after another. Videos are not
+    /// handled here (the window adds them). A new call supersedes the import still running, and
+    /// with no import links in it nothing changes. The tracks arrive as [`Action::Append`].
+    pub fn import(&mut self, links: Vec<Link>) -> Vec<Action> {
+        let links: VecDeque<Link> = links
+            .into_iter()
+            .filter(|link| !matches!(link, Link::Video(_)))
+            .collect();
+        if links.is_empty() {
+            return Vec::new();
+        }
+        self.api.cancel(Slot::Import);
+        self.import_queue = links;
+        self.next_import()
     }
 
     /// Nav item `index` was chosen (clicked or entered).
@@ -382,6 +408,50 @@ impl Library {
         vec![Action::ReplaceAndPlay { entries, start }]
     }
 
+    /// Starts the next queued import, if there is one. Its first request is sent now, or once the
+    /// page is ready.
+    fn next_import(&mut self) -> Vec<Action> {
+        self.imported = 0;
+        while let Some(link) = self.import_queue.pop_front() {
+            let (purpose, request) = match link {
+                Link::Playlist(id) => (Purpose::ImportPage, ytm::playlist(&id)),
+                Link::Album(id) => (Purpose::ImportPage, ytm::album(&id)),
+                Link::Artist(id) => (Purpose::ImportArtist, ytm::artist(&id)),
+                Link::Video(_) => continue,
+            };
+            return self.request(purpose, request);
+        }
+        Vec::new()
+    }
+
+    /// Appends one page of an import, then asks for the next page while there is one and the cap
+    /// is not reached. Otherwise the import is done, and the next queued one starts.
+    fn import_tracks(
+        &mut self,
+        mut tracks: Vec<Track>,
+        continuation: Option<String>,
+    ) -> Vec<Action> {
+        tracks.truncate(IMPORT_CAP.saturating_sub(self.imported));
+        self.imported += tracks.len();
+        let mut out = Vec::new();
+        if !tracks.is_empty() {
+            out.push(Action::Append(tracks.iter().map(entry_of).collect()));
+        }
+        let capped = continuation.is_some() && self.imported >= IMPORT_CAP;
+        match continuation.filter(|_| !capped) {
+            Some(token) => out.extend(self.request(Purpose::ImportMore, ytm::continuation(&token))),
+            None => {
+                if capped {
+                    eprintln!("tubeamp: import stopped at {IMPORT_CAP} tracks");
+                } else {
+                    eprintln!("tubeamp: imported {} tracks", self.imported);
+                }
+                out.extend(self.next_import());
+            }
+        }
+        out
+    }
+
     /// Empties the main list and its history, and drops the selection.
     fn reset_main(&mut self) {
         self.history.clear();
@@ -399,7 +469,7 @@ impl Library {
             .unwrap_or_default()
     }
 
-    fn fail(&mut self, purpose: Purpose, status: u16, body: &str) {
+    fn fail(&mut self, purpose: Purpose, status: u16, body: &str) -> Vec<Action> {
         let reason = if status == 0 {
             body.lines().next().unwrap_or("request failed").to_string()
         } else {
@@ -409,8 +479,14 @@ impl Library {
             Purpose::More => self.content.more_pending = false,
             Purpose::Radio => self.state.status = format!("Radio failed: {reason}"),
             Purpose::NavPlaylists => {}
+            // An import's failure goes to the log, and the list on screen is left as it is.
+            Purpose::ImportPage | Purpose::ImportArtist | Purpose::ImportMore => {
+                eprintln!("tubeamp: import failed: {reason}");
+                return self.next_import();
+            }
             _ => self.state.status = format!("Could not load: {reason}"),
         }
+        Vec::new()
     }
 
     /// Reads an answer body for `purpose` into the lists.
@@ -506,6 +582,22 @@ impl Library {
                     return Vec::new();
                 }
                 return vec![Action::Append(tracks.iter().map(entry_of).collect())];
+            }
+            // Imports leave the list, its status and its rows alone.
+            Purpose::ImportPage => {
+                let page = ytm::parse_playlist(body);
+                return self.import_tracks(page.tracks, page.continuation);
+            }
+            Purpose::ImportMore => {
+                let more = ytm::parse_continuation(body);
+                return self.import_tracks(more.tracks, more.continuation);
+            }
+            Purpose::ImportArtist => {
+                let artist = ytm::parse_artist(body);
+                return match artist.songs_browse_id {
+                    Some(id) => self.request(Purpose::ImportPage, ytm::playlist(&id)),
+                    None => self.import_tracks(artist.tracks, None),
+                };
             }
         }
         self.refresh();
@@ -1182,5 +1274,186 @@ mod tests {
             }),
             "[PLAYLIST] Road"
         );
+    }
+
+    const PLAYLIST: &str = include_str!("../../ytm/tests/fixtures/playlist.json");
+    const ALBUM: &str = include_str!("../../ytm/tests/fixtures/album.json");
+    const ARTIST: &str = include_str!("../../ytm/tests/fixtures/artist.json");
+
+    /// A playlist-style row for a hand-made page.
+    fn row(id: &str) -> serde_json::Value {
+        serde_json::json!({
+            "musicResponsiveListItemRenderer": {
+                "playlistItemData": {"videoId": id},
+                "flexColumns": [
+                    {"musicResponsiveListItemFlexColumnRenderer": {"text": {"runs": [{"text": id}]}}}
+                ]
+            }
+        })
+    }
+
+    /// The first page of a playlist with `ids` as rows, and a token for the next page.
+    fn playlist_page(ids: &[&str], token: Option<&str>) -> String {
+        let rows: Vec<serde_json::Value> = ids.iter().map(|id| row(id)).collect();
+        let mut shelf = serde_json::json!({ "contents": rows });
+        if let Some(token) = token {
+            shelf["continuations"] =
+                serde_json::json!([{"nextContinuationData": {"continuation": token}}]);
+        }
+        serde_json::json!({
+            "contents": {"singleColumnBrowseResultsRenderer": {"tabs": [{"tabRenderer": {
+                "content": {"sectionListRenderer": {"contents": [{"musicPlaylistShelfRenderer": shelf}]}}
+            }}]}}
+        })
+        .to_string()
+    }
+
+    /// A continuation page of a playlist with `ids` as rows.
+    fn continuation_page(ids: &[&str]) -> String {
+        let rows: Vec<serde_json::Value> = ids.iter().map(|id| row(id)).collect();
+        serde_json::json!({
+            "continuationContents": {"musicPlaylistShelfContinuation": {"contents": rows}}
+        })
+        .to_string()
+    }
+
+    fn appended(actions: &[Action]) -> Vec<String> {
+        actions
+            .iter()
+            .filter_map(|a| match a {
+                Action::Append(entries) => Some(entries.iter().map(|e| e.video_id.clone())),
+                _ => None,
+            })
+            .flatten()
+            .collect()
+    }
+
+    #[test]
+    fn importing_a_playlist_appends_its_tracks_and_leaves_the_list_alone() {
+        let mut lib = ready_library();
+        page_with_tracks(&mut lib, vec![track("aaaaaaaaaaa", "A", "X", 60)]);
+        let rows_before = lib.state.rows.clone();
+        let req = sent_req(&lib.import(vec![Link::Playlist("PLx".into())]));
+        let page = ytm::parse_playlist(PLAYLIST);
+        let actions = lib.on_result(req, true, 200, PLAYLIST);
+        let expected: Vec<String> = page.tracks.iter().map(|t| t.video_id.clone()).collect();
+        assert_eq!(appended(&actions), expected);
+        assert_eq!(
+            lib.state.rows, rows_before,
+            "the list on screen is unchanged"
+        );
+        assert!(lib.state.status.is_empty());
+    }
+
+    #[test]
+    fn an_import_follows_the_continuation_until_it_runs_out() {
+        let mut lib = ready_library();
+        let req = sent_req(&lib.import(vec![Link::Playlist("PLx".into())]));
+        let actions = lib.on_result(
+            req,
+            true,
+            200,
+            &playlist_page(&["aaaaaaaaaaa", "bbbbbbbbbbb"], Some("tok1")),
+        );
+        assert_eq!(appended(&actions), vec!["aaaaaaaaaaa", "bbbbbbbbbbb"]);
+        let more = sent_req(&actions[1..]);
+        let actions = lib.on_result(more, true, 200, &continuation_page(&["ccccccccccc"]));
+        assert_eq!(appended(&actions), vec!["ccccccccccc"]);
+        assert!(
+            actions.iter().all(|a| !matches!(a, Action::Send(_))),
+            "no more pages"
+        );
+        assert!(lib.import_queue.is_empty());
+    }
+
+    #[test]
+    fn an_import_stops_at_the_cap_even_with_a_next_page() {
+        let mut lib = ready_library();
+        let _ = lib.import(vec![Link::Playlist("PLx".into())]);
+        lib.imported = IMPORT_CAP - 2;
+        let tracks: Vec<Track> = (0..3)
+            .map(|i| track(&format!("id{i:09}"), "T", "X", 60))
+            .collect();
+        let actions = lib.import_tracks(tracks, Some("tok".into()));
+        assert_eq!(appended(&actions).len(), 2, "only up to the cap");
+        assert!(actions.iter().all(|a| !matches!(a, Action::Send(_))));
+        assert_eq!(
+            lib.imported, 0,
+            "the count starts again for the next import"
+        );
+    }
+
+    #[test]
+    fn an_artist_link_reads_its_songs_playlist_then_appends_it() {
+        let mut lib = ready_library();
+        let req = sent_req(&lib.import(vec![Link::Artist("UC_kRDKYrUlrbtrSiyu5Tflg".into())]));
+        let actions = lib.on_result(req, true, 200, ARTIST);
+        let songs = match &actions[..] {
+            [Action::Send(Cmd::Api {
+                req,
+                endpoint,
+                body,
+            })] => {
+                assert_eq!(endpoint, "browse");
+                assert_eq!(
+                    body["browseId"],
+                    "VLOLAK5uy_lNVBcjNtiCwq-n95uoxJ-Gd4vsfMkyZNs"
+                );
+                *req
+            }
+            other => panic!("expected the songs playlist request, got {other:?}"),
+        };
+        let page = ytm::parse_playlist(PLAYLIST);
+        let actions = lib.on_result(songs, true, 200, PLAYLIST);
+        assert_eq!(appended(&actions).len(), page.tracks.len());
+    }
+
+    #[test]
+    fn a_new_import_supersedes_the_one_in_flight() {
+        let mut lib = ready_library();
+        let first = sent_req(&lib.import(vec![Link::Playlist("PLa".into())]));
+        let second = sent_req(&lib.import(vec![Link::Album("MPREb_x".into())]));
+        assert!(
+            lib.on_result(first, true, 200, PLAYLIST).is_empty(),
+            "stale"
+        );
+        assert_eq!(
+            appended(&lib.on_result(second, true, 200, ALBUM)).len(),
+            ytm::parse_playlist(ALBUM).tracks.len()
+        );
+    }
+
+    #[test]
+    fn several_import_links_run_one_after_another() {
+        let mut lib = ready_library();
+        let first = sent_req(&lib.import(vec![
+            Link::Video("kJQP7kiw5Fk".into()),
+            Link::Playlist("PLa".into()),
+            Link::Album("MPREb_x".into()),
+        ]));
+        let actions = lib.on_result(first, false, 404, "gone");
+        assert!(
+            lib.state.status.is_empty(),
+            "a failed import leaves the status alone"
+        );
+        let second = sent_req(&actions);
+        match &actions[..] {
+            [Action::Send(Cmd::Api { body, .. })] => assert_eq!(body["browseId"], "MPREb_x"),
+            other => panic!("unexpected {other:?}"),
+        }
+        assert!(lib
+            .on_result(second, true, 200, ALBUM)
+            .iter()
+            .any(|a| matches!(a, Action::Append(_))));
+    }
+
+    #[test]
+    fn videos_and_empty_imports_send_nothing() {
+        let mut lib = ready_library();
+        assert!(lib
+            .import(vec![Link::Video("kJQP7kiw5Fk".into())])
+            .is_empty());
+        assert!(lib.import(Vec::new()).is_empty());
+        assert!(lib.import_queue.is_empty());
     }
 }

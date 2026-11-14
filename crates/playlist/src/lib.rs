@@ -12,7 +12,7 @@ use std::collections::BTreeSet;
 
 use serde::{Deserialize, Serialize};
 
-pub use url::{is_video_id, parse_video_id};
+pub use url::{is_video_id, parse_link, parse_links, parse_video_id, Link};
 
 /// One playlist row: a YouTube video plus what we know about it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -409,6 +409,15 @@ impl Playlist {
         let entries: Vec<Entry> = serde_json::from_str(text)?;
         Ok(Playlist::from_entries(entries))
     }
+
+    /// The list as text: one `https://music.youtube.com/watch?v=ID` link per line. Titles are not
+    /// kept. [`parse_links`] reads the text back, which is how LIST ▸ SAVE writes a `.txt` list.
+    pub fn to_links_text(&self) -> String {
+        self.entries
+            .iter()
+            .map(|e| format!("https://music.youtube.com/watch?v={}\n", e.video_id))
+            .collect()
+    }
 }
 
 #[cfg(test)]
@@ -797,5 +806,28 @@ mod tests {
         assert_eq!(minimal.get(0).unwrap().title, "");
         assert_eq!(minimal.get(0).unwrap().duration_secs, None);
         assert!(Playlist::from_json("{}").is_err());
+    }
+
+    #[test]
+    fn links_text_has_one_link_per_line_and_reads_back_to_the_same_ids() {
+        let p = Playlist::from_entries(vec![
+            Entry::from_id("kJQP7kiw5Fk"),
+            Entry::from_id("fJ9rUzIMcZQ"),
+        ]);
+        let text = p.to_links_text();
+        assert_eq!(
+            text,
+            "https://music.youtube.com/watch?v=kJQP7kiw5Fk\n\
+             https://music.youtube.com/watch?v=fJ9rUzIMcZQ\n"
+        );
+        let ids: Vec<Link> = parse_links(&text);
+        assert_eq!(
+            ids,
+            vec![
+                Link::Video("kJQP7kiw5Fk".into()),
+                Link::Video("fJ9rUzIMcZQ".into()),
+            ]
+        );
+        assert_eq!(Playlist::default().to_links_text(), "");
     }
 }

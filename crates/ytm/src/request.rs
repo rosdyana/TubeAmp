@@ -67,6 +67,11 @@ pub fn album(browse_id: &str) -> Request {
     browse(browse_id)
 }
 
+/// An artist's channel page, from its `UC…` id (`ArtistItem::browse_id`).
+pub fn artist(channel_id: &str) -> Request {
+    browse(channel_id)
+}
+
 /// The next page of a browse or search response, from a continuation token.
 pub fn continuation(token: &str) -> Request {
     ("browse", json!({ "continuation": token }))

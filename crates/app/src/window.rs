@@ -23,7 +23,7 @@ use tubeamp_audio::{params as eq_params, AudioEngine, AudioError, Capture, Captu
 use tubeamp_bridge::{Bridge, Cmd, Evt};
 use tubeamp_eq::model::ZERO_VALUE;
 use tubeamp_eq::{Preset, BANDS_HZ, BUILTIN};
-use tubeamp_playlist::{Entry, Playlist};
+use tubeamp_playlist::{parse_links, Entry, Link, Playlist};
 use tubeamp_skin::Skin;
 use tubeamp_ui::eq_window as eqw;
 use tubeamp_ui::gen_window as gen;
@@ -1591,14 +1591,11 @@ impl App {
 
     fn run_pl_action(&mut self, action: PlAction) {
         match action {
-            PlAction::AddUrl => match pl_app::clipboard_video_id() {
-                Ok(id) => {
-                    let index = self.playlist.add(Entry::from_id(&id));
-                    self.show_row(index);
-                    self.log(format!("playlist: added {id}"));
-                }
+            PlAction::AddUrl => match pl_app::clipboard_links() {
+                Ok(links) => self.add_links(links),
                 Err(msg) => eprintln!("tubeamp: {msg}"),
             },
+            PlAction::AddFile => self.add_files(),
             PlAction::RemoveAll | PlAction::NewList => {
                 self.playlist.clear();
                 self.pl_state.scroll = 0;
@@ -1613,6 +1610,59 @@ impl App {
             PlAction::LoadList => self.load_list(),
         }
         self.pl_changed();
+    }
+
+    /// Adds links from ADD ▸ URL or ADD ▸ FILE. A video is appended at once. A playlist, album or
+    /// artist is imported by the library, and its tracks are appended as its pages arrive.
+    fn add_links(&mut self, links: Vec<Link>) {
+        let mut last = None;
+        let mut videos = 0;
+        for link in &links {
+            if let Link::Video(id) = link {
+                last = Some(self.playlist.add(Entry::from_id(id)));
+                videos += 1;
+            }
+        }
+        if let Some(index) = last {
+            self.show_row(index);
+            self.log(format!("playlist: added {videos} video(s)"));
+        }
+        let actions = self.library.import(links);
+        self.apply_library(actions);
+    }
+
+    /// ADD ▸ FILE: the entries of a JSON file are appended as they are. The links of the other
+    /// files are added together, so that one import does not supersede another.
+    fn add_files(&mut self) {
+        let Some(paths) = pl_app::pick_files_to_add() else {
+            return;
+        };
+        let mut links = Vec::new();
+        for path in paths {
+            let text = match std::fs::read_to_string(&path) {
+                Ok(text) => text,
+                Err(e) => {
+                    eprintln!("tubeamp: could not read {}: {e}", path.display());
+                    continue;
+                }
+            };
+            if pl_app::is_json_list(&text) {
+                match Playlist::from_json(&text) {
+                    Ok(list) => {
+                        for entry in list.entries() {
+                            self.playlist.add(entry.clone());
+                        }
+                    }
+                    Err(e) => eprintln!("tubeamp: could not read {}: {e}", path.display()),
+                }
+            } else {
+                links.extend(parse_links(&text));
+            }
+        }
+        if links.is_empty() {
+            eprintln!("tubeamp: the files have no YouTube links");
+        }
+        self.add_links(links);
     }
 
     /// Shows the MISC ▸ SORT menu at its button. Its choices come back as `UserEvent::Menu`.
@@ -1647,31 +1697,36 @@ impl App {
         self.pl_changed();
     }
 
-    /// LIST ▸ SAVE: the playlist as a JSON array of entries.
+    /// LIST ▸ SAVE: the playlist as JSON entries, or as text links when the name ends in `.txt`.
     fn save_list(&mut self) {
         let Some(path) = pl_app::pick_list_to_save() else {
             return;
         };
-        match std::fs::write(&path, self.playlist.to_json()) {
+        match std::fs::write(&path, pl_app::list_text(&self.playlist, &path)) {
             Ok(()) => eprintln!("tubeamp: saved the playlist to {}", path.display()),
             Err(e) => eprintln!("tubeamp: could not write {}: {e}", path.display()),
         }
     }
 
-    /// LIST ▸ LOAD: replaces the playlist with a JSON file written by SAVE.
+    /// LIST ▸ LOAD: replaces the playlist with a file written by SAVE, in either format.
     fn load_list(&mut self) {
         let Some(path) = pl_app::pick_list_to_load() else {
             return;
         };
         let loaded = std::fs::read_to_string(&path)
             .map_err(|e| e.to_string())
-            .and_then(|text| Playlist::from_json(&text).map_err(|e| e.to_string()));
+            .and_then(|text| pl_app::list_from_text(&text));
         match loaded {
-            Ok(list) => {
+            Ok((list, skipped)) => {
                 let count = list.len();
                 self.playlist = list;
                 self.pl_state.scroll = 0;
                 eprintln!("tubeamp: loaded {count} tracks from {}", path.display());
+                if skipped > 0 {
+                    eprintln!(
+                        "tubeamp: left out {skipped} links that are not videos (use ADD ▸ FILE)"
+                    );
+                }
             }
             Err(msg) => eprintln!("tubeamp: could not load {}: {msg}", path.display()),
         }

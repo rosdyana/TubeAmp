@@ -42,7 +42,18 @@ pub fn matches_sha256(bytes: &[u8], expected: &str) -> bool {
 
 /// Downloads `url`. The request carries only a plain `User-Agent: TubeAmp`.
 fn fetch(url: &str) -> Result<Vec<u8>, String> {
-    let mut response = ureq::get(url)
+    // ureq defaults to Rustls even with only native-tls built in, so the provider is set here.
+    // The OS trust store verifies the server (Security.framework / SChannel).
+    let tls = ureq::tls::TlsConfig::builder()
+        .provider(ureq::tls::TlsProvider::NativeTls)
+        .root_certs(ureq::tls::RootCerts::PlatformVerifier)
+        .build();
+    let agent: ureq::Agent = ureq::Agent::config_builder()
+        .tls_config(tls)
+        .build()
+        .into();
+    let mut response = agent
+        .get(url)
         .header("User-Agent", "TubeAmp")
         .call()
         .map_err(|e| e.to_string())?;
@@ -128,6 +139,17 @@ pub fn ask() -> Answer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Downloads over the native TLS stack. Network, so ignored by default:
+    /// `cargo test -p tubeamp -- --ignored downloads_over_native_tls`.
+    #[test]
+    #[ignore]
+    fn downloads_over_native_tls() {
+        let bytes = fetch(PRIMARY_URL)
+            .or_else(|_| fetch(FALLBACK_URL))
+            .expect("download");
+        assert!(matches_sha256(&bytes, SHA256));
+    }
 
     #[test]
     fn sha256_matches_the_published_test_vector() {

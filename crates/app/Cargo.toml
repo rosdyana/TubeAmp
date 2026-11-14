@@ -31,7 +31,7 @@ serde = { version = "1", features = ["derive"] }
 toml = "0.8"
 directories = "6"
 sha2 = "0.10"
-ureq = { version = "3", default-features = false, features = ["rustls"] }
+ureq = { version = "3", default-features = false, features = ["native-tls-no-default"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "0.6"

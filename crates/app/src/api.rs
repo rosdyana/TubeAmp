@@ -21,6 +21,8 @@ pub enum Slot {
     Nav,
     /// "Start radio".
     Radio,
+    /// The playlists, albums and artists imported from links. Apart from the main list.
+    Import,
 }
 
 /// What an answer is for, so the library knows how to read it.
@@ -39,6 +41,12 @@ pub enum Purpose {
     NavPlaylists,
     /// The up-next queue of a track.
     Radio,
+    /// The first page of a playlist or album to import, or an artist's songs playlist.
+    ImportPage,
+    /// An artist's channel page, to find its songs.
+    ImportArtist,
+    /// The next page of an import.
+    ImportMore,
 }
 
 impl Purpose {
@@ -47,6 +55,7 @@ impl Purpose {
         match self {
             Purpose::NavPlaylists => Slot::Nav,
             Purpose::Radio => Slot::Radio,
+            Purpose::ImportPage | Purpose::ImportArtist | Purpose::ImportMore => Slot::Import,
             _ => Slot::Main,
         }
     }
@@ -111,7 +120,8 @@ impl ApiManager {
     /// is not ready yet and the request waits in the queue.
     pub fn start(&mut self, purpose: Purpose, request: Request) -> Option<Cmd> {
         let slot = purpose.slot();
-        if purpose != Purpose::More {
+        // A continuation continues its list, so it does not make the list's own answer stale.
+        if !matches!(purpose, Purpose::More | Purpose::ImportMore) {
             self.cancel(slot);
         }
         let id = self.next_id;
@@ -281,6 +291,62 @@ mod tests {
             released.refused.is_empty(),
             "the library request was superseded, not refused"
         );
+    }
+
+    #[test]
+    fn a_new_import_supersedes_the_one_in_flight_but_its_next_page_does_not() {
+        let mut api = ApiManager::new();
+        api.on_ready(true);
+        let first = req_id(
+            &api.start(Purpose::ImportPage, ytm::playlist("PLa"))
+                .unwrap(),
+        );
+        let page = req_id(
+            &api.start(Purpose::ImportMore, ytm::continuation("tok"))
+                .unwrap(),
+        );
+        assert_eq!(api.take(first), Some(Purpose::ImportPage));
+        assert_eq!(api.take(page), Some(Purpose::ImportMore));
+
+        let old = req_id(
+            &api.start(Purpose::ImportPage, ytm::playlist("PLb"))
+                .unwrap(),
+        );
+        let more = req_id(
+            &api.start(Purpose::ImportMore, ytm::continuation("tok"))
+                .unwrap(),
+        );
+        let new = req_id(
+            &api.start(Purpose::ImportArtist, ytm::artist("UCx"))
+                .unwrap(),
+        );
+        assert_eq!(
+            api.take(old),
+            None,
+            "the page before the new import is stale"
+        );
+        assert_eq!(api.take(more), None, "its next page is stale too");
+        assert_eq!(api.take(new), Some(Purpose::ImportArtist));
+    }
+
+    #[test]
+    fn imports_do_not_touch_the_main_list_or_need_sign_in() {
+        let mut api = ApiManager::new();
+        api.on_ready(false);
+        let page = req_id(&api.start(Purpose::Home, ytm::home()).unwrap());
+        let import = req_id(
+            &api.start(Purpose::ImportPage, ytm::playlist("PLa"))
+                .unwrap(),
+        );
+        assert_eq!(
+            api.take(page),
+            Some(Purpose::Home),
+            "the home page is not replaced"
+        );
+        assert_eq!(api.take(import), Some(Purpose::ImportPage));
+        assert!(!Purpose::ImportPage.needs_sign_in());
+        assert!(!Purpose::ImportArtist.needs_sign_in());
+        assert!(!Purpose::ImportMore.needs_sign_in());
     }
 
     #[test]

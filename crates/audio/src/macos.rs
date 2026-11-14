@@ -102,11 +102,36 @@ pub struct AudioEngine {
     watch: Arc<TapWatch>,
 }
 
+// SAFETY: the only non-`Send` field is `callback`, a raw pointer to the `Callback` that
+// `start_inner` boxed. This engine is its sole owner. Before `ta_start` returns, nothing else
+// touches it. From then until `ta_stop` returns, only the Core Audio thread uses it, through the
+// IOProc. `Drop` calls `ta_stop` before freeing it. So moving the engine to another thread (the
+// start runs on a worker, see `capture.rs`) does not create concurrent access. The other fields
+// are `Send` on their own.
+unsafe impl Send for AudioEngine {}
+
+// Checked at compile time, so the `unsafe impl` above cannot silently stop applying.
+const _: fn() = || {
+    fn assert_send<T: Send>() {}
+    assert_send::<AudioEngine>();
+};
+
 impl AudioEngine {
     /// Starts the tap on our WebKit audio process. Fails with
     /// [`AudioError::NoOwnedProcess`] until YouTube Music has started playing, so callers
     /// should retry.
+    ///
+    /// This can block while macOS shows the System Audio Recording prompt. Call it from a worker
+    /// thread, never the UI thread (see [`crate::Capture`]).
     pub fn start() -> Result<AudioEngine, AudioError> {
+        // Dev hook (`TUBEAMP_FAKE_START_DELAY_MS=N`): holds the start for N ms, to test that the UI
+        // keeps running while a slow start is in flight.
+        if let Some(ms) = std::env::var("TUBEAMP_FAKE_START_DELAY_MS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+        {
+            std::thread::sleep(Duration::from_millis(ms));
+        }
         if RUNNING.swap(true, Ordering::SeqCst) {
             return Err(AudioError::AlreadyRunning);
         }

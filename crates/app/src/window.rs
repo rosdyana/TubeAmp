@@ -19,7 +19,7 @@ use std::time::{Duration, Instant};
 
 use tubeamp_audio::vis::{Vis, VisFrame};
 use tubeamp_audio::guard::{denial_suspected, DENIAL_WINDOW};
-use tubeamp_audio::{params as eq_params, AudioEngine, AudioError};
+use tubeamp_audio::{params as eq_params, AudioEngine, AudioError, Capture, CaptureEvent};
 use tubeamp_bridge::{Bridge, Cmd, Evt};
 use tubeamp_eq::model::ZERO_VALUE;
 use tubeamp_eq::{Preset, BANDS_HZ, BUILTIN};
@@ -87,6 +87,11 @@ const AUDIO_RETRY: Duration = Duration::from_secs(2);
 const AUDIO_OFF_NOTICE: &str = "EQ OFF: ALLOW SYSTEM AUDIO RECORDING FOR TUBEAMP";
 /// How long that message stays in the marquee.
 const AUDIO_OFF_SHOWN: Duration = Duration::from_secs(8);
+/// The marquee note while the tap's start takes longer than `AUDIO_STARTING_AFTER`. A start can
+/// wait on the System Audio Recording prompt, so the user needs to see that it is in progress.
+const AUDIO_STARTING_NOTICE: &str = "STARTING AUDIO CAPTURE...";
+/// How long a start may take before `AUDIO_STARTING_NOTICE` is shown.
+const AUDIO_STARTING_AFTER: Duration = Duration::from_secs(1);
 /// Delay before `TUBEAMP_AUTOLOAD` loads its video.
 const AUTOLOAD_DELAY: Duration = Duration::from_secs(6);
 /// Arrow-key seek step, in seconds (Winamp).
@@ -330,12 +335,13 @@ struct App {
     milkdrop: MilkdropWindow,
     /// Gaps between the bridge's state updates, for the log.
     state_rate: RateMeter,
-    audio: Option<AudioEngine>,
+    /// The audio tap: its start runs on a worker thread, and `Denied` means no automatic retry.
+    capture: Capture<AudioEngine>,
     audio_given_up: bool,
     audio_error_shown: bool,
+    /// Whether `AUDIO_STARTING_NOTICE` is on the marquee (it must be cleared when the start ends).
+    audio_note_shown: bool,
     audio_retry_at: Instant,
-    /// Set when the tap was torn down as silent: no automatic retry until the user asks.
-    audio_denied: bool,
     /// When the page began reporting playing (`ps == 1`), or `None` while it does not.
     playing_since: Option<Instant>,
     vis: Vis,
@@ -434,11 +440,11 @@ pub fn run(skin: Skin, opts: Options) -> Result<(), winit::error::EventLoopError
         video_fullscreen: false,
         milkdrop: MilkdropWindow::default(),
         state_rate: RateMeter::default(),
-        audio: None,
+        capture: Capture::new(),
         audio_given_up: false,
         audio_error_shown: false,
+        audio_note_shown: false,
         audio_retry_at: started,
-        audio_denied: false,
         playing_since: None,
         vis: Vis::new(),
         vis_frame: VisFrame::default(),
@@ -2700,8 +2706,7 @@ impl App {
             "tubeamp: the audio tap is silent while YouTube Music plays; tearing it down (EQ off). \
              Allow System Audio Recording for TubeAmp, then turn the EQ on or use Retry audio capture."
         );
-        self.audio = None;
-        self.audio_denied = true;
+        self.capture.deny();
         self.playing_since = None;
         self.show_message(AUDIO_OFF_NOTICE.to_string(), Some(AUDIO_OFF_SHOWN));
         self.request_redraw();
@@ -2711,11 +2716,11 @@ impl App {
     /// The tap starts on the next tick while the page plays. A tap that is still silent is torn
     /// down again after the window.
     fn retry_audio_capture(&mut self, now: Instant) {
-        if self.audio.is_some() {
+        if self.capture.engine().is_some() {
             return;
         }
         eprintln!("tubeamp: audio capture retry requested");
-        self.audio_denied = false;
+        self.capture.retry();
         self.audio_error_shown = false;
         self.audio_retry_at = now;
         self.request_redraw();
@@ -3034,8 +3039,8 @@ impl App {
         self.state.duration_secs = p.duration_secs;
         self.state.kbps = p.kbps_for_display().or(self.state.kbps);
         self.state.khz = Some(
-            self.audio
-                .as_ref()
+            self.capture
+                .engine()
                 .map_or(FALLBACK_KHZ, |engine| engine.sample_rate() / 1000),
         );
         // The bridge does not report the channel count, so a playing track is treated as stereo.
@@ -3072,29 +3077,61 @@ impl App {
         self.refresh_video_info();
     }
 
-    fn try_start_audio(&mut self, now: Instant) {
-        match AudioEngine::start() {
-            Ok(engine) => {
-                eprintln!("tubeamp: audio tap running at {} Hz", engine.sample_rate());
-                self.audio = Some(engine);
+    /// Asks for the tap to start. The start runs on a worker thread (it can wait on the TCC
+    /// prompt), so this returns at once. `poll_audio` picks up the result.
+    fn start_audio(&mut self, now: Instant) {
+        if self.capture.request_start(now, AudioEngine::start) && self.opts.log {
+            eprintln!("tubeamp: audio tap start requested (worker thread)");
+        }
+    }
+
+    /// Takes the result of a start that has finished, and shows the starting note when a start
+    /// takes long. Never blocks.
+    fn poll_audio(&mut self, now: Instant) {
+        match self.capture.poll() {
+            Some(CaptureEvent::Started) => {
+                self.clear_starting_note();
+                if let Some(engine) = self.capture.engine() {
+                    eprintln!("tubeamp: audio tap running at {} Hz", engine.sample_rate());
+                }
             }
-            Err(e @ AudioError::Unsupported) => {
-                eprintln!("tubeamp: {e}; the EQ and visualiser audio are off");
+            Some(CaptureEvent::Failed(AudioError::Unsupported)) => {
+                self.clear_starting_note();
+                eprintln!("tubeamp: {}; the EQ and visualiser audio are off", AudioError::Unsupported);
                 self.audio_given_up = true;
             }
-            Err(e) => {
+            Some(CaptureEvent::Failed(e)) => {
+                self.clear_starting_note();
                 if !self.audio_error_shown || self.opts.log {
                     eprintln!("tubeamp: audio tap not ready ({e}); retrying");
                 }
                 self.audio_error_shown = true;
                 self.audio_retry_at = now + AUDIO_RETRY;
             }
+            None => {
+                let slow = self
+                    .capture
+                    .starting_for(now)
+                    .is_some_and(|d| d >= AUDIO_STARTING_AFTER);
+                if slow && !self.audio_note_shown {
+                    self.audio_note_shown = true;
+                    self.show_message(AUDIO_STARTING_NOTICE.to_string(), None);
+                }
+            }
+        }
+    }
+
+    /// Removes the starting note from the marquee, if it is the one showing.
+    fn clear_starting_note(&mut self) {
+        if self.audio_note_shown {
+            self.audio_note_shown = false;
+            self.clear_message_if(AUDIO_STARTING_NOTICE);
         }
     }
 
     /// Feeds the analyser with the samples since the last frame, and advances it one step.
     fn step_vis(&mut self) {
-        match self.audio.as_mut() {
+        match self.capture.engine_mut() {
             Some(engine) => {
                 engine.drain_samples(&mut self.samples);
                 self.vis_frame = self.vis.update(&self.samples).clone();
@@ -3215,7 +3252,7 @@ impl App {
         if playing {
             wake = wake.min(self.next_vis);
         }
-        if playing && self.audio.is_none() && !self.audio_given_up && !self.audio_denied {
+        if playing && self.capture.can_start() && !self.audio_given_up {
             wake = wake.min(self.audio_retry_at);
         }
         if let Some(t) = self.milkdrop.next_wake() {
@@ -3262,27 +3299,24 @@ impl App {
             (true, since) => since.or(Some(now)),
             (false, _) => None,
         };
-        if let Some(engine) = self.audio.as_ref() {
-            let suspect = denial_suspected(
+        self.poll_audio(now);
+        let suspect = self.capture.engine().is_some_and(|engine| {
+            denial_suspected(
                 now,
                 engine.last_sound_at(),
                 self.playing_since,
                 self.state.volume > 0,
                 DENIAL_WINDOW,
-            );
-            if suspect {
-                self.audio_tap_silent();
-            }
+            )
+        });
+        if suspect {
+            self.audio_tap_silent();
         }
-        if playing
-            && self.audio.is_none()
-            && !self.audio_given_up
-            && !self.audio_denied
-            && now >= self.audio_retry_at
+        if playing && self.capture.can_start() && !self.audio_given_up && now >= self.audio_retry_at
         {
-            self.try_start_audio(now);
+            self.start_audio(now);
         }
-        self.milkdrop.tick(now, self.audio.as_ref());
+        self.milkdrop.tick(now, self.capture.engine());
         if let Some(video) = self.video.as_mut() {
             video.apply_due_restore(now);
         }

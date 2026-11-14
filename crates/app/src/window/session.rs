@@ -790,6 +790,13 @@ impl App {
         self.session.message = Some((text, for_.map(|d| Instant::now() + d)));
     }
 
+    /// Removes the marquee message if it is `text` (another message is left alone).
+    pub(super) fn clear_message_if(&mut self, text: &str) {
+        if matches!(&self.session.message, Some((shown, _)) if shown == text) {
+            self.session.message = None;
+        }
+    }
+
     /// The marquee message still to show, if any. An expired one is dropped.
     pub(super) fn active_message(&mut self, now: Instant) -> Option<String> {
         match &self.session.message {

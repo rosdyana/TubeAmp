@@ -1,0 +1,10 @@
+[package]
+name = "tubeamp-skin"
+version = "0.0.0"
+edition = "2021"
+publish = false
+description = "Classic Winamp 2.x .wsz skin loader: bitmap sheets, sprite tables, viscolor/pledit/region parsing"
+
+[dependencies]
+zip = { version = "2", default-features = false, features = ["deflate"] }
+image = { version = "0.25", default-features = false, features = ["bmp", "png"] }

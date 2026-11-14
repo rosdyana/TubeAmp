@@ -5,7 +5,13 @@
 //!
 //! The bridge webview is a child of the video window. The Eject button, the L key and Alt+V show
 //! and hide that window. Closing it only hides it, so the playback goes on.
+//!
+//! Windows are dragged by their title bars with our own drag (not the OS drag), so they snap to
+//! each other and to the screen edges (see `layout.rs`). Dragging the main window moves the group
+//! of windows connected to it. Changing a window's size (double size, windowshade) moves the
+//! windows touching it, as Webamp does.
 
+use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -19,18 +25,19 @@ use tubeamp_skin::Skin;
 use tubeamp_ui::eq_window as eqw;
 use tubeamp_ui::gen_window as gen;
 use tubeamp_ui::library_window as lw;
-use tubeamp_ui::main_window::{BALANCE, CLUTTER_O, POSITION, VOLUME};
+use tubeamp_ui::main_window::{self as mw, BALANCE, CLUTTER_O, POSITION, VOLUME};
 use tubeamp_ui::playlist_window as plw;
 use tubeamp_ui::video_window::{self as vw, VideoHit, VideoWindowState};
 use tubeamp_ui::{
-    displayed_secs, hit_test_eq, hit_test_library, hit_test_main, hit_test_playlist, labels,
-    marquee_period_px, menu_button_rect, press_grab, render_eq, render_library, render_main,
-    render_playlist, render_vis, row_index_at, slider_value_at, sliders, Canvas, EqHit, EqSlider,
-    EqWindowState, LibHit, LibKind, MainButton, MainHit, MainState, PlHit, PlMenu, PlTransport,
+    displayed_secs, hit_test_eq, hit_test_eq_shade, hit_test_library, hit_test_main,
+    hit_test_main_shade, hit_test_playlist, hit_test_playlist_shade, labels, marquee_period_px,
+    menu_button_rect, press_grab, render_eq, render_library, render_main, render_playlist,
+    render_vis, row_index_at, slider_value_at, sliders, Canvas, EqHit, EqSlider, EqWindowState,
+    LibHit, LibKind, MainButton, MainHit, MainState, PlHit, PlMenu, PlTransport,
     PlaylistWindowState, Status, HEIGHT, PRESETS_BTN, WIDTH,
 };
 use winit::application::ApplicationHandler;
-use winit::dpi::{LogicalSize, PhysicalPosition, PhysicalSize};
+use winit::dpi::{LogicalSize, PhysicalPosition};
 use winit::event::{ElementState, KeyEvent, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
 use winit::keyboard::{Key, ModifiersState, NamedKey};
@@ -38,10 +45,15 @@ use winit::platform::modifier_supplement::KeyEventExtModifierSupplement;
 use winit::window::{Fullscreen, WindowAttributes, WindowId};
 
 use crate::eq::{self, EqCommand};
+use crate::hotkeys::{self, KeyName, Shortcut, Stroke};
+use crate::layout::{self, Bx, Win, SNAP_DISTANCE};
 use crate::library::{self, Action, LibCommand, Library};
 use crate::player::{Playback, RateMeter, FALLBACK_KHZ};
 use crate::playlist::{self as pl_app, PlAction, SortCommand};
 use crate::skinned::{self, scaled, SkinnedWindow};
+
+/// Every window, in the order the layout visits them.
+const ALL_WINDOWS: [Win; 5] = [Win::Main, Win::Eq, Win::Playlist, Win::Library, Win::Video];
 
 /// Marquee step: one character cell, as in Webamp's `Marquee.tsx`.
 const MARQUEE_STEP_PX: u32 = 5;
@@ -99,6 +111,18 @@ pub struct Options {
     pub open_video: bool,
     /// Start the video window in the browser view (the full YouTube Music page), not video only.
     pub video_browser: bool,
+    /// Which windows start in windowshade mode.
+    pub shade: ShadeSet,
+    /// Print the window rectangles and connections to stderr when a drag ends.
+    pub layout_dump: bool,
+}
+
+/// The windows that start in windowshade mode (`--shade`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ShadeSet {
+    pub main: bool,
+    pub eq: bool,
+    pub pl: bool,
 }
 
 /// Events posted to the event loop from outside it.
@@ -167,6 +191,34 @@ enum PlDrag {
     },
 }
 
+/// A window dragged by its title bar. The window pressed follows the pointer, and the windows in
+/// `moving` keep their offsets from it, snapping to `stationary` and to the screen.
+struct WinDrag {
+    /// The window whose title bar was pressed. Its events carry the pointer.
+    win: Win,
+    /// That window's origin at the press, in physical pixels.
+    win_start: (f64, f64),
+    /// The pointer on the screen at the press, in physical pixels.
+    start_pointer: (f64, f64),
+    /// The move applied so far, relative to the start.
+    last_move: (f64, f64),
+    /// The windows that move, with their rectangles at the press.
+    moving: Vec<(Win, Bx)>,
+    /// The other visible windows, which the moving ones snap to.
+    stationary: Vec<Bx>,
+    /// The monitor's rectangle (the screen edges snap too).
+    screen: Bx,
+    /// The snap distance in physical pixels.
+    snap: f64,
+}
+
+/// A shade slider drag in progress.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ShadeSlider {
+    Volume,
+    Balance,
+}
+
 struct App {
     opts: Options,
     skin: Skin,
@@ -179,8 +231,12 @@ struct App {
     eq_state: EqWindowState,
     eq_press: Option<EqHit>,
     eq_drag: Option<EqDrag>,
-    /// The main window's outer position and inner size, as last seen. The equalizer docks to it.
-    main_rect: Option<(PhysicalPosition<i32>, PhysicalSize<u32>)>,
+    /// The shade's volume or balance slider being dragged.
+    eq_shade_drag: Option<ShadeSlider>,
+    /// The window drag in progress, if a title bar is held.
+    win_drag: Option<WinDrag>,
+    /// The last title bar press, for double-click detection (it toggles the windowshade).
+    title_click: Option<(Win, Instant)>,
     pl: Option<SkinnedWindow>,
     pl_visible: bool,
     pl_state: PlaylistWindowState,
@@ -279,7 +335,9 @@ pub fn run(skin: Skin, opts: Options) -> Result<(), winit::error::EventLoopError
         eq_state: EqWindowState::default(),
         eq_press: None,
         eq_drag: None,
-        main_rect: None,
+        eq_shade_drag: None,
+        win_drag: None,
+        title_click: None,
         pl: None,
         pl_visible: false,
         pl_state: PlaylistWindowState::default(),
@@ -353,6 +411,25 @@ fn save_one(pixels: &[u32], width: u32, height: u32, path: &Path) {
     }
 }
 
+/// The shortcut key of a winit key press, ignoring the modifiers' effect on the character.
+fn key_name_of(event: &KeyEvent) -> Option<KeyName> {
+    match event.key_without_modifiers() {
+        Key::Named(NamedKey::ArrowLeft) => Some(KeyName::Left),
+        Key::Named(NamedKey::ArrowRight) => Some(KeyName::Right),
+        Key::Named(NamedKey::ArrowUp) => Some(KeyName::Up),
+        Key::Named(NamedKey::ArrowDown) => Some(KeyName::Down),
+        Key::Named(NamedKey::Escape) => Some(KeyName::Escape),
+        Key::Character(c) => {
+            let mut chars = c.chars();
+            match (chars.next(), chars.next()) {
+                (Some(ch), None) => Some(KeyName::Char(ch.to_ascii_lowercase())),
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
 impl App {
     fn log(&self, msg: String) {
         if self.opts.log {
@@ -400,26 +477,359 @@ impl App {
     /// The main window's hit target under the pointer.
     fn main_hit(&self) -> Option<MainHit> {
         let (x, y) = self.main.as_ref()?.skin_pixel()?;
-        hit_test_main(x, y)
+        if self.state.shade {
+            hit_test_main_shade(x, y)
+        } else {
+            hit_test_main(x, y)
+        }
     }
 
     /// The equalizer's hit target under the pointer.
     fn eq_hit_under_cursor(&self) -> Option<EqHit> {
         let (x, y) = self.eq.as_ref()?.skin_pixel()?;
-        hit_test_eq(x, y)
+        if self.eq_state.shade {
+            hit_test_eq_shade(x, y)
+        } else {
+            hit_test_eq(x, y)
+        }
+    }
+
+    // Window geometry and the layout (snapping, connections, size changes).
+
+    fn window(&self, win: Win) -> Option<&SkinnedWindow> {
+        match win {
+            Win::Main => self.main.as_ref(),
+            Win::Eq => self.eq.as_ref(),
+            Win::Playlist => self.pl.as_ref(),
+            Win::Library => self.lib.as_ref(),
+            Win::Video => self.video.as_ref(),
+        }
+    }
+
+    fn window_visible(&self, win: Win) -> bool {
+        match win {
+            Win::Main => true,
+            Win::Eq => self.eq_visible,
+            Win::Playlist => self.pl_visible,
+            Win::Library => self.lib_visible,
+            Win::Video => self.video_visible,
+        }
+    }
+
+    /// The window's size in skin pixels, from the state (not from the OS, which applies a resize
+    /// later).
+    fn base_size(&self, win: Win) -> (u32, u32) {
+        match win {
+            Win::Main => (WIDTH, mw::window_height(self.state.shade)),
+            Win::Eq => (eqw::WIDTH, eqw::window_height(self.eq_state.shade)),
+            Win::Playlist => plw::window_size_for(self.pl_state.size_steps, self.pl_state.shade),
+            Win::Library => gen::window_size(self.library.state.size_steps),
+            Win::Video => (self.video_state.w, self.video_state.h),
+        }
+    }
+
+    /// The window's size in physical pixels, as it should be now.
+    fn window_px_size(&self, win: Win) -> (f64, f64) {
+        let (w, h) = self.base_size(win);
+        let factor = self.window(win).map_or(1, |sw| sw.factor());
+        (f64::from(w * factor), f64::from(h * factor))
+    }
+
+    /// The window's origin in physical pixels, if it exists.
+    fn window_origin(&self, win: Win) -> Option<(f64, f64)> {
+        let pos = self.window(win)?.window.outer_position().ok()?;
+        Some((f64::from(pos.x), f64::from(pos.y)))
+    }
+
+    fn set_window_origin(&self, win: Win, origin: (f64, f64)) {
+        if let Some(sw) = self.window(win) {
+            sw.window.set_outer_position(PhysicalPosition::new(
+                origin.0.round() as i32,
+                origin.1.round() as i32,
+            ));
+        }
+    }
+
+    /// The rectangles of the visible windows, physical pixels.
+    fn visible_rects(&self) -> Vec<(Win, Bx)> {
+        ALL_WINDOWS
+            .iter()
+            .filter(|&&w| self.window_visible(w))
+            .filter_map(|&w| {
+                let (x, y) = self.window_origin(w)?;
+                let (sw, sh) = self.window_px_size(w);
+                Some((w, Bx::new(x, y, sw, sh)))
+            })
+            .collect()
+    }
+
+    /// The monitor the main window is on, in physical pixels. Without one, the screen is unbounded.
+    fn screen_rect(&self) -> Bx {
+        self.main
+            .as_ref()
+            .and_then(|m| m.window.current_monitor())
+            .map_or(Bx::new(-1.0e7, -1.0e7, 2.0e7, 2.0e7), |m| {
+                let p = m.position();
+                let s = m.size();
+                Bx::new(
+                    f64::from(p.x),
+                    f64::from(p.y),
+                    f64::from(s.width),
+                    f64::from(s.height),
+                )
+            })
+    }
+
+    /// The snap distance in physical pixels for the window's monitor.
+    fn snap_px(&self, win: Win) -> f64 {
+        let scale = self.window(win).map_or(1.0, |sw| sw.window.scale_factor());
+        SNAP_DISTANCE * scale
+    }
+
+    /// Starts a drag of `win` by its title bar. Dragging the main window takes its connected group
+    /// along; any other window moves alone.
+    fn begin_window_drag(&mut self, win: Win) {
+        let Some(origin) = self.window_origin(win) else {
+            return;
+        };
+        let Some(cursor) = self.window(win).and_then(|sw| sw.cursor_position()) else {
+            return;
+        };
+        let all = self.visible_rects();
+        let snap = self.snap_px(win);
+        let group: BTreeSet<Win> = if win == Win::Main {
+            layout::connected_group(&all, Win::Main, snap)
+        } else {
+            [win].into_iter().collect()
+        };
+        let moving: Vec<(Win, Bx)> = all
+            .iter()
+            .filter(|(w, _)| group.contains(w))
+            .copied()
+            .collect();
+        let stationary: Vec<Bx> = all
+            .iter()
+            .filter(|(w, _)| !group.contains(w))
+            .map(|(_, b)| *b)
+            .collect();
+        self.log(format!(
+            "drag: start {win:?} origin {origin:?} cursor ({:.1}, {:.1}) factor {}",
+            cursor.x,
+            cursor.y,
+            self.window(win).map_or(0, |sw| sw.factor())
+        ));
+        self.win_drag = Some(WinDrag {
+            win,
+            win_start: origin,
+            start_pointer: (origin.0 + cursor.x, origin.1 + cursor.y),
+            last_move: (0.0, 0.0),
+            moving,
+            stationary,
+            screen: self.screen_rect(),
+            snap,
+        });
+    }
+
+    /// Moves the dragged windows to the pointer, snapped. Called by the dragged window's events.
+    fn update_window_drag(&mut self) {
+        let Some(drag) = self.win_drag.as_ref() else {
+            return;
+        };
+        let Some(cursor) = self.window(drag.win).and_then(|sw| sw.cursor_position()) else {
+            return;
+        };
+        // The dragged window's own position is where we last put it, so the pointer's screen
+        // position is that origin plus the pointer's offset inside the window.
+        let pointer = (
+            drag.win_start.0 + drag.last_move.0 + cursor.x,
+            drag.win_start.1 + drag.last_move.1 + cursor.y,
+        );
+        let proposed = (
+            pointer.0 - drag.start_pointer.0,
+            pointer.1 - drag.start_pointer.1,
+        );
+        // A press that has not moved the pointer moves nothing, even if the group would snap.
+        if proposed == (0.0, 0.0) {
+            return;
+        }
+        let boxes: Vec<Bx> = drag.moving.iter().map(|(_, b)| *b).collect();
+        let delta = layout::drag_diff(proposed, &boxes, &drag.stationary, &drag.screen, drag.snap);
+        let moves: Vec<(Win, (f64, f64))> = drag
+            .moving
+            .iter()
+            .map(|(w, b)| (*w, (b.x + delta.0, b.y + delta.1)))
+            .collect();
+        if let Some(d) = self.win_drag.as_mut() {
+            d.last_move = delta;
+        }
+        for (w, origin) in moves {
+            self.set_window_origin(w, origin);
+        }
+    }
+
+    /// Ends the window drag, if one is running. With `--layout-dump` it prints the layout. A press
+    /// that moved the window is not the first half of a double-click.
+    fn end_window_drag(&mut self) {
+        let Some(drag) = self.win_drag.take() else {
+            return;
+        };
+        if drag.last_move != (0.0, 0.0) {
+            self.title_click = None;
+        }
+        if self.opts.layout_dump {
+            self.dump_layout();
+        }
+    }
+
+    /// Prints the visible windows' rectangles and the connections to stderr.
+    fn dump_layout(&self) {
+        let all = self.visible_rects();
+        for (w, b) in &all {
+            eprintln!("layout: {w:?} x={} y={} w={} h={}", b.x, b.y, b.w, b.h);
+        }
+        let edges = layout::adjacency(&all);
+        let mut touching = Vec::new();
+        for (w, e) in &edges {
+            if let Some(t) = e.top {
+                touching.push(format!("{w:?} below {t:?}"));
+            }
+            if let Some(l) = e.left {
+                touching.push(format!("{w:?} right of {l:?}"));
+            }
+        }
+        touching.sort();
+        let group = layout::connected_group(&all, Win::Main, self.snap_px(Win::Main));
+        eprintln!(
+            "layout: edges [{}]; connected to main [{}]",
+            touching.join(", "),
+            group
+                .iter()
+                .map(|w| format!("{w:?}"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
+
+    /// Changes a window's size or shade with `change`, and moves the windows that touch it, the
+    /// way Webamp does: the windows below or to the right move by the change in size. The sizes
+    /// are read from the state, before and after.
+    fn relayout(&mut self, change: impl FnOnce(&mut App)) {
+        let before = self.visible_rects();
+        let graph = layout::adjacency(&before);
+        let before_sizes: HashMap<Win, (f64, f64)> =
+            before.iter().map(|(w, b)| (*w, (b.w, b.h))).collect();
+        let origins: Vec<(Win, (f64, f64))> =
+            before.iter().map(|(w, b)| (*w, (b.x, b.y))).collect();
+        change(self);
+        let size_diff: HashMap<Win, (f64, f64)> = before
+            .iter()
+            .map(|(w, _)| {
+                let (nw, nh) = self.window_px_size(*w);
+                let (ow, oh) = before_sizes[w];
+                (*w, (nw - ow, nh - oh))
+            })
+            .collect();
+        let diff = layout::position_diff(&graph, &size_diff);
+        for (w, (x, y)) in origins {
+            let d = diff.get(&w).copied().unwrap_or((0.0, 0.0));
+            self.set_window_origin(w, (x + d.0, y + d.1));
+        }
+        self.request_redraw();
+    }
+
+    /// Gives every window its skin size and zoom, from the state.
+    fn apply_sizes(&mut self) {
+        let zoom = if self.state.doubled { 2 } else { 1 };
+        for win in ALL_WINDOWS {
+            let base = self.base_size(win);
+            let slot = match win {
+                Win::Main => self.main.as_mut(),
+                Win::Eq => self.eq.as_mut(),
+                Win::Playlist => self.pl.as_mut(),
+                Win::Library => self.lib.as_mut(),
+                Win::Video => self.video.as_mut(),
+            };
+            if let Some(sw) = slot {
+                sw.set_zoom(zoom);
+                sw.set_base(base);
+            }
+        }
+    }
+
+    /// A title bar was pressed. A second press within [`DOUBLE_CLICK`] toggles the windowshade of
+    /// the main window, the equalizer and the playlist; otherwise the press starts a drag.
+    fn title_press(&mut self, win: Win) {
+        let now = Instant::now();
+        if let Some((last, at)) = self.title_click {
+            if last == win && now.duration_since(at) <= DOUBLE_CLICK {
+                self.title_click = None;
+                self.toggle_shade_of(win);
+                return;
+            }
+        }
+        self.title_click = Some((win, now));
+        self.begin_window_drag(win);
+    }
+
+    /// The windowshade toggle for `win`. Only the main window, the equalizer and the playlist have
+    /// one; the library and the video window do nothing.
+    fn toggle_shade_of(&mut self, win: Win) {
+        match win {
+            Win::Main => self.toggle_main_shade(),
+            Win::Eq => self.toggle_eq_shade(),
+            Win::Playlist => self.toggle_pl_shade(),
+            Win::Library | Win::Video => {}
+        }
+    }
+
+    fn toggle_main_shade(&mut self) {
+        let on = !self.state.shade;
+        self.relayout(|app| {
+            app.state.shade = on;
+            app.apply_sizes();
+        });
+    }
+
+    fn toggle_eq_shade(&mut self) {
+        let on = !self.eq_state.shade;
+        self.relayout(|app| {
+            app.eq_state.shade = on;
+            app.apply_sizes();
+        });
+    }
+
+    fn toggle_pl_shade(&mut self) {
+        let on = !self.pl_state.shade;
+        self.relayout(|app| {
+            app.pl_state.shade = on;
+            app.apply_sizes();
+        });
+    }
+
+    /// Snaps a resize of `win` to `(w, h)` skin pixels: its right and bottom edges move onto the
+    /// other windows' and the screen's edges when they are close. Returns the snapped skin size.
+    fn snapped_skin_size(&self, win: Win, w: f64, h: f64) -> (f64, f64) {
+        let Some(origin) = self.window_origin(win) else {
+            return (w, h);
+        };
+        let factor = self.window(win).map_or(1, |sw| sw.factor());
+        let factor = f64::from(factor);
+        let rect = Bx::new(origin.0, origin.1, w * factor, h * factor);
+        let others: Vec<Bx> = self
+            .visible_rects()
+            .into_iter()
+            .filter(|(o, _)| *o != win)
+            .map(|(_, b)| b)
+            .collect();
+        let snapped = layout::snap_resize(&rect, &others, &self.screen_rect(), self.snap_px(win));
+        (snapped.w / factor, snapped.h / factor)
     }
 
     fn on_press(&mut self) {
         let hit = self.main_hit();
         self.press_target = hit;
         match hit {
-            Some(MainHit::TitleBar) => {
-                if let Some(main) = &self.main {
-                    if let Err(e) = main.window.drag_window() {
-                        eprintln!("tubeamp: window drag failed: {e}");
-                    }
-                }
-            }
+            Some(MainHit::TitleBar) => self.title_press(Win::Main),
             Some(MainHit::Button(button)) => {
                 self.state.pressed = Some(button);
                 let drag = match button {
@@ -445,10 +855,14 @@ impl App {
         };
         match self.drag {
             Some(Drag::Position { .. }) => {
-                let fraction = sliders::position_fraction(x - f64::from(POSITION.x));
-                self.drag = Some(Drag::Position {
-                    percent: sliders::percent(fraction),
-                });
+                let (percent, fraction) = if self.state.shade {
+                    let percent = mw::shade_position_percent(x);
+                    (percent, percent as f32 / 100.0)
+                } else {
+                    let fraction = sliders::position_fraction(x - f64::from(POSITION.x));
+                    (sliders::percent(fraction), fraction)
+                };
+                self.drag = Some(Drag::Position { percent });
                 self.state.position = fraction;
             }
             Some(Drag::Volume) => {
@@ -500,6 +914,7 @@ impl App {
     }
 
     fn on_release(&mut self, el: &ActiveEventLoop) {
+        self.end_window_drag();
         let target = self.press_target.take();
         let hit = self.main_hit();
         self.state.pressed = None;
@@ -539,95 +954,94 @@ impl App {
                     let on = !self.state.doubled;
                     self.set_doubled(on);
                 }
+                MainButton::Shade => self.toggle_main_shade(),
                 _ => {}
             },
-            MainHit::Time => self.state.remaining_mode = !self.state.remaining_mode,
+            MainHit::Time | MainHit::MiniTime => {
+                self.state.remaining_mode = !self.state.remaining_mode
+            }
             MainHit::Vis => self.state.vis_mode = self.state.vis_mode.next(),
             _ => {}
         }
         self.request_redraw();
     }
 
+    /// A native key press: a shortcut (see `hotkeys.rs`), unless the window handles the key
+    /// itself. Key repeats only move the arrows.
     fn on_key(&mut self, event: &KeyEvent) {
         if event.state != ElementState::Pressed {
             return;
         }
-        if self.modifiers.control_key() {
-            if event.repeat {
-                return;
-            }
-            match event.key_without_modifiers() {
-                Key::Character(c) if c.eq_ignore_ascii_case("d") => {
-                    let on = !self.state.doubled;
-                    self.set_doubled(on);
-                }
-                Key::Character(c) if c.eq_ignore_ascii_case("t") => {
-                    self.state.remaining_mode = !self.state.remaining_mode;
-                }
-                Key::Character(c) if c.eq_ignore_ascii_case("l") => self.toggle_library(),
-                _ => return,
-            }
-            self.request_redraw();
+        let Some(key) = key_name_of(event) else {
             return;
-        }
-        // Alt+L opens the media library and Alt+V the video window (Winamp's shortcuts). Other Alt
-        // keys are left alone.
-        if self.modifiers.alt_key() && !event.repeat {
-            let key = event.key_without_modifiers();
-            if matches!(&key, Key::Character(c) if c.eq_ignore_ascii_case("l")) {
-                self.toggle_library();
+        };
+        let stroke = Stroke {
+            key,
+            ctrl: self.modifiers.control_key(),
+            alt: self.modifiers.alt_key(),
+            meta: self.modifiers.super_key(),
+        };
+        if let Some(shortcut) = hotkeys::shortcut_for(&stroke, event.repeat) {
+            if self.run_shortcut(shortcut) {
                 self.request_redraw();
-                return;
-            }
-            if matches!(&key, Key::Character(c) if c.eq_ignore_ascii_case("v")) {
-                self.toggle_video();
-                self.request_redraw();
-                return;
             }
         }
-        match event.key_without_modifiers() {
-            Key::Named(NamedKey::ArrowLeft) => self.seek_relative(-SEEK_STEP_SECS),
-            Key::Named(NamedKey::ArrowRight) => self.seek_relative(SEEK_STEP_SECS),
-            Key::Named(NamedKey::ArrowUp) => self.nudge_volume(VOLUME_STEP),
-            Key::Named(NamedKey::ArrowDown) => self.nudge_volume(-VOLUME_STEP),
-            Key::Named(NamedKey::Escape) if self.video_fullscreen => self.toggle_video_fullscreen(),
-            _ if event.repeat => return,
-            Key::Character(c) => match c.to_ascii_lowercase().as_str() {
-                "z" => self.prev_track(),
-                "x" => self.send(Cmd::Play),
-                "c" => self.send(Cmd::Pause),
-                "v" => self.send(Cmd::Stop),
-                "b" => self.next_track(),
-                "l" => self.toggle_video(),
-                _ => return,
-            },
-            _ => return,
-        }
-        self.request_redraw();
     }
 
-    /// Doubles (or halves) the windows. The docked equalizer follows the main window's new bottom
-    /// edge in `on_main_resized`.
+    /// Runs a shortcut. Returns whether it was handled: Escape is not, outside fullscreen.
+    fn run_shortcut(&mut self, shortcut: Shortcut) -> bool {
+        match shortcut {
+            Shortcut::ToggleDouble => {
+                let on = !self.state.doubled;
+                self.set_doubled(on);
+            }
+            Shortcut::ToggleRemaining => self.state.remaining_mode = !self.state.remaining_mode,
+            Shortcut::ToggleLibrary => self.toggle_library(),
+            Shortcut::ToggleVideo => self.toggle_video(),
+            Shortcut::SeekBack => self.seek_relative(-SEEK_STEP_SECS),
+            Shortcut::SeekForward => self.seek_relative(SEEK_STEP_SECS),
+            Shortcut::VolumeUp => self.nudge_volume(VOLUME_STEP),
+            Shortcut::VolumeDown => self.nudge_volume(-VOLUME_STEP),
+            Shortcut::Previous => self.prev_track(),
+            Shortcut::Play => self.send(Cmd::Play),
+            Shortcut::Pause => self.send(Cmd::Pause),
+            Shortcut::Stop => self.send(Cmd::Stop),
+            Shortcut::Next => self.next_track(),
+            Shortcut::Escape => {
+                if !self.video_fullscreen {
+                    return false;
+                }
+                self.toggle_video_fullscreen();
+            }
+        }
+        true
+    }
+
+    /// A key the YouTube Music page forwarded (video view). The same shortcut as a native press.
+    /// When TubeAmp used the key, its main window takes the keyboard, so the page does not keep
+    /// it: the next keys come to TubeAmp's own windows.
+    fn on_page_key(&mut self, key: &str, code: &str, ctrl: bool, alt: bool, meta: bool) {
+        let Some(stroke) = hotkeys::stroke_from_page(key, code, ctrl, alt, meta) else {
+            return;
+        };
+        let Some(shortcut) = hotkeys::shortcut_for(&stroke, false) else {
+            return;
+        };
+        if self.run_shortcut(shortcut) {
+            if let Some(main) = self.main.as_ref() {
+                main.window.focus_window();
+            }
+            self.request_redraw();
+        }
+    }
+
+    /// Doubles (or halves) the windows. The windows touching them move with them (`relayout`).
     fn set_doubled(&mut self, on: bool) {
-        let zoom = if on { 2 } else { 1 };
-        self.state.doubled = on;
-        if let Some(main) = self.main.as_mut() {
-            main.set_zoom(zoom);
-        }
-        if let Some(eq) = self.eq.as_mut() {
-            eq.set_zoom(zoom);
-        }
-        if let Some(pl) = self.pl.as_mut() {
-            pl.set_zoom(zoom);
-        }
-        if let Some(lib) = self.lib.as_mut() {
-            lib.set_zoom(zoom);
-        }
-        if let Some(video) = self.video.as_mut() {
-            video.set_zoom(zoom);
-        }
+        self.relayout(|app| {
+            app.state.doubled = on;
+            app.apply_sizes();
+        });
         self.update_video_bounds();
-        self.request_redraw();
     }
 
     // Playlist window.
@@ -635,6 +1049,9 @@ impl App {
     /// The playlist's hit target under the pointer.
     fn pl_hit_under_cursor(&self) -> Option<PlHit> {
         let (x, y) = self.pl.as_ref()?.skin_pixel()?;
+        if self.pl_state.shade {
+            return hit_test_playlist_shade(self.pl_state.size_steps, x, y);
+        }
         hit_test_playlist(
             self.pl_state.size_steps,
             self.pl_state.scroll,
@@ -653,7 +1070,7 @@ impl App {
         if self.pl.is_none() {
             return;
         }
-        self.dock_playlist();
+        self.place_playlist_below_stack();
         if let Some(pl) = self.pl.as_ref() {
             pl.window.set_visible(true);
         }
@@ -684,58 +1101,23 @@ impl App {
         }
     }
 
-    /// Where a playlist docked to a main window at `main_pos` and `main_height` sits: under the
-    /// equalizer when it is open, otherwise under the main window. Both share the main window's
-    /// left edge.
-    fn dock_point(
-        &self,
-        main_pos: PhysicalPosition<i32>,
-        main_height: u32,
-    ) -> PhysicalPosition<i32> {
+    /// Where the playlist goes when it is shown: under the equalizer when that is open, otherwise
+    /// under the main window, both at the main window's left edge. The heights come from the state.
+    fn below_stack_point(&self) -> Option<(f64, f64)> {
+        let (x, y) = self.window_origin(Win::Main)?;
         if self.eq_visible {
-            if let Some(eq) = self.eq.as_ref() {
-                if let Ok(eq_pos) = eq.window.outer_position() {
-                    let eq_height = eq.window.inner_size().height as i32;
-                    return PhysicalPosition::new(main_pos.x, eq_pos.y + eq_height);
-                }
-            }
+            let (_, eq_y) = self.window_origin(Win::Eq)?;
+            let (_, eq_h) = self.window_px_size(Win::Eq);
+            return Some((x, eq_y + eq_h));
         }
-        PhysicalPosition::new(main_pos.x, main_pos.y + main_height as i32)
+        let (_, main_h) = self.window_px_size(Win::Main);
+        Some((x, y + main_h))
     }
 
-    /// Moves the playlist to its dock point for the main window as it is now.
-    fn dock_playlist(&self) {
-        let Some(main) = self.main.as_ref() else {
-            return;
-        };
-        let Ok(main_pos) = main.window.outer_position() else {
-            return;
-        };
-        let point = self.dock_point(main_pos, main.window.inner_size().height);
-        if let Some(pl) = self.pl.as_ref() {
-            pl.window.set_outer_position(point);
-        }
-    }
-
-    /// Whether the playlist is at its dock point for a main window at `main_pos` and
-    /// `main_height`. Call this before the windows move, so the equalizer is still where it was.
-    fn pl_docked_for(&self, main_pos: PhysicalPosition<i32>, main_height: u32) -> bool {
-        let Some(pl) = self.pl.as_ref() else {
-            return false;
-        };
-        let Ok(pos) = pl.window.outer_position() else {
-            return false;
-        };
-        pos == self.dock_point(main_pos, main_height)
-    }
-
-    fn pl_docked_now(&self) -> bool {
-        let Some(main) = self.main.as_ref() else {
-            return false;
-        };
-        match main.window.outer_position() {
-            Ok(pos) => self.pl_docked_for(pos, main.window.inner_size().height),
-            Err(_) => false,
+    /// Moves the playlist to where it goes when shown (see `below_stack_point`).
+    fn place_playlist_below_stack(&self) {
+        if let Some(point) = self.below_stack_point() {
+            self.set_window_origin(Win::Playlist, point);
         }
     }
 
@@ -747,8 +1129,9 @@ impl App {
             self.playlist.len(),
             plw::visible_rows(steps),
         );
+        let shade = self.pl_state.shade;
         if let Some(pl) = self.pl.as_mut() {
-            pl.set_base(plw::window_size(steps));
+            pl.set_base(plw::window_size_for(steps, shade));
         }
         self.request_redraw();
     }
@@ -793,13 +1176,7 @@ impl App {
             self.pl_state.open_menu = None;
         }
         match hit {
-            Some(PlHit::TitleBar) => {
-                if let Some(pl) = self.pl.as_ref() {
-                    if let Err(e) = pl.window.drag_window() {
-                        eprintln!("tubeamp: playlist drag failed: {e}");
-                    }
-                }
-            }
+            Some(PlHit::TitleBar) => self.title_press(Win::Playlist),
             Some(PlHit::Resize) => {
                 if let Some(cursor) = self.pl.as_ref().and_then(|p| p.cursor_position()) {
                     self.pl_drag = Some(PlDrag::Resize {
@@ -865,6 +1242,7 @@ impl App {
     }
 
     fn on_pl_release(&mut self) {
+        self.end_window_drag();
         let target = self.pl_press.take();
         let hit = self.pl_hit_under_cursor();
         self.pl_state.pressed = None;
@@ -891,8 +1269,7 @@ impl App {
     fn activate_pl(&mut self, hit: PlHit) {
         match hit {
             PlHit::Close => self.hide_pl(),
-            // Windowshade for the playlist comes with M5; the button is drawn but does nothing yet.
-            PlHit::Shade => {}
+            PlHit::Shade => self.toggle_pl_shade(),
             PlHit::Transport(t) => self.run_pl_transport(t),
             PlHit::MiniTime => self.state.remaining_mode = !self.state.remaining_mode,
             _ => {}
@@ -940,7 +1317,14 @@ impl App {
                 let (w0, h0) = plw::window_size(start_steps);
                 let w = f64::from(w0) + (cursor.x - start_cursor.x) / factor;
                 let h = f64::from(h0) + (cursor.y - start_cursor.y) / factor;
-                let steps = plw::steps_for_size(w.round() as i32, h.round() as i32);
+                let (w, h) = self.snapped_skin_size(Win::Playlist, w, h);
+                let fitted = plw::steps_for_size(w.round() as i32, h.round() as i32);
+                // The shade is one strip tall: only the width changes.
+                let steps = if self.pl_state.shade {
+                    (fitted.0, start_steps.1)
+                } else {
+                    fitted
+                };
                 if steps != self.pl_state.size_steps {
                     self.log(format!(
                         "playlist: resize to {steps:?} (w {w:.1}, h {h:.1}, factor {factor}, cursor {:.1},{:.1} from {:.1},{:.1})",
@@ -979,6 +1363,13 @@ impl App {
         self.pl_changed();
     }
 
+    /// Moves the window drag when the window being dragged is `win` (its events carry the pointer).
+    fn drag_moved(&mut self, win: Win) {
+        if self.win_drag.as_ref().is_some_and(|d| d.win == win) {
+            self.update_window_drag();
+        }
+    }
+
     fn pl_event(&mut self, event: WindowEvent) {
         match event {
             // Closing the playlist window hides it, like the equalizer.
@@ -999,6 +1390,7 @@ impl App {
                 if self.pl_drag.is_some() {
                     self.update_pl_drag();
                 }
+                self.drag_moved(Win::Playlist);
                 self.pl_state.hover = self.pl_hit_under_cursor();
                 self.request_redraw();
             }
@@ -1203,7 +1595,8 @@ impl App {
         if !self.lib_placed {
             if let Some(main) = self.main.as_ref() {
                 if let Ok(pos) = main.window.outer_position() {
-                    let x = pos.x + main.window.inner_size().width as i32 + 8;
+                    let (main_w, _) = self.window_px_size(Win::Main);
+                    let x = pos.x + main_w as i32;
                     lib.window
                         .set_outer_position(PhysicalPosition::new(x, pos.y));
                 }
@@ -1298,13 +1691,7 @@ impl App {
             self.library.state.search_active = false;
         }
         match hit {
-            Some(LibHit::TitleBar) => {
-                if let Some(lib) = self.lib.as_ref() {
-                    if let Err(e) = lib.window.drag_window() {
-                        eprintln!("tubeamp: media library drag failed: {e}");
-                    }
-                }
-            }
+            Some(LibHit::TitleBar) => self.begin_window_drag(Win::Library),
             Some(LibHit::Close) => self.hide_library(),
             Some(LibHit::Resize) => {
                 if let Some(cursor) = self.lib.as_ref().and_then(|l| l.cursor_position()) {
@@ -1377,6 +1764,7 @@ impl App {
     }
 
     fn on_lib_release(&mut self) {
+        self.end_window_drag();
         self.lib_press = None;
         self.lib_drag = None;
         self.request_redraw();
@@ -1408,6 +1796,7 @@ impl App {
                 let (w0, h0) = gen::window_size(start_steps);
                 let w = f64::from(w0) + (cursor.x - start_cursor.x) / factor;
                 let h = f64::from(h0) + (cursor.y - start_cursor.y) / factor;
+                let (w, h) = self.snapped_skin_size(Win::Library, w, h);
                 let steps = gen::steps_for_size(w.round() as i32, h.round() as i32);
                 if steps != self.library.state.size_steps {
                     self.set_lib_steps(steps);
@@ -1602,6 +1991,7 @@ impl App {
                 if self.lib_drag.is_some() {
                     self.update_lib_drag();
                 }
+                self.drag_moved(Win::Library);
                 self.request_redraw();
             }
             WindowEvent::CursorLeft { .. } => {
@@ -1656,7 +2046,8 @@ impl App {
         if !self.video_placed {
             let place = self.main.as_ref().and_then(|main| {
                 let pos = main.window.outer_position().ok()?;
-                let x = pos.x + main.window.inner_size().width as i32 + 8;
+                let (main_w, _) = self.window_px_size(Win::Main);
+                let x = pos.x + main_w as i32;
                 Some(PhysicalPosition::new(x, pos.y))
             });
             if let (Some(place), Some(video)) = (place, self.video.as_ref()) {
@@ -1798,13 +2189,7 @@ impl App {
             _ => None,
         };
         match hit {
-            Some(VideoHit::TitleBar) => {
-                if let Some(video) = self.video.as_ref() {
-                    if let Err(e) = video.window.drag_window() {
-                        eprintln!("tubeamp: video window drag failed: {e}");
-                    }
-                }
-            }
+            Some(VideoHit::TitleBar) => self.begin_window_drag(Win::Video),
             Some(VideoHit::Resize) => {
                 let start = (self.video_state.w, self.video_state.h);
                 if let Some(cursor) = self.video.as_ref().and_then(|v| v.cursor_position()) {
@@ -1820,6 +2205,7 @@ impl App {
     }
 
     fn on_video_release(&mut self) {
+        self.end_window_drag();
         let target = self.video_press.take();
         let hit = self.video_hit_under_cursor();
         self.video_state.pressed = None;
@@ -1856,6 +2242,7 @@ impl App {
         let factor = f64::from(video.factor());
         let w = f64::from(drag.start.0) + (cursor.x - drag.start_cursor.x) / factor;
         let h = f64::from(drag.start.1) + (cursor.y - drag.start_cursor.y) / factor;
+        let (w, h) = self.snapped_skin_size(Win::Video, w, h);
         let size = vw::clamp_size(w.round() as i32, h.round() as i32);
         if size != (self.video_state.w, self.video_state.h) {
             self.set_video_size(size);
@@ -1905,6 +2292,7 @@ impl App {
                 if self.video_resize.is_some() {
                     self.update_video_resize();
                 }
+                self.drag_moved(Win::Video);
                 self.request_redraw();
             }
             WindowEvent::CursorLeft { .. } => {
@@ -1929,26 +2317,19 @@ impl App {
     // Equalizer window.
 
     fn toggle_eq(&mut self) {
-        // A playlist docked under the equalizer (or the main window) follows the toggle.
-        let attached = self.pl_visible && self.pl_docked_now();
         if self.eq_visible {
             self.hide_eq();
         } else {
             self.show_eq();
         }
-        if attached {
-            self.dock_playlist();
-        }
     }
 
-    /// Shows the equalizer directly below the main window, at the main window's left edge.
+    /// Shows the equalizer directly below the main window, at the main window's left edge. Its
+    /// place after that is whatever the user (or the snapping) left it at.
     fn show_eq(&mut self) {
-        let Some(main) = self.main.as_ref() else {
-            return;
-        };
-        if let Ok(pos) = main.window.outer_position() {
-            let height = main.window.inner_size().height as i32;
-            self.move_eq(PhysicalPosition::new(pos.x, pos.y + height));
+        if let Some((x, y)) = self.window_origin(Win::Main) {
+            let (_, height) = self.window_px_size(Win::Main);
+            self.move_eq(PhysicalPosition::new(x as i32, (y + height) as i32));
         }
         let Some(eq) = self.eq.as_ref() else {
             return;
@@ -1964,6 +2345,7 @@ impl App {
         self.state.eq_open = false;
         self.eq_press = None;
         self.eq_drag = None;
+        self.eq_shade_drag = None;
         self.eq_state.pressed = None;
         self.eq_state.dragging = None;
         if let Some(eq) = self.eq.as_ref() {
@@ -1978,84 +2360,19 @@ impl App {
         }
     }
 
-    fn eq_outer_position(&self) -> Option<PhysicalPosition<i32>> {
-        self.eq.as_ref()?.window.outer_position().ok()
-    }
-
-    /// Whether the equalizer's top edge sits exactly on the bottom edge of a main window at
-    /// `main_pos` with `main_size`.
-    fn eq_docked_to(&self, main_pos: PhysicalPosition<i32>, main_size: PhysicalSize<u32>) -> bool {
-        self.eq_outer_position()
-            .is_some_and(|p| p.y == main_pos.y + main_size.height as i32)
-    }
-
-    /// The main window moved: a docked equalizer and a docked playlist move with it. This is a
-    /// simple attach; full snapping comes in M5.
-    fn on_main_moved(&mut self, pos: PhysicalPosition<i32>) {
-        match self.main_rect {
-            Some((old, size)) => {
-                let pl_attached = self.pl_visible && self.pl_docked_for(old, size.height);
-                let delta_x = pos.x - old.x;
-                let delta_y = pos.y - old.y;
-                if self.eq_visible && self.eq_docked_to(old, size) {
-                    if let Some(eq_pos) = self.eq_outer_position() {
-                        self.move_eq(PhysicalPosition::new(
-                            eq_pos.x + delta_x,
-                            eq_pos.y + delta_y,
-                        ));
-                    }
-                }
-                if pl_attached {
-                    if let Some(pl) = self.pl.as_ref() {
-                        if let Ok(pl_pos) = pl.window.outer_position() {
-                            pl.window.set_outer_position(PhysicalPosition::new(
-                                pl_pos.x + delta_x,
-                                pl_pos.y + delta_y,
-                            ));
-                        }
-                    }
-                }
-                self.main_rect = Some((pos, size));
-            }
-            None => {
-                self.main_rect = self.main.as_ref().map(|m| (pos, m.window.inner_size()));
-            }
-        }
-    }
-
-    /// The main window changed size (zoom): a docked equalizer keeps its top on the new bottom.
-    fn on_main_resized(&mut self, size: PhysicalSize<u32>) {
-        let Some((pos, old_size)) = self.main_rect else {
-            self.main_rect = self
-                .main
-                .as_ref()
-                .and_then(|m| m.window.outer_position().ok())
-                .map(|p| (p, size));
-            return;
-        };
-        let pl_attached = self.pl_visible && self.pl_docked_for(pos, old_size.height);
-        if self.eq_visible && self.eq_docked_to(pos, old_size) {
-            if let Some(eq_pos) = self.eq_outer_position() {
-                self.move_eq(PhysicalPosition::new(eq_pos.x, pos.y + size.height as i32));
-            }
-        }
-        if pl_attached {
-            self.dock_playlist();
-        }
-        self.main_rect = Some((pos, size));
-    }
-
     fn on_eq_press(&mut self) {
         let hit = self.eq_hit_under_cursor();
         self.eq_press = hit;
         self.eq_state.pressed = hit;
         match hit {
-            Some(EqHit::TitleBar) => {
-                if let Some(eq) = self.eq.as_ref() {
-                    if let Err(e) = eq.window.drag_window() {
-                        eprintln!("tubeamp: equalizer drag failed: {e}");
-                    }
-                }
+            Some(EqHit::TitleBar) => self.title_press(Win::Eq),
+            Some(EqHit::ShadeVolume) => {
+                self.eq_shade_drag = Some(ShadeSlider::Volume);
+                self.update_eq_shade_drag();
+            }
+            Some(EqHit::ShadeBalance) => {
+                self.eq_shade_drag = Some(ShadeSlider::Balance);
+                self.update_eq_shade_drag();
             }
             Some(EqHit::Slider(slider)) => {
                 if let Some((x, y)) = self.eq.as_ref().and_then(|e| e.skin_point()) {
@@ -2071,6 +2388,8 @@ impl App {
     }
 
     fn on_eq_release(&mut self) {
+        self.end_window_drag();
+        self.eq_shade_drag = None;
         let target = self.eq_press.take();
         let hit = self.eq_hit_under_cursor();
         self.eq_state.pressed = None;
@@ -2087,11 +2406,28 @@ impl App {
     fn activate_eq(&mut self, hit: EqHit) {
         match hit {
             EqHit::Close => self.hide_eq(),
+            EqHit::Shade => self.toggle_eq_shade(),
             EqHit::On => self.toggle_power(),
             EqHit::Auto => self.toggle_auto(),
             EqHit::Presets => self.open_presets_menu(),
-            EqHit::TitleBar | EqHit::Slider(_) => {}
+            EqHit::TitleBar | EqHit::Slider(_) | EqHit::ShadeVolume | EqHit::ShadeBalance => {}
         }
+    }
+
+    /// Moves the shade's volume or balance to the pointer. The value goes to the main window's
+    /// state, and to the player or the audio like the main window's own sliders.
+    fn update_eq_shade_drag(&mut self) {
+        let Some(drag) = self.eq_shade_drag else {
+            return;
+        };
+        let Some((x, _)) = self.eq.as_ref().and_then(|e| e.skin_point()) else {
+            return;
+        };
+        match drag {
+            ShadeSlider::Volume => self.set_volume(eqw::shade_volume_from_x(x)),
+            ShadeSlider::Balance => self.set_balance(eqw::shade_balance_from_x(x)),
+        }
+        self.request_redraw();
     }
 
     /// Moves the slider being dragged to the pointer. The value goes straight to the audio.
@@ -2243,6 +2579,15 @@ impl App {
                 self.on_track_ended();
             }
             Evt::Error { at, msg } => eprintln!("tubeamp: YouTube Music error at {at}: {msg}"),
+            // Keys the page forwards in the video view run the same shortcuts as native keys.
+            Evt::Key {
+                key,
+                code,
+                ctrl,
+                alt,
+                meta,
+                ..
+            } => self.on_page_key(key, code, *ctrl, *alt, *meta),
             // Escape reaches us from the page when the webview has focus. It leaves fullscreen.
             Evt::Escape => {
                 if self.video_fullscreen {
@@ -2453,6 +2798,8 @@ impl App {
         self.pl_state.mini_time_secs =
             (self.state.status != Status::Stop).then(|| displayed_secs(&self.state));
         self.pl_state.mini_remaining = self.state.remaining_mode;
+        self.eq_state.volume = self.state.volume;
+        self.eq_state.balance = self.state.balance;
         self.refresh_video_info();
     }
 
@@ -2489,22 +2836,25 @@ impl App {
 
     /// The main window as it looks now, at skin size.
     fn main_canvas(&self) -> Canvas {
-        let mut canvas = Canvas::new(WIDTH, HEIGHT);
+        let mut canvas = Canvas::new(WIDTH, mw::window_height(self.state.shade));
         render_main(&self.skin, &self.state, &mut canvas);
-        render_vis(&self.skin, &self.state, &self.vis_frame, &mut canvas);
+        // The shade has no visualiser (Webamp's shade draws only a small one, not yet done).
+        if !self.state.shade {
+            render_vis(&self.skin, &self.state, &self.vis_frame, &mut canvas);
+        }
         canvas
     }
 
     /// The equalizer window as it looks now, at skin size.
     fn eq_canvas(&self) -> Canvas {
-        let mut canvas = Canvas::new(eqw::WIDTH, eqw::HEIGHT);
+        let mut canvas = Canvas::new(eqw::WIDTH, eqw::window_height(self.eq_state.shade));
         render_eq(&self.skin, &self.eq_state, &mut canvas);
         canvas
     }
 
     /// The playlist window as it looks now, at its current size.
     fn pl_canvas(&self) -> Canvas {
-        let (w, h) = plw::window_size(self.pl_state.size_steps);
+        let (w, h) = plw::window_size_for(self.pl_state.size_steps, self.pl_state.shade);
         let mut canvas = Canvas::new(w, h);
         render_playlist(&self.skin, &self.playlist, &self.pl_state, &mut canvas);
         canvas
@@ -2541,15 +2891,12 @@ impl App {
         let Some((_, path)) = &self.opts.screenshot else {
             return;
         };
-        save_one(&scaled(&self.main_canvas(), 2), WIDTH * 2, HEIGHT * 2, path);
+        let main = self.main_canvas();
+        save_one(&scaled(&main, 2), main.w * 2, main.h * 2, path);
         if self.eq_visible {
             let eq_path = eq_screenshot_path(path);
-            save_one(
-                &scaled(&self.eq_canvas(), 2),
-                eqw::WIDTH * 2,
-                eqw::HEIGHT * 2,
-                &eq_path,
-            );
+            let eq = self.eq_canvas();
+            save_one(&scaled(&eq, 2), eq.w * 2, eq.h * 2, &eq_path);
         }
         if self.pl_visible {
             let canvas = self.pl_canvas();
@@ -2656,11 +3003,9 @@ impl App {
         match event {
             WindowEvent::CloseRequested => event_loop.exit(),
             WindowEvent::RedrawRequested => self.redraw_main(),
-            WindowEvent::Resized(size) => {
-                self.on_main_resized(size);
-                self.request_redraw();
-            }
-            WindowEvent::Moved(pos) => self.on_main_moved(pos),
+            WindowEvent::Resized(_) => self.request_redraw(),
+            // The windows only move when we move them (drags and `relayout`).
+            WindowEvent::Moved(_) => {}
             WindowEvent::ScaleFactorChanged { .. } => self.request_redraw(),
             WindowEvent::Focused(focused) => {
                 self.state.focused = focused;
@@ -2674,6 +3019,7 @@ impl App {
                 if self.drag.is_some() {
                     self.update_drag();
                 }
+                self.drag_moved(Win::Main);
             }
             WindowEvent::CursorLeft { .. } => {
                 if let Some(main) = self.main.as_mut() {
@@ -2713,6 +3059,10 @@ impl App {
                 if self.eq_drag.is_some() {
                     self.update_eq_drag();
                 }
+                if self.eq_shade_drag.is_some() {
+                    self.update_eq_shade_drag();
+                }
+                self.drag_moved(Win::Eq);
             }
             WindowEvent::CursorLeft { .. } => {
                 if let Some(eq) = self.eq.as_mut() {
@@ -2833,15 +3183,18 @@ impl ApplicationHandler<UserEvent> for App {
             bridge.occlusion_detection_off()
         ));
 
-        self.main_rect = main
-            .window
-            .outer_position()
-            .ok()
-            .map(|p| (p, main.window.inner_size()));
         self.main = Some(main);
         self.eq = Some(eq);
         self.video = Some(video);
         self.bridge = Some(bridge);
+        self.pl = Some(pl);
+        self.lib = Some(lib);
+        // `--shade`: the windows start in windowshade mode, at their skin sizes. This comes before
+        // anything is placed, because the placement uses the sizes.
+        self.state.shade = self.opts.shade.main;
+        self.eq_state.shade = self.opts.shade.eq;
+        self.pl_state.shade = self.opts.shade.pl;
+        self.apply_sizes();
         self.update_video_bounds();
         if self.opts.video_browser {
             self.set_video_browser(true);
@@ -2855,8 +3208,6 @@ impl ApplicationHandler<UserEvent> for App {
         if self.opts.open_eq {
             self.show_eq();
         }
-        self.pl = Some(pl);
-        self.lib = Some(lib);
         for id in self.opts.add.clone() {
             self.playlist.add(Entry::from_id(&id));
         }

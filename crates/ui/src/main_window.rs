@@ -14,6 +14,17 @@ use tubeamp_skin::{Sheet, Skin};
 pub const WIDTH: u32 = 275;
 /// Main window height in pixels (1×).
 pub const HEIGHT: u32 = 116;
+/// Height of the windowshade (1×). The width stays [`WIDTH`].
+pub const SHADE_HEIGHT: u32 = 14;
+
+/// The window's height in skin pixels for its shade state.
+pub fn window_height(shade: bool) -> u32 {
+    if shade {
+        SHADE_HEIGHT
+    } else {
+        HEIGHT
+    }
+}
 
 /// Playback status, which selects the play/pause/stop indicator.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -55,6 +66,8 @@ pub struct MainState {
     pub doubled: bool,
     /// What the vis area shows.
     pub vis_mode: VisMode,
+    /// The windowshade: a 275×14 strip with the title, mini time and position bar.
+    pub shade: bool,
 }
 
 impl Default for MainState {
@@ -80,6 +93,7 @@ impl Default for MainState {
             pressed: None,
             doubled: false,
             vis_mode: VisMode::default(),
+            shade: false,
         }
     }
 }
@@ -124,6 +138,8 @@ pub enum MainHit {
     MonoStereo,
     /// The visualiser area (clicking it cycles the mode).
     Vis,
+    /// The mini time in the windowshade title bar: toggles elapsed and remaining time.
+    MiniTime,
 }
 
 // Element rectangles (window pixels), from css/main-window.css.
@@ -189,6 +205,40 @@ const HIT_TABLE: &[(Rect, MainHit)] = &[
     (EJECT, MainHit::Button(MainButton::Eject)),
     (SHUFFLE, MainHit::Button(MainButton::Shuffle)),
     (REPEAT, MainHit::Button(MainButton::Repeat)),
+];
+
+// Windowshade element rectangles, from css/main-window.css (`#main-window.shade` rules). The
+// transport rectangles are click areas only: the shade draws no buttons for them.
+/// The mini time (`.mini-time`, 25 × 6). Its last digit runs past 25 px, and clicks on it count.
+const SHADE_MINI_TIME: Rect = Rect::new(127, 4, 30, 6);
+/// Where the mini time's characters start, relative to the element (Webamp's `left` values).
+const SHADE_MINI_MINUS_X: i32 = 1;
+const SHADE_MINI_DIGIT_X: [i32; 4] = [7, 12, 20, 25];
+/// The shade position bar (`#position` in shade): a 17 × 7 track with a 3 px thumb.
+pub const SHADE_POSITION: Rect = Rect::new(226, 4, 17, 7);
+/// How far the shade thumb travels: the track less the thumb's width.
+pub const SHADE_POSITION_TRAVEL: i32 = 14;
+const SHADE_PREVIOUS: Rect = Rect::new(169, 2, 7, 10);
+const SHADE_PLAY: Rect = Rect::new(176, 2, 10, 10);
+const SHADE_PAUSE: Rect = Rect::new(186, 2, 9, 10);
+const SHADE_STOP: Rect = Rect::new(195, 2, 9, 10);
+const SHADE_NEXT: Rect = Rect::new(204, 2, 10, 10);
+const SHADE_EJECT: Rect = Rect::new(215, 2, 10, 10);
+
+/// Hit-test order in shade mode: the same buttons as the full window, then the shade's own.
+const SHADE_HIT_TABLE: &[(Rect, MainHit)] = &[
+    (OPTION_BTN, MainHit::Button(MainButton::Option)),
+    (MINIMIZE_BTN, MainHit::Button(MainButton::Minimize)),
+    (SHADE_BTN, MainHit::Button(MainButton::Shade)),
+    (CLOSE_BTN, MainHit::Button(MainButton::Close)),
+    (SHADE_MINI_TIME, MainHit::MiniTime),
+    (SHADE_POSITION, MainHit::Button(MainButton::Position)),
+    (SHADE_PREVIOUS, MainHit::Button(MainButton::Previous)),
+    (SHADE_PLAY, MainHit::Button(MainButton::Play)),
+    (SHADE_PAUSE, MainHit::Button(MainButton::Pause)),
+    (SHADE_STOP, MainHit::Button(MainButton::Stop)),
+    (SHADE_NEXT, MainHit::Button(MainButton::Next)),
+    (SHADE_EJECT, MainHit::Button(MainButton::Eject)),
 ];
 
 /// Absolute left edges of the four digits (minutes tens/units, seconds tens/units).
@@ -262,6 +312,24 @@ pub fn hit_test_main(x: i32, y: i32) -> Option<MainHit> {
         .or_else(|| TITLE_BAR.contains(x, y).then_some(MainHit::TitleBar))
 }
 
+/// Which hit target (if any) is at `(x, y)` in the windowshade (275 × 14).
+pub fn hit_test_main_shade(x: i32, y: i32) -> Option<MainHit> {
+    if !(0..WIDTH as i32).contains(&x) || !(0..SHADE_HEIGHT as i32).contains(&y) {
+        return None;
+    }
+    SHADE_HIT_TABLE
+        .iter()
+        .find(|(rect, _)| rect.contains(x, y))
+        .map(|(_, hit)| *hit)
+        .or(Some(MainHit::TitleBar))
+}
+
+/// The position (`0..=100`) for a pointer at window `x` on the shade position bar, clamped.
+pub fn shade_position_percent(x: f64) -> u32 {
+    let rel = (x - f64::from(SHADE_POSITION.x) - 1.5) / f64::from(SHADE_POSITION_TRAVEL);
+    (rel.clamp(0.0, 1.0) * 100.0).round() as u32
+}
+
 fn is_down(st: &MainState, button: MainButton) -> bool {
     st.pressed == Some(button)
 }
@@ -303,6 +371,10 @@ fn draw_part(
 ///
 /// The visualiser area (24, 43) is left as background here. [`crate::render_vis`] draws it on top.
 pub fn render_main(skin: &Skin, st: &MainState, canvas: &mut Canvas) {
+    if st.shade {
+        render_main_shade(skin, st, canvas);
+        return;
+    }
     draw(skin, canvas, Sheet::Main, "MAIN_WINDOW_BACKGROUND", 0, 0);
     draw_titlebar(skin, st, canvas);
     draw_clutterbar(skin, st, canvas);
@@ -326,7 +398,26 @@ fn draw_titlebar(skin: &Skin, st: &MainState, canvas: &mut Canvas) {
         "MAIN_TITLE_BAR"
     };
     draw(skin, canvas, Sheet::Titlebar, bar, 0, 0);
+    draw_title_buttons(skin, st, canvas);
+}
 
+/// The windowshade: the 275×14 shade bar, the title buttons, the mini time and the position bar.
+/// The transport buttons are not drawn (Webamp hides them in shade mode), only clicked.
+fn render_main_shade(skin: &Skin, st: &MainState, canvas: &mut Canvas) {
+    let bar = if st.focused {
+        "MAIN_SHADE_BACKGROUND_SELECTED"
+    } else {
+        "MAIN_SHADE_BACKGROUND"
+    };
+    draw(skin, canvas, Sheet::Titlebar, bar, 0, 0);
+    draw_title_buttons(skin, st, canvas);
+    draw_mini_time(skin, st, canvas);
+    draw_shade_position(skin, st, canvas);
+}
+
+/// The option, minimize, shade and close buttons. The shade button's sprites are the selected
+/// ones in shade mode while the window is focused, as in Webamp's `.shade.selected` rules.
+fn draw_title_buttons(skin: &Skin, st: &MainState, canvas: &mut Canvas) {
     let (x, y) = (OPTION_BTN.x, OPTION_BTN.y);
     let name = up_down(
         is_down(st, MainButton::Option),
@@ -349,11 +440,15 @@ fn draw_titlebar(skin: &Skin, st: &MainState, canvas: &mut Canvas) {
         MINIMIZE_BTN.y,
     );
 
-    let name = up_down(
-        is_down(st, MainButton::Shade),
-        "MAIN_SHADE_BUTTON",
-        "MAIN_SHADE_BUTTON_DEPRESSED",
-    );
+    let (up, down) = if st.shade && st.focused {
+        (
+            "MAIN_SHADE_BUTTON_SELECTED",
+            "MAIN_SHADE_BUTTON_SELECTED_DEPRESSED",
+        )
+    } else {
+        ("MAIN_SHADE_BUTTON", "MAIN_SHADE_BUTTON_DEPRESSED")
+    };
+    let name = up_down(is_down(st, MainButton::Shade), up, down);
     draw(
         skin,
         canvas,
@@ -376,6 +471,57 @@ fn draw_titlebar(skin: &Skin, st: &MainState, canvas: &mut Canvas) {
         CLOSE_BTN.x,
         CLOSE_BTN.y,
     );
+}
+
+/// The shade's mini time: the TEXT.BMP font, minus sign first when showing time left. Blank
+/// while stopped, like the full window's time.
+fn draw_mini_time(skin: &Skin, st: &MainState, canvas: &mut Canvas) {
+    if st.status == Status::Stop {
+        return;
+    }
+    let (x, y) = (SHADE_MINI_TIME.x, SHADE_MINI_TIME.y);
+    let clip = Rect::new(0, 0, WIDTH as i32, SHADE_HEIGHT as i32);
+    if st.remaining_mode {
+        draw_text(canvas, skin, "-", x + SHADE_MINI_MINUS_X, y, clip);
+    }
+    let digits = time_digits(displayed_secs(st));
+    for (d, dx) in digits.iter().zip(SHADE_MINI_DIGIT_X) {
+        let ch = char::from_digit(*d, 10).unwrap_or('0').to_string();
+        draw_text(canvas, skin, &ch, x + dx, y, clip);
+    }
+}
+
+/// The shade's position bar: the track, then the thumb at its place, with the left and right
+/// thumbs at the ends as in Webamp's `.left` and `.right` classes.
+fn draw_shade_position(skin: &Skin, st: &MainState, canvas: &mut Canvas) {
+    draw(
+        skin,
+        canvas,
+        Sheet::Titlebar,
+        "MAIN_SHADE_POSITION_BACKGROUND",
+        SHADE_POSITION.x,
+        SHADE_POSITION.y,
+    );
+    if st.status != Status::Stop && st.duration_secs > 0 {
+        let p = st.position.clamp(0.0, 1.0);
+        let offset = (p * SHADE_POSITION_TRAVEL as f32).round() as i32;
+        let percent = p * 100.0;
+        let name = if percent <= 33.0 {
+            "MAIN_SHADE_POSITION_THUMB_LEFT"
+        } else if percent >= 66.0 {
+            "MAIN_SHADE_POSITION_THUMB_RIGHT"
+        } else {
+            "MAIN_SHADE_POSITION_THUMB"
+        };
+        draw(
+            skin,
+            canvas,
+            Sheet::Titlebar,
+            name,
+            SHADE_POSITION.x + offset,
+            SHADE_POSITION.y,
+        );
+    }
 }
 
 fn draw_clutterbar(skin: &Skin, st: &MainState, canvas: &mut Canvas) {
@@ -1285,5 +1431,209 @@ mod tests {
     fn marquee_period_matches_the_loop_length() {
         assert_eq!(marquee_period_px("x"), 0);
         assert_eq!(marquee_period_px(&"x".repeat(31)), (31 + 7) * 5);
+    }
+
+    fn shade_canvas(skin: &Skin, st: &MainState) -> Canvas {
+        let mut canvas = Canvas::new(WIDTH, SHADE_HEIGHT);
+        render_main(skin, st, &mut canvas);
+        canvas
+    }
+
+    fn shade_state() -> MainState {
+        MainState {
+            shade: true,
+            ..base_state()
+        }
+    }
+
+    #[test]
+    fn shade_background_follows_focus() {
+        let skin = testkit::synthetic_skin();
+        // The buttons, the mini time and the position bar cover parts of the bar, so the stretch
+        // between the option button (x 6..15) and the mini time (x 127) is compared.
+        let focused = shade_canvas(&skin, &shade_state());
+        assert_copied(
+            &focused,
+            &skin,
+            Sheet::Titlebar,
+            (27 + 16, 29),
+            (16, 0),
+            (111, 14),
+        );
+        let unfocused = shade_canvas(
+            &skin,
+            &MainState {
+                focused: false,
+                ..shade_state()
+            },
+        );
+        assert_copied(
+            &unfocused,
+            &skin,
+            Sheet::Titlebar,
+            (27 + 16, 42),
+            (16, 0),
+            (111, 14),
+        );
+    }
+
+    #[test]
+    fn shade_buttons_use_the_selected_shade_sprites() {
+        let skin = testkit::synthetic_skin();
+        let c = shade_canvas(&skin, &shade_state());
+        assert_copied(&c, &skin, Sheet::Titlebar, (0, 27), (254, 3), (9, 9));
+        let pressed = shade_canvas(
+            &skin,
+            &MainState {
+                pressed: Some(MainButton::Shade),
+                ..shade_state()
+            },
+        );
+        assert_copied(&pressed, &skin, Sheet::Titlebar, (9, 27), (254, 3), (9, 9));
+        // Close keeps its normal sprite.
+        assert_copied(&c, &skin, Sheet::Titlebar, (18, 0), (264, 3), (9, 9));
+    }
+
+    #[test]
+    fn shade_position_thumb_moves_across_the_track_and_changes_end_sprite() {
+        let skin = testkit::synthetic_skin();
+        let at_end = shade_canvas(
+            &skin,
+            &MainState {
+                position: 1.0,
+                ..shade_state()
+            },
+        );
+        // 100% uses the right-hand thumb, at 226 + 14.
+        assert_copied(&at_end, &skin, Sheet::Titlebar, (23, 36), (240, 4), (3, 7));
+        let middle = shade_canvas(
+            &skin,
+            &MainState {
+                position: 0.5,
+                ..shade_state()
+            },
+        );
+        // 50%: 7 px along, the plain thumb.
+        assert_copied(&middle, &skin, Sheet::Titlebar, (20, 36), (233, 4), (3, 7));
+        let left = shade_canvas(
+            &skin,
+            &MainState {
+                position: 0.0,
+                ..shade_state()
+            },
+        );
+        assert_copied(&left, &skin, Sheet::Titlebar, (17, 36), (226, 4), (3, 7));
+    }
+
+    #[test]
+    fn shade_mini_time_draws_the_digits_from_the_text_font() {
+        let skin = testkit::synthetic_skin();
+        // 83 s is 01:23: the digits 0, 1, 2, 3 at the element's offsets 7, 12, 20, 25. The TEXT
+        // glyph cells are 5 × 6, so cell (col, row) starts at (5·col, 6·row).
+        let c = shade_canvas(&skin, &shade_state());
+        let glyph = |ch: char| {
+            let (row, col) = tubeamp_skin::sprites::font_cell(ch);
+            (col * 5, row * 6)
+        };
+        assert_copied(&c, &skin, Sheet::Text, glyph('0'), (127 + 7, 4), (5, 6));
+        assert_copied(&c, &skin, Sheet::Text, glyph('1'), (127 + 12, 4), (5, 6));
+        assert_copied(&c, &skin, Sheet::Text, glyph('2'), (127 + 20, 4), (5, 6));
+        assert_copied(&c, &skin, Sheet::Text, glyph('3'), (127 + 25, 4), (5, 6));
+    }
+
+    #[test]
+    fn shade_mini_time_shows_a_minus_sign_when_counting_down() {
+        let skin = testkit::synthetic_skin();
+        let elapsed = shade_canvas(&skin, &shade_state());
+        let remaining = shade_canvas(
+            &skin,
+            &MainState {
+                remaining_mode: true,
+                ..shade_state()
+            },
+        );
+        // The minus sign is drawn at 127 + 1, and only there changes the picture.
+        let mut expected = Canvas::new(WIDTH, SHADE_HEIGHT);
+        let bg = shade_canvas(
+            &skin,
+            &MainState {
+                status: Status::Stop,
+                ..shade_state()
+            },
+        );
+        expected.px.copy_from_slice(&bg.px);
+        draw_text(
+            &mut expected,
+            &skin,
+            "-",
+            127 + SHADE_MINI_MINUS_X,
+            4,
+            Rect::new(0, 0, WIDTH as i32, SHADE_HEIGHT as i32),
+        );
+        // Stopped hides the digits, so `expected` has only the minus over the background.
+        let minus_only = |c: &Canvas| {
+            (127..132)
+                .flat_map(|x| (4..10).map(move |y| (x, y)))
+                .map(|(x, y)| px(c, x, y))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(minus_only(&remaining), minus_only(&expected));
+        assert_ne!(minus_only(&remaining), minus_only(&elapsed));
+    }
+
+    #[test]
+    fn stopped_shade_hides_the_mini_time() {
+        let skin = testkit::synthetic_skin();
+        let stopped = shade_canvas(
+            &skin,
+            &MainState {
+                status: Status::Stop,
+                ..shade_state()
+            },
+        );
+        // Under the mini time the shade background shows through.
+        assert_copied(
+            &stopped,
+            &skin,
+            Sheet::Titlebar,
+            (27 + 127, 29 + 4),
+            (127, 4),
+            (30, 6),
+        );
+    }
+
+    #[test]
+    fn shade_hit_test_finds_the_shade_controls() {
+        assert_eq!(hit_test_main_shade(130, 6), Some(MainHit::MiniTime));
+        assert_eq!(hit_test_main_shade(150, 6), Some(MainHit::MiniTime));
+        assert_eq!(
+            hit_test_main_shade(230, 6),
+            Some(MainHit::Button(MainButton::Position))
+        );
+        assert_eq!(
+            hit_test_main_shade(172, 6),
+            Some(MainHit::Button(MainButton::Previous))
+        );
+        assert_eq!(
+            hit_test_main_shade(218, 6),
+            Some(MainHit::Button(MainButton::Eject))
+        );
+        assert_eq!(
+            hit_test_main_shade(258, 6),
+            Some(MainHit::Button(MainButton::Shade))
+        );
+        assert_eq!(hit_test_main_shade(60, 6), Some(MainHit::TitleBar));
+        assert_eq!(hit_test_main_shade(60, 14), None);
+        assert_eq!(hit_test_main_shade(275, 6), None);
+        // The shade is 14 px tall, so the volume and balance rows below it are not hit.
+        assert_eq!(hit_test_main_shade(130, 62), None);
+    }
+
+    #[test]
+    fn shade_position_percent_follows_the_pointer_and_clamps() {
+        assert_eq!(shade_position_percent(226.0), 0);
+        assert_eq!(shade_position_percent(226.0 + 1.5 + 7.0), 50);
+        assert_eq!(shade_position_percent(1000.0), 100);
+        assert_eq!(shade_position_percent(-50.0), 0);
     }
 }

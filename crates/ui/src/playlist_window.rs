@@ -19,7 +19,7 @@ use tubeamp_skin::{Sheet, Skin};
 use crate::canvas::{Canvas, Rect};
 use crate::font::{draw_track_text, fit_text, text_width};
 use crate::labels::time_truncated;
-use crate::text::draw_text;
+use crate::text::{draw_text, GLYPH_H, GLYPH_W};
 
 /// Width of the playlist window at the base size (1×), in skin pixels.
 pub const BASE_WIDTH: u32 = 275;
@@ -29,6 +29,8 @@ pub const BASE_HEIGHT: u32 = 116;
 pub const STEP_W: u32 = 25;
 /// Height added per vertical resize step.
 pub const STEP_H: u32 = 29;
+/// Height of the windowshade (1×). The width still follows the resize steps.
+pub const SHADE_HEIGHT: u32 = 14;
 /// Largest number of resize steps in either direction (a sanity bound, not a Winamp limit).
 pub const MAX_STEPS: u32 = 40;
 /// The size the window opens at: 275×232, the classic default.
@@ -202,6 +204,8 @@ pub struct PlaylistWindowState {
     pub mini_time_secs: Option<u32>,
     /// Shows the mini time as time remaining, with a minus sign.
     pub mini_remaining: bool,
+    /// The windowshade: one 14-pixel strip with the current track and its time.
+    pub shade: bool,
 }
 
 impl Default for PlaylistWindowState {
@@ -215,6 +219,7 @@ impl Default for PlaylistWindowState {
             open_menu: None,
             mini_time_secs: None,
             mini_remaining: false,
+            shade: false,
         }
     }
 }
@@ -225,6 +230,17 @@ pub fn window_size(steps: (u32, u32)) -> (u32, u32) {
         BASE_WIDTH + STEP_W * steps.0,
         BASE_HEIGHT + STEP_H * steps.1,
     )
+}
+
+/// Window size in skin pixels for resize steps `(sx, sy)` in the given shade state. The shade
+/// keeps the width and is 14 pixels tall.
+pub fn window_size_for(steps: (u32, u32), shade: bool) -> (u32, u32) {
+    let (w, h) = window_size(steps);
+    if shade {
+        (w, SHADE_HEIGHT)
+    } else {
+        (w, h)
+    }
 }
 
 /// Resize steps for a window of `w` × `h` skin pixels, rounded to the nearest step and never
@@ -465,11 +481,49 @@ pub fn hit_test_playlist(
     (y < TITLE_H).then_some(PlHit::TitleBar)
 }
 
+/// Which element (if any) is at `(x, y)` in the windowshade of the given steps. The buttons sit
+/// where they do in the full window. The width resize target is the 9 × 9 square 20 px in from
+/// the right edge (Webamp's `#playlist-resize-target` in shade).
+pub fn hit_test_playlist_shade(steps: (u32, u32), x: i32, y: i32) -> Option<PlHit> {
+    let (w, _) = window_size(steps);
+    let w = w as i32;
+    if x < 0 || y < 0 || x >= w || y >= SHADE_HEIGHT as i32 {
+        return None;
+    }
+    if Rect::new(w - 11, 3, 9, 9).contains(x, y) {
+        return Some(PlHit::Close);
+    }
+    if Rect::new(w - 21, 3, 9, 9).contains(x, y) {
+        return Some(PlHit::Shade);
+    }
+    if Rect::new(w - 29, 3, 9, 9).contains(x, y) {
+        return Some(PlHit::Resize);
+    }
+    Some(PlHit::TitleBar)
+}
+
+/// The shade's track title, trimmed as Webamp does: `(205 + 25 × sx) / 5` characters at most. A
+/// long title keeps its start and ends with an ellipsis. The font has no single-character
+/// ellipsis, so three dots take its place and the same number of characters is kept before them.
+pub fn shade_title(text: &str, steps: (u32, u32)) -> String {
+    let max_chars = ((205 + 25 * steps.0) / 5) as usize;
+    let chars: Vec<char> = text.chars().collect();
+    if chars.len() <= max_chars {
+        return text.to_string();
+    }
+    let keep: String = chars[..max_chars.saturating_sub(3)].iter().collect();
+    format!("{keep}...")
+}
+
 // Drawing.
 
 /// Draws the playlist window at the size of `st.size_steps`. `canvas` must be
 /// [`window_size`] in size.
 pub fn render_playlist(skin: &Skin, pl: &Playlist, st: &PlaylistWindowState, canvas: &mut Canvas) {
+    if st.shade {
+        render_playlist_shade(skin, pl, st, canvas);
+        return;
+    }
     let l = Layout::new(st.size_steps);
     let rows = l.rows();
     let scroll = clamp_scroll(st.scroll, pl.len(), rows);
@@ -496,6 +550,43 @@ pub fn render_playlist(skin: &Skin, pl: &Playlist, st: &PlaylistWindowState, can
     if let Some(menu) = st.open_menu {
         draw_popup(skin, l, menu, st.hover, canvas);
     }
+}
+
+/// The windowshade: the PLEDIT shade strip (left piece, tiled middle, right piece), the current
+/// track as "n. Artist - Title" clipped before the time, the time on the right, and the title
+/// buttons. Webamp's `PlaylistShade.tsx` and `playlist-window.css` (`#playlist-window-shade`).
+fn render_playlist_shade(skin: &Skin, pl: &Playlist, st: &PlaylistWindowState, canvas: &mut Canvas) {
+    let (w, _) = window_size(st.size_steps);
+    let w = w as i32;
+    tile_x(skin, canvas, "PLAYLIST_SHADE_BACKGROUND", 0, w, 0, false);
+    blit_pledit(skin, canvas, "PLAYLIST_SHADE_BACKGROUND_LEFT", 0, 0);
+    let right = if st.focused {
+        "PLAYLIST_SHADE_BACKGROUND_RIGHT_SELECTED"
+    } else {
+        "PLAYLIST_SHADE_BACKGROUND_RIGHT"
+    };
+    blit_pledit(skin, canvas, right, w - 50, 0);
+
+    let current = pl.current();
+    let duration = current
+        .and_then(|i| pl.get(i))
+        .and_then(|e| e.duration_secs);
+    let time = match (current.and_then(|i| pl.display_line(i)), duration) {
+        (Some(_), Some(secs)) => time_truncated(secs),
+        _ => String::new(),
+    };
+    let time_x = w - 30 - time.chars().count() as i32 * GLYPH_W;
+    let name = current
+        .and_then(|i| pl.display_line(i))
+        .unwrap_or_else(|| "[No file]".to_string());
+    let shown = shade_title(&name, st.size_steps);
+    let clip = Rect::new(5, 4, (time_x - 5 - 3).max(0), GLYPH_H);
+    draw_text(canvas, skin, &shown, 5, 4, clip);
+    if !time.is_empty() {
+        draw_text(canvas, skin, &time, time_x, 4, Rect::new(0, 0, w, SHADE_HEIGHT as i32));
+    }
+
+    draw_title_buttons(skin, Layout::new(st.size_steps), st, canvas);
 }
 
 /// Draws a sprite from PLEDIT at `(x, y)`, if the skin has it.
@@ -1249,5 +1340,169 @@ mod tests {
             .iter()
             .enumerate()
             .all(|(i, &p)| p == black || i % 60 < 1));
+    }
+}
+
+#[cfg(test)]
+mod shade_tests {
+    use super::*;
+    use tubeamp_playlist::Entry;
+    use tubeamp_skin::testkit;
+
+    fn playlist() -> Playlist {
+        let mut pl = Playlist::from_entries(
+            (0..3)
+                .map(|i| Entry {
+                    video_id: format!("vid{i:08}"),
+                    title: format!("Title {i}"),
+                    artist: "Artist".to_string(),
+                    duration_secs: Some(243),
+                })
+                .collect(),
+        );
+        pl.set_current(Some(1));
+        pl
+    }
+
+    fn shade_state(steps: (u32, u32)) -> PlaylistWindowState {
+        PlaylistWindowState {
+            size_steps: steps,
+            shade: true,
+            focused: true,
+            ..PlaylistWindowState::default()
+        }
+    }
+
+    fn render(skin: &Skin, pl: &Playlist, st: &PlaylistWindowState) -> Canvas {
+        let (w, h) = window_size_for(st.size_steps, st.shade);
+        let mut canvas = Canvas::new(w, h);
+        render_playlist(skin, pl, st, &mut canvas);
+        canvas
+    }
+
+    fn px(c: &Canvas, x: i32, y: i32) -> u32 {
+        c.px[(y as u32 * c.w + x as u32) as usize]
+    }
+
+    fn pledit_px(skin: &Skin, x: u32, y: u32) -> u32 {
+        let img = skin.sheet(Sheet::Pledit).expect("pledit");
+        img.px[(y * img.w + x) as usize]
+    }
+
+    /// Asserts that canvas `dst` shows PLEDIT `src` over `size`.
+    fn assert_pledit(c: &Canvas, skin: &Skin, src: (u32, u32), dst: (i32, i32), size: (u32, u32)) {
+        for j in 0..size.1 {
+            for i in 0..size.0 {
+                assert_eq!(
+                    px(c, dst.0 + i as i32, dst.1 + j as i32),
+                    pledit_px(skin, src.0 + i, src.1 + j),
+                    "canvas ({},{}) should show PLEDIT ({},{})",
+                    dst.0 + i as i32,
+                    dst.1 + j as i32,
+                    src.0 + i,
+                    src.1 + j
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn shade_is_fourteen_pixels_tall_and_keeps_the_width() {
+        assert_eq!(window_size_for((0, 4), true), (275, 14));
+        assert_eq!(window_size_for((2, 1), true), (325, 14));
+        assert_eq!(window_size_for((2, 1), false), (325, 145));
+    }
+
+    #[test]
+    fn shade_strip_pieces_sit_at_the_left_and_right_ends() {
+        // The title text covers rows 4..10, so only the rows above it are compared.
+        let skin = testkit::synthetic_skin();
+        let pl = playlist();
+        let c = render(&skin, &pl, &shade_state((0, 4)));
+        assert_pledit(&c, &skin, (72, 42), (0, 0), (25, 3));
+        assert_pledit(&c, &skin, (99, 42), (275 - 50, 0), (50, 3));
+        // The middle tile starts at 25 and repeats the plain strip.
+        assert_pledit(&c, &skin, (72, 57), (25, 0), (25, 3));
+        let unfocused = render(
+            &skin,
+            &pl,
+            &PlaylistWindowState {
+                focused: false,
+                ..shade_state((0, 4))
+            },
+        );
+        assert_pledit(&unfocused, &skin, (99, 57), (275 - 50, 0), (50, 3));
+    }
+
+    #[test]
+    fn shade_hit_test_finds_the_buttons_and_the_width_handle() {
+        let steps = (0, 4);
+        assert_eq!(hit_test_playlist_shade(steps, 264, 5), Some(PlHit::Close));
+        assert_eq!(hit_test_playlist_shade(steps, 254, 5), Some(PlHit::Shade));
+        assert_eq!(hit_test_playlist_shade(steps, 246, 5), Some(PlHit::Resize));
+        assert_eq!(hit_test_playlist_shade(steps, 100, 7), Some(PlHit::TitleBar));
+        assert_eq!(hit_test_playlist_shade(steps, 100, 14), None);
+        assert_eq!(hit_test_playlist_shade(steps, 275, 7), None);
+    }
+
+    #[test]
+    fn shade_title_is_trimmed_to_the_width_in_characters() {
+        // (205 + 25 × 0) / 5 = 41 characters at the base width.
+        let short = "1. Artist - Title";
+        assert_eq!(shade_title(short, (0, 0)), short);
+        let long: String = "x".repeat(60);
+        let trimmed = shade_title(&long, (0, 0));
+        assert_eq!(trimmed.chars().count(), 41);
+        assert!(trimmed.ends_with("..."));
+        // A wider window fits more: (205 + 50) / 5 = 51.
+        assert_eq!(shade_title(&long, (2, 0)).chars().count(), 51);
+    }
+
+    #[test]
+    fn shade_time_is_the_current_track_duration_and_blank_without_a_track() {
+        let skin = testkit::synthetic_skin();
+        // 243 s is 4:03: four characters, so the time starts at 275 - 30 - 20.
+        let with_track = render(&skin, &playlist(), &shade_state((0, 4)));
+        let mut expected = Canvas::new(275, SHADE_HEIGHT);
+        let blank = render(&skin, &Playlist::default(), &shade_state((0, 4)));
+        expected.px.copy_from_slice(&blank.px);
+        draw_text(
+            &mut expected,
+            &skin,
+            "4:03",
+            275 - 30 - 20,
+            4,
+            Rect::new(0, 0, 275, SHADE_HEIGHT as i32),
+        );
+        let time_area = |c: &Canvas| {
+            (225..250)
+                .flat_map(|x| (4..10).map(move |y| (x, y)))
+                .map(|(x, y)| px(c, x, y))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(time_area(&with_track), time_area(&expected));
+        assert_ne!(time_area(&with_track), time_area(&blank));
+    }
+
+    #[test]
+    fn shade_title_is_clipped_before_the_time() {
+        // The title is clipped 3 px before the time's first character, so nothing of it lands in
+        // the time's columns or after them.
+        let skin = testkit::synthetic_skin();
+        let c = render(&skin, &playlist(), &shade_state((0, 4)));
+        let blank = render(
+            &skin,
+            &Playlist::default(),
+            &PlaylistWindowState {
+                shade: true,
+                focused: true,
+                ..PlaylistWindowState::default()
+            },
+        );
+        for x in 250..275 {
+            for y in 4..10 {
+                assert_eq!(px(&c, x, y), px(&blank, x, y), "pixel ({x},{y}) past the time");
+            }
+        }
     }
 }

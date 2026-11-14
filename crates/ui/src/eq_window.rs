@@ -18,9 +18,27 @@ use tubeamp_skin::{Sheet, Skin};
 pub const WIDTH: u32 = 275;
 /// Window height in pixels (1×).
 pub const HEIGHT: u32 = 116;
+/// Height of the windowshade (1×).
+pub const SHADE_HEIGHT: u32 = 14;
+
+/// The window's height in skin pixels for its shade state.
+pub fn window_height(shade: bool) -> u32 {
+    if shade {
+        SHADE_HEIGHT
+    } else {
+        HEIGHT
+    }
+}
 
 const TITLE_BAR: Rect = Rect::new(0, 0, 275, 14);
 const CLOSE_BTN: Rect = Rect::new(264, 3, 9, 9);
+/// The windowshade button (`#equalizer-shade`), in both modes.
+const SHADE_BTN: Rect = Rect::new(254, 3, 9, 9);
+/// The shade's volume and balance tracks (`#equalizer-volume` and `#equalizer-balance`). The
+/// thumbs are 3 px wide, so they travel 3 px less than the track.
+const SHADE_VOLUME: Rect = Rect::new(61, 4, 97, 6);
+const SHADE_BALANCE: Rect = Rect::new(164, 4, 43, 6);
+const SHADE_THUMB_W: f64 = 3.0;
 const ON_BTN: Rect = Rect::new(14, 18, 26, 12);
 const AUTO_BTN: Rect = Rect::new(40, 18, 32, 12);
 /// The PRESETS button (`#presets-context`).
@@ -57,10 +75,16 @@ pub enum EqSlider {
 pub enum EqHit {
     TitleBar,
     Close,
+    /// The windowshade button.
+    Shade,
     On,
     Auto,
     Presets,
     Slider(EqSlider),
+    /// The shade's mini volume slider.
+    ShadeVolume,
+    /// The shade's mini balance slider.
+    ShadeBalance,
 }
 
 /// Everything the equalizer window shows.
@@ -68,6 +92,11 @@ pub enum EqHit {
 pub struct EqWindowState {
     pub settings: EqSettings,
     pub focused: bool,
+    /// The windowshade: a 275×14 strip with the title buttons and mini volume and balance.
+    pub shade: bool,
+    /// The volume and balance shown in shade mode (the main window's values).
+    pub volume: u8,
+    pub balance: i8,
     /// The control held down, drawn with its pressed sprite.
     pub pressed: Option<EqHit>,
     /// The slider being dragged. Its thumb is drawn selected.
@@ -92,6 +121,9 @@ pub fn hit_test_eq(x: i32, y: i32) -> Option<EqHit> {
     if CLOSE_BTN.contains(x, y) {
         return Some(EqHit::Close);
     }
+    if SHADE_BTN.contains(x, y) {
+        return Some(EqHit::Shade);
+    }
     if ON_BTN.contains(x, y) {
         return Some(EqHit::On);
     }
@@ -108,6 +140,40 @@ pub fn hit_test_eq(x: i32, y: i32) -> Option<EqHit> {
         return None;
     }
     TITLE_BAR.contains(x, y).then_some(EqHit::TitleBar)
+}
+
+/// Which hit target (if any) is at `(x, y)` in the windowshade (275 × 14).
+pub fn hit_test_eq_shade(x: i32, y: i32) -> Option<EqHit> {
+    if !(0..WIDTH as i32).contains(&x) || !(0..SHADE_HEIGHT as i32).contains(&y) {
+        return None;
+    }
+    if CLOSE_BTN.contains(x, y) {
+        return Some(EqHit::Close);
+    }
+    if SHADE_BTN.contains(x, y) {
+        return Some(EqHit::Shade);
+    }
+    if SHADE_VOLUME.contains(x, y) {
+        return Some(EqHit::ShadeVolume);
+    }
+    if SHADE_BALANCE.contains(x, y) {
+        return Some(EqHit::ShadeBalance);
+    }
+    Some(EqHit::TitleBar)
+}
+
+/// The volume (`0..=100`) for a pointer at window `x` on the shade's volume track, when dragged.
+pub fn shade_volume_from_x(x: f64) -> u8 {
+    let travel = f64::from(SHADE_VOLUME.w) - SHADE_THUMB_W;
+    let rel = (x - f64::from(SHADE_VOLUME.x) - SHADE_THUMB_W / 2.0) / travel;
+    (rel.clamp(0.0, 1.0) * 100.0).round() as u8
+}
+
+/// The balance (`-100..=100`) for a pointer at window `x` on the shade's balance track.
+pub fn shade_balance_from_x(x: f64) -> i8 {
+    let travel = f64::from(SHADE_BALANCE.w) - SHADE_THUMB_W;
+    let rel = (x - f64::from(SHADE_BALANCE.x) - SHADE_THUMB_W / 2.0) / travel;
+    (rel.clamp(0.0, 1.0) * 200.0 - 100.0).round() as i8
 }
 
 /// JavaScript's `Math.round`, which rounds halves towards +Infinity.
@@ -310,6 +376,10 @@ fn solve(mat: &mut [Vec<f64>], ks: &mut [f64]) {
 
 /// Draws the whole equalizer window in Webamp's layout, from the background up.
 pub fn render_eq(skin: &Skin, st: &EqWindowState, canvas: &mut Canvas) {
+    if st.shade {
+        render_eq_shade(skin, st, canvas);
+        return;
+    }
     draw(skin, canvas, "EQ_WINDOW_BACKGROUND", 0, 0);
     let bar = if st.focused {
         "EQ_TITLE_BAR_SELECTED"
@@ -324,6 +394,7 @@ pub fn render_eq(skin: &Skin, st: &EqWindowState, canvas: &mut Canvas) {
         "EQ_CLOSE_BUTTON"
     };
     draw(skin, canvas, close, CLOSE_BTN.x, CLOSE_BTN.y);
+    draw_shade_button(skin, canvas, st, false);
 
     let on = 2 * usize::from(st.settings.on) + usize::from(is_pressed(st, EqHit::On));
     draw(skin, canvas, ON_NAMES[on], ON_BTN.x, ON_BTN.y);
@@ -367,6 +438,62 @@ fn draw(skin: &Skin, canvas: &mut Canvas, name: &str, x: i32, y: i32) {
     if let Some(view) = skin.sprite(Sheet::Eqmain, name) {
         canvas.blit(&view, x, y);
     }
+}
+
+/// Like [`draw`], from EQ_EX.BMP (the shade and the window buttons that EQMAIN lacks).
+fn draw_ex(skin: &Skin, canvas: &mut Canvas, name: &str, x: i32, y: i32) {
+    if let Some(view) = skin.sprite(Sheet::EqEx, name) {
+        canvas.blit(&view, x, y);
+    }
+}
+
+/// The windowshade button. Its normal sprite is EQMAIN's (Webamp's fallback), and the pressed one
+/// is EQ_EX's: the restore glyph in the full window, the minimise glyph in shade mode.
+fn draw_shade_button(skin: &Skin, canvas: &mut Canvas, st: &EqWindowState, shade: bool) {
+    let x = SHADE_BTN.x;
+    let y = SHADE_BTN.y;
+    if is_pressed(st, EqHit::Shade) {
+        let name = if shade {
+            "EQ_MINIMIZE_BUTTON_ACTIVE"
+        } else {
+            "EQ_MAXIMIZE_BUTTON_ACTIVE"
+        };
+        draw_ex(skin, canvas, name, x, y);
+    } else {
+        draw(skin, canvas, "EQ_MAXIMIZE_BUTTON_ACTIVE_FALLBACK", x, y);
+    }
+}
+
+/// The shade: EQ_EX's strip, the title buttons, and the mini volume and balance thumbs. The tracks
+/// are part of the strip's background, so only the thumbs are drawn on top.
+fn render_eq_shade(skin: &Skin, st: &EqWindowState, canvas: &mut Canvas) {
+    let bg = if st.focused {
+        "EQ_SHADE_BACKGROUND_SELECTED"
+    } else {
+        "EQ_SHADE_BACKGROUND"
+    };
+    draw_ex(skin, canvas, bg, 0, 0);
+    draw_shade_button(skin, canvas, st, true);
+
+    let close = if is_pressed(st, EqHit::Close) {
+        "EQ_SHADE_CLOSE_BUTTON_ACTIVE"
+    } else {
+        "EQ_SHADE_CLOSE_BUTTON"
+    };
+    draw_ex(skin, canvas, close, CLOSE_BTN.x, CLOSE_BTN.y);
+
+    // Thumbs take one of three sprites by the value's third (Webamp's `segment`).
+    let third = |ratio: f64| ["LEFT", "CENTER", "RIGHT"][(ratio * 2.0).round() as usize];
+    let vol_ratio = f64::from(st.volume.min(100)) / 100.0;
+    let vol_x = SHADE_VOLUME.x + (vol_ratio * (f64::from(SHADE_VOLUME.w) - SHADE_THUMB_W)).round() as i32;
+    let vol_name = format!("EQ_SHADE_VOLUME_SLIDER_{}", third(vol_ratio));
+    draw_ex(skin, canvas, &vol_name, vol_x, SHADE_VOLUME.y);
+
+    let bal = i32::from(st.balance.clamp(-100, 100));
+    let bal_ratio = f64::from(bal + 100) / 200.0;
+    let bal_x = SHADE_BALANCE.x + (bal_ratio * (f64::from(SHADE_BALANCE.w) - SHADE_THUMB_W)).round() as i32;
+    let bal_name = format!("EQ_SHADE_BALANCE_SLIDER_{}", third(bal_ratio));
+    draw_ex(skin, canvas, &bal_name, bal_x, SHADE_BALANCE.y);
 }
 
 /// One slider: the band background frame for `level`, then the thumb at its offset.
@@ -684,5 +811,150 @@ mod tests {
         let bytes = testkit::zip_bytes(&[("MAIN.BMP", testkit::bmp_bytes(&tiny))]);
         let skin = Skin::load(&bytes).expect("only MAIN is required");
         let _ = render(&skin, &flat_state());
+    }
+}
+
+#[cfg(test)]
+mod shade_tests {
+    use super::*;
+    use tubeamp_skin::testkit;
+
+    fn shade_state() -> EqWindowState {
+        EqWindowState {
+            shade: true,
+            focused: true,
+            volume: 0,
+            balance: 0,
+            ..EqWindowState::default()
+        }
+    }
+
+    fn render(skin: &Skin, st: &EqWindowState) -> Canvas {
+        let mut canvas = Canvas::new(WIDTH, SHADE_HEIGHT);
+        render_eq(skin, st, &mut canvas);
+        canvas
+    }
+
+    fn px(c: &Canvas, x: i32, y: i32) -> u32 {
+        c.px[(y as u32 * c.w + x as u32) as usize]
+    }
+
+    fn ex_px(skin: &Skin, x: u32, y: u32) -> u32 {
+        let img = skin.sheet(Sheet::EqEx).expect("eq_ex");
+        img.px[(y * img.w + x) as usize]
+    }
+
+    /// Asserts that canvas `dst` shows EQ_EX `src` over `size`.
+    fn assert_ex(c: &Canvas, skin: &Skin, src: (u32, u32), dst: (i32, i32), size: (u32, u32)) {
+        for j in 0..size.1 {
+            for i in 0..size.0 {
+                assert_eq!(
+                    px(c, dst.0 + i as i32, dst.1 + j as i32),
+                    ex_px(skin, src.0 + i, src.1 + j),
+                    "canvas ({},{}) should show EQ_EX ({},{})",
+                    dst.0 + i as i32,
+                    dst.1 + j as i32,
+                    src.0 + i,
+                    src.1 + j
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn shade_strip_follows_focus() {
+        let skin = testkit::synthetic_skin();
+        // The thumbs (rows 4..11) and the buttons (x 254..) cover parts of the strip, so the
+        // bands above and below them are compared.
+        let c = render(&skin, &shade_state());
+        assert_ex(&c, &skin, (0, 0), (0, 0), (254, 3));
+        assert_ex(&c, &skin, (0, 11), (0, 11), (254, 3));
+        let unfocused = render(
+            &skin,
+            &EqWindowState {
+                focused: false,
+                ..shade_state()
+            },
+        );
+        assert_ex(&unfocused, &skin, (0, 15 + 11), (0, 11), (254, 3));
+    }
+
+    #[test]
+    fn shade_close_and_restore_buttons_use_the_shade_sprites() {
+        let skin = testkit::synthetic_skin();
+        let c = render(&skin, &shade_state());
+        assert_ex(&c, &skin, (11, 38), (264, 3), (9, 9));
+        let pressed = render(
+            &skin,
+            &EqWindowState {
+                pressed: Some(EqHit::Close),
+                ..shade_state()
+            },
+        );
+        assert_ex(&pressed, &skin, (11, 47), (264, 3), (9, 9));
+        // The shade button's normal sprite comes from EQMAIN, the fallback.
+        let shade_btn = skin
+            .sprite(Sheet::Eqmain, "EQ_MAXIMIZE_BUTTON_ACTIVE_FALLBACK")
+            .expect("fallback sprite");
+        assert_eq!(px(&c, 254, 3), shade_btn.pixel(0, 0));
+    }
+
+    #[test]
+    fn shade_thumbs_follow_the_volume_and_balance() {
+        let skin = testkit::synthetic_skin();
+        // Volume 100 is the right thumb at the end of the track; balance 0 is the middle one.
+        let st = EqWindowState {
+            volume: 100,
+            balance: 0,
+            ..shade_state()
+        };
+        let c = render(&skin, &st);
+        assert_ex(&c, &skin, (7, 30), (61 + 94, 4), (3, 7));
+        assert_ex(&c, &skin, (14, 30), (164 + 20, 4), (3, 7));
+        // Volume 0 and balance -100 are the left thumbs.
+        let left = render(
+            &skin,
+            &EqWindowState {
+                volume: 0,
+                balance: -100,
+                ..shade_state()
+            },
+        );
+        assert_ex(&left, &skin, (1, 30), (61, 4), (3, 7));
+        assert_ex(&left, &skin, (11, 30), (164, 4), (3, 7));
+    }
+
+    #[test]
+    fn shade_hit_test_finds_the_controls_and_the_strip() {
+        assert_eq!(hit_test_eq_shade(266, 5), Some(EqHit::Close));
+        assert_eq!(hit_test_eq_shade(256, 5), Some(EqHit::Shade));
+        assert_eq!(hit_test_eq_shade(100, 6), Some(EqHit::ShadeVolume));
+        assert_eq!(hit_test_eq_shade(180, 6), Some(EqHit::ShadeBalance));
+        assert_eq!(hit_test_eq_shade(20, 7), Some(EqHit::TitleBar));
+        assert_eq!(hit_test_eq_shade(20, 14), None);
+        assert_eq!(hit_test_eq_shade(275, 7), None);
+    }
+
+    #[test]
+    fn full_window_has_a_shade_button_at_the_same_place() {
+        assert_eq!(hit_test_eq(256, 5), Some(EqHit::Shade));
+        assert_eq!(hit_test_eq(266, 5), Some(EqHit::Close));
+    }
+
+    #[test]
+    fn shade_volume_and_balance_map_pointer_x_to_their_values() {
+        assert_eq!(shade_volume_from_x(61.0 + 1.5), 0);
+        assert_eq!(shade_volume_from_x(61.0 + 1.5 + 94.0), 100);
+        assert_eq!(shade_volume_from_x(61.0 + 1.5 + 47.0), 50);
+        assert_eq!(shade_volume_from_x(-10.0), 0);
+        assert_eq!(shade_balance_from_x(164.0 + 1.5), -100);
+        assert_eq!(shade_balance_from_x(164.0 + 1.5 + 20.0), 0);
+        assert_eq!(shade_balance_from_x(164.0 + 1.5 + 40.0), 100);
+    }
+
+    #[test]
+    fn window_height_is_the_shade_height_or_the_full_height() {
+        assert_eq!(window_height(true), 14);
+        assert_eq!(window_height(false), 116);
     }
 }

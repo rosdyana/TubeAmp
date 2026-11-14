@@ -18,6 +18,8 @@
 mod api;
 mod demo;
 mod eq;
+mod hotkeys;
+mod layout;
 mod library;
 mod player;
 mod playlist;
@@ -38,7 +40,7 @@ use tubeamp_ui::playlist_window::{self as plw, MAX_STEPS};
 use tubeamp_ui::video_window::{self as vw, VideoWindowState};
 use tubeamp_ui::{
     render_eq, render_library, render_main, render_playlist, render_video_frame, Canvas,
-    LibraryState, MainState, PlMenu, HEIGHT, WIDTH,
+    EqWindowState, LibraryState, MainState, PlMenu, HEIGHT, WIDTH,
 };
 
 /// The built-in default skin (TubeAmp Classic), embedded at build time.
@@ -55,6 +57,7 @@ const USAGE: &str = "usage:
   tubeamp --render-pl SKIN.wsz OUT.png [--zoom N] [--size-steps SX,SY] [--open-menu add|rem|sel|misc|list]
   tubeamp --render-library SKIN.wsz OUT.png [--zoom N] [--fixture PATH.json]
   tubeamp --render-video SKIN.wsz OUT.png [--zoom N] [--size WxH]
+  tubeamp --render-shade main|eq|pl SKIN.wsz OUT.png [--zoom N] [--size-steps SX,SY]
 
   --zoom N                 integer scale of the 275x116 window (1..=8, default 1)
   --screenshot-after S F   save the live main window (2x) to F after S seconds, and the
@@ -75,6 +78,10 @@ const USAGE: &str = "usage:
   --video-mode MODE        video (default: only the video shows) or browser (the whole
                            YouTube Music page, and a larger window)
   --size WxH               with --render-video: the frame size in skin pixels (default 275x232)
+  --shade main,eq,pl       start with these windows in windowshade mode (any subset)
+  --render-shade WHICH     with --render-shade: the windowshade of main, eq or pl, headless
+  --layout-dump            print the window rectangles and their connections to stderr when a
+                           drag ends (for tests)
 
 environment:
   TUBEAMP_AUTOLOAD=ID      load YouTube video ID six seconds after start
@@ -110,7 +117,44 @@ struct Args {
     size: Option<(u32, u32)>,
     open_video: bool,
     video_browser: bool,
+    /// `--shade`: which windows start in windowshade mode.
+    shade: window::ShadeSet,
+    /// `--render-shade`: the window, skin and output file.
+    render_shade: Option<(ShadeTarget, PathBuf, PathBuf)>,
+    layout_dump: bool,
     help: bool,
+}
+
+/// The windows that have a windowshade, for `--render-shade`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ShadeTarget {
+    Main,
+    Eq,
+    Pl,
+}
+
+/// Parses the window name for `--render-shade`.
+fn parse_shade_target(value: &str) -> Result<ShadeTarget, String> {
+    match value {
+        "main" => Ok(ShadeTarget::Main),
+        "eq" => Ok(ShadeTarget::Eq),
+        "pl" => Ok(ShadeTarget::Pl),
+        other => Err(format!("--render-shade takes main, eq or pl, got {other}")),
+    }
+}
+
+/// Parses `--shade`: a comma-separated subset of `main`, `eq` and `pl`.
+fn parse_shade_set(value: &str) -> Result<window::ShadeSet, String> {
+    let mut set = window::ShadeSet::default();
+    for name in value.split(',').map(str::trim).filter(|n| !n.is_empty()) {
+        match name {
+            "main" => set.main = true,
+            "eq" => set.eq = true,
+            "pl" => set.pl = true,
+            other => return Err(format!("--shade takes main, eq or pl, got {other}")),
+        }
+    }
+    Ok(set)
 }
 
 fn next_path(args: &mut impl Iterator<Item = String>, flag: &str) -> Result<PathBuf, String> {
@@ -264,6 +308,18 @@ fn parse_args(mut args: impl Iterator<Item = String>) -> Result<Args, String> {
                 out.size = Some(parse_frame_size(&value)?);
             }
             "--open-video" => out.open_video = true,
+            "--shade" => {
+                let value = args.next().ok_or("--shade needs main, eq or pl")?;
+                out.shade = parse_shade_set(&value)?;
+            }
+            "--render-shade" => {
+                let which = args.next().ok_or("--render-shade needs main, eq or pl")?;
+                let target = parse_shade_target(&which)?;
+                let skin = next_path(&mut args, "--render-shade")?;
+                let png = next_path(&mut args, "--render-shade")?;
+                out.render_shade = Some((target, skin, png));
+            }
+            "--layout-dump" => out.layout_dump = true,
             "--video-mode" => {
                 let value = args.next().ok_or("--video-mode needs video or browser")?;
                 out.video_browser = parse_video_mode(&value)?;
@@ -309,6 +365,52 @@ fn render_scaled(skin: &Skin, state: &MainState, factor: u32) -> Vec<u32> {
     let mut out = vec![0u32; ((WIDTH * factor) * (HEIGHT * factor)) as usize];
     canvas.scale_into(&mut out, factor);
     out
+}
+
+/// The windowshade of `target` at its demo state, for `--render-shade`. The playlist uses the
+/// demo tracks and `size_steps` (default: the classic size).
+fn render_shade_canvas(
+    skin: &Skin,
+    target: ShadeTarget,
+    size_steps: Option<(u32, u32)>,
+    preset: Option<&Preset>,
+) -> Canvas {
+    match target {
+        ShadeTarget::Main => {
+            let state = MainState {
+                shade: true,
+                ..demo::demo_state(RENDER_TIME_SECS, 0, true)
+            };
+            let mut canvas = Canvas::new(WIDTH, tubeamp_ui::main_window::SHADE_HEIGHT);
+            render_main(skin, &state, &mut canvas);
+            canvas
+        }
+        ShadeTarget::Eq => {
+            let state = EqWindowState {
+                shade: true,
+                // The demo's volume and balance, as the main window's render shows them.
+                volume: 75,
+                balance: 0,
+                ..demo::eq_demo_state(preset)
+            };
+            let mut canvas = Canvas::new(eqw::WIDTH, eqw::SHADE_HEIGHT);
+            render_eq(skin, &state, &mut canvas);
+            canvas
+        }
+        ShadeTarget::Pl => {
+            let steps = size_steps.unwrap_or(plw::DEFAULT_STEPS);
+            let playlist = demo::pl_demo_playlist();
+            let state = PlaylistWindowState {
+                shade: true,
+                mini_time_secs: None,
+                ..demo::pl_demo_state(steps)
+            };
+            let (w, h) = plw::window_size_for(steps, true);
+            let mut canvas = Canvas::new(w, h);
+            render_playlist(skin, &playlist, &state, &mut canvas);
+            canvas
+        }
+    }
 }
 
 fn save_png(pixels: &[u32], width: u32, height: u32, path: &Path) -> Result<(), Box<dyn Error>> {
@@ -398,6 +500,15 @@ fn run() -> Result<(), Box<dyn Error>> {
         return Ok(());
     }
 
+    if let Some((target, skin_path, png_path)) = args.render_shade {
+        let skin = Skin::load_path(&skin_path)?;
+        let canvas = render_shade_canvas(&skin, target, args.size_steps, args.eq_preset.as_ref());
+        let pixels = skinned::scaled(&canvas, zoom);
+        save_png(&pixels, canvas.w * zoom, canvas.h * zoom, &png_path)?;
+        println!("wrote {}", png_path.display());
+        return Ok(());
+    }
+
     if let Some((skin_path, png_path)) = args.render_pl {
         let skin = Skin::load_path(&skin_path)?;
         let steps = args.size_steps.unwrap_or(plw::DEFAULT_STEPS);
@@ -435,6 +546,8 @@ fn run() -> Result<(), Box<dyn Error>> {
         library_search: args.library_search,
         open_video: args.open_video,
         video_browser: args.video_browser,
+        shade: args.shade,
+        layout_dump: args.layout_dump,
     };
     window::run(skin, options)?;
     Ok(())

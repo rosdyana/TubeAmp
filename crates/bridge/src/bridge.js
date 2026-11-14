@@ -2,7 +2,7 @@
 //
 // Reads the player and posts snapshots to Rust, and runs the commands Rust sends.
 // Wire format: JSON objects tagged by "t", see crates/bridge/src/proto.rs.
-//   page -> Rust: window.ipc.postMessage(JSON.stringify({t: "state" | "ended" | "error" | "ready" | "apiresult", ...}))
+//   page -> Rust: window.ipc.postMessage(JSON.stringify({t: "state" | "ended" | "error" | "ready" | "apiresult" | "key" | "escape", ...}))
 //   Rust -> page: window.__tubeamp.cmd({t: "play" | "pause" | "api" | ..., ...})
 //
 // InnerTube: {t: "api", req, endpoint, body} runs a same-origin POST to /youtubei/v1/<endpoint>
@@ -35,6 +35,7 @@
     viewMode: true,
     keepRoot: null,
     markedAt: 0,
+    eventAt: 0,
   });
 
   // TODO(windows): attach the Web Audio EQ graph here, once the Windows backend lands:
@@ -92,6 +93,25 @@
 
   const isPlaying = (ps) => ps === 1 || ps === 3;
 
+  // Posts one snapshot now, and the end of a video once (player state 0 after something else).
+  // Called by the timer and by the media events below, so the state does not depend on the timer
+  // alone. A hidden webview runs its timers slowly, but the media events still arrive.
+  const report = () => {
+    const msg = snapshot(player(), Date.now());
+    const ps = msg.ps;
+    post(msg);
+    // YouTube reports state 0 once when a video ends. Only fire on the transition into 0.
+    if (ps !== null) {
+      if (ps === 0 && T.lastPs !== null && T.lastPs !== 0) post({ t: "ended" });
+      T.lastPs = ps;
+    }
+    return ps;
+  };
+
+  // Media events that change the state, and timeupdate, which is throttled to 250 ms.
+  const MEDIA_EVENTS = ["play", "pause", "seeked", "loadedmetadata", "ended"];
+  const TIMEUPDATE_MS = 250;
+
   // Errors from the <video> element. YouTube Music swaps the element, so re-attach when it changes.
   const watchVideo = () => {
     const v = document.querySelector("video");
@@ -100,6 +120,15 @@
     v.addEventListener("error", () => {
       const e = v.error;
       post({ t: "error", where: "video", msg: e ? `code ${e.code}: ${e.message}` : "unknown" });
+    });
+    for (const name of MEDIA_EVENTS) {
+      v.addEventListener(name, () => attempt(report));
+    }
+    v.addEventListener("timeupdate", () => {
+      const now = Date.now();
+      if (now - T.eventAt < TIMEUPDATE_MS) return;
+      T.eventAt = now;
+      attempt(report);
     });
   };
 
@@ -179,19 +208,68 @@ html.tubeamp-video video { object-fit: contain !important; }
     true
   );
 
+  // ---- Keys in the video view ------------------------------------------------------------------
+
+  // The shortcuts TubeAmp runs (crates/app/src/hotkeys.rs, PAGE_KEYS). A key in this list is
+  // also prevented from reaching the page. Any other key still goes to the page, so YouTube
+  // Music's own shortcuts keep working. Keep this list in step with PAGE_KEYS (an app test checks it).
+  const PLAIN_KEYS = ["arrowleft", "arrowright", "arrowup", "arrowdown", "z", "x", "c", "v", "b", "l"];
+  const CTRL_KEYS = ["d", "t", "l"];
+  const ALT_KEYS = ["l", "v"];
+
+  // The key's letter: under Alt or Ctrl on macOS, KeyboardEvent.key is a symbol, so letters come
+  // from `code` (KeyV), which does not depend on modifiers or the layout's shifted characters.
+  const keyName = (e) => {
+    if (e.code && /^Key[A-Z]$/.test(e.code)) return e.code.slice(3).toLowerCase();
+    return String(e.key || "").toLowerCase();
+  };
+
+  // Whether TubeAmp runs a shortcut for this key press. Only these are prevented.
+  // The same rule as shortcut_for in hotkeys.rs: Cmd, and Ctrl+Alt, are never shortcuts; Ctrl is
+  // a Ctrl shortcut only; Alt takes its own letters, and otherwise falls through to the plain keys.
+  const handledByTubeAmp = (e) => {
+    const k = keyName(e);
+    if (e.metaKey || (e.ctrlKey && e.altKey)) return false;
+    if (e.ctrlKey) return CTRL_KEYS.includes(k);
+    if (e.altKey && ALT_KEYS.includes(k)) return true;
+    return PLAIN_KEYS.includes(k);
+  };
+
+  const isEditable = (el) => {
+    if (!el || !el.tagName) return false;
+    const tag = el.tagName.toLowerCase();
+    return tag === "input" || tag === "textarea" || tag === "select" || !!el.isContentEditable;
+  };
+
+  // In the video view the webview can have focus (after a click in the video). Keys then come
+  // here first: forward them to Rust, and prevent the ones TubeAmp handles. Escape is forwarded
+  // by the listener above, so it is left out here. Nothing is forwarded in the browser view.
+  document.addEventListener(
+    "keydown",
+    (e) => {
+      if (!T.viewMode || e.isComposing || e.key === "Escape") return;
+      if (isEditable(e.target)) return;
+      const handled = handledByTubeAmp(e);
+      post({
+        t: "key",
+        key: e.key,
+        code: e.code || "",
+        ctrl: !!e.ctrlKey,
+        alt: !!e.altKey,
+        shift: !!e.shiftKey,
+        meta: !!e.metaKey,
+      });
+      if (handled) e.preventDefault();
+    },
+    true
+  );
+
   const tick = () => {
     let ps = null;
     try {
       applyView();
       watchVideo();
-      const msg = snapshot(player(), Date.now());
-      ps = msg.ps;
-      post(msg);
-      // YouTube reports state 0 once when a video ends. Only fire on the transition into 0.
-      if (ps !== null) {
-        if (ps === 0 && T.lastPs !== null && T.lastPs !== 0) post({ t: "ended" });
-        T.lastPs = ps;
-      }
+      ps = report();
     } catch (e) {
       post({ t: "error", where: "tick", msg: String(e) });
     } finally {

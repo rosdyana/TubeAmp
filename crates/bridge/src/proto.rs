@@ -72,6 +72,22 @@ pub enum Evt {
     /// Escape was pressed while the page had focus. The video window uses it to leave fullscreen,
     /// since the webview takes the key events once it has focus.
     Escape,
+    /// A key pressed while the page shows the video (not the full page) and the target is not a
+    /// text field. The app runs its own shortcut for it, as if the key had come to its window.
+    /// `key` is `KeyboardEvent.key`, and `code` is `KeyboardEvent.code` (for letters under Alt,
+    /// where the key is a symbol on macOS).
+    Key {
+        key: String,
+        code: String,
+        #[serde(default)]
+        ctrl: bool,
+        #[serde(default)]
+        alt: bool,
+        #[serde(default)]
+        shift: bool,
+        #[serde(default)]
+        meta: bool,
+    },
     /// Something failed in the page. `at` names the place, `msg` is the message.
     Error {
         #[serde(rename = "where")]
@@ -282,6 +298,57 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn key_evt_round_trips_with_its_modifiers() {
+        round_trip_evt(Evt::Key {
+            key: "z".to_string(),
+            code: "KeyZ".to_string(),
+            ctrl: false,
+            alt: false,
+            shift: false,
+            meta: false,
+        });
+        round_trip_evt(Evt::Key {
+            key: "√".to_string(),
+            code: "KeyV".to_string(),
+            ctrl: false,
+            alt: true,
+            shift: true,
+            meta: true,
+        });
+    }
+
+    #[test]
+    fn key_evt_wire_format_matches_bridge_js() {
+        assert_eq!(
+            serde_json::from_str::<Evt>(
+                r#"{"t":"key","key":"ArrowLeft","code":"ArrowLeft","ctrl":false,"alt":false,"shift":true,"meta":false}"#
+            )
+            .unwrap(),
+            Evt::Key {
+                key: "ArrowLeft".to_string(),
+                code: "ArrowLeft".to_string(),
+                ctrl: false,
+                alt: false,
+                shift: true,
+                meta: false,
+            }
+        );
+        // The modifier flags default to false when the page leaves them out.
+        assert_eq!(
+            serde_json::from_str::<Evt>(r#"{"t":"key","key":"x","code":"KeyX"}"#).unwrap(),
+            Evt::Key {
+                key: "x".to_string(),
+                code: "KeyX".to_string(),
+                ctrl: false,
+                alt: false,
+                shift: false,
+                meta: false,
+            }
+        );
+        assert!(serde_json::from_str::<Evt>(r#"{"t":"key","key":"x"}"#).is_err());
     }
 
     #[test]

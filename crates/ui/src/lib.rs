@@ -16,15 +16,15 @@ pub use library_window::{
     hit_test_library, render_library, LibHit, LibKind, LibRow, LibraryState, NavItem, NavKind,
 };
 pub use eq_window::{
-    hit_test_eq, press_grab, render_eq, slider_rect, slider_value_at, EqHit, EqSlider,
+    hit_test_eq, hit_test_eq_shade, press_grab, render_eq, slider_rect, slider_value_at, EqHit, EqSlider,
     EqWindowState, PRESETS_BTN,
 };
 pub use main_window::{
-    displayed_secs, hit_test_main, render_main, time_digits, MainButton, MainHit, MainState,
+    displayed_secs, hit_test_main, hit_test_main_shade, render_main, time_digits, MainButton, MainHit, MainState,
     Status, HEIGHT, WIDTH,
 };
 pub use playlist_window::{
-    hit_test_playlist, menu_button_rect, render_playlist, row_index_at, PlHit, PlMenu, PlTransport,
+    hit_test_playlist, hit_test_playlist_shade, menu_button_rect, render_playlist, row_index_at, PlHit, PlMenu, PlTransport,
     PlaylistWindowState,
 };
 pub use text::{draw_text, marquee_frame, marquee_period_px};

@@ -302,16 +302,14 @@ fn stroke(pm: &mut Pixmap, path: &tiny_skia::Path, shader: Shader<'static>, widt
 /// Premultiplied pixmap bytes to straight RGBA.
 fn unpremultiply(data: &[u8], size: u32) -> RgbaImage {
     let mut out = Vec::with_capacity(data.len());
-    for px in data.chunks_exact(4) {
-        let a = px[3] as u32;
-        if a == 0 {
-            out.extend_from_slice(&[0, 0, 0, 0]);
-        } else {
-            for &c in &px[..3] {
-                out.push(((c as u32 * 255 + a / 2) / a).min(255) as u8);
-            }
-            out.push(px[3]);
+    for px in data.as_chunks::<4>().0 {
+        let a = u32::from(px[3]);
+        // Fully transparent pixels (a == 0) become 0,0,0,0.
+        for &c in &px[..3] {
+            let v = (u32::from(c) * 255 + a / 2).checked_div(a).unwrap_or(0);
+            out.push(v.min(255) as u8);
         }
+        out.push(px[3]);
     }
     RgbaImage::from_raw(size, size, out).expect("pixel count matches size")
 }

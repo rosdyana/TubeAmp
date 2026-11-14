@@ -175,13 +175,13 @@ impl Vis {
 
         let log_max = (BINS as f32).log10();
         let span = (COLUMNS - 1) as f32;
-        for x in 0..COLUMNS {
+        for (x, out) in self.sample.iter_mut().enumerate().take(COLUMNS) {
             let linear = x as f32 / span * (BINS - 1) as f32;
             let logged = 10f32.powf(log_max * x as f32 / span);
             let scaled = (1.0 - SCALE) * linear + SCALE * logged;
             let i1 = (scaled.floor() as usize).min(BINS - 1);
             let i2 = (scaled.ceil() as usize).min(BINS - 1);
-            self.sample[x] = if i1 == i2 {
+            *out = if i1 == i2 {
                 mags[i1]
             } else {
                 let f2 = scaled - i1 as f32;

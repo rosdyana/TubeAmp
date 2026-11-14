@@ -190,7 +190,7 @@ pub fn parse_region(text: &str) -> Regions {
             .filter(|s| !s.is_empty())
             .filter_map(|s| s.parse().ok())
             .collect();
-        let points: Vec<(i32, i32)> = nums.chunks_exact(2).map(|p| (p[0], p[1])).collect();
+        let points: Vec<(i32, i32)> = nums.as_chunks::<2>().0.iter().map(|&[x, y]| (x, y)).collect();
 
         let mut idx = 0usize;
         let mut polygons = Vec::new();

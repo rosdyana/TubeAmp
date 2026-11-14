@@ -107,7 +107,11 @@ pub fn render(size: u32) -> RgbaImage {
         grad(
             100.0,
             924.0,
-            &[(0.0, STEEL_TOP, 255), (0.45, STEEL_MID, 255), (1.0, STEEL_BOT, 255)],
+            &[
+                (0.0, STEEL_TOP, 255),
+                (0.45, STEEL_MID, 255),
+                (1.0, STEEL_BOT, 255),
+            ],
         ),
         t,
     );
@@ -119,7 +123,13 @@ pub fn render(size: u32) -> RgbaImage {
     );
 
     // Bevel: a dark outer rim, a light inner edge at the top, a shadow inner edge at the bottom.
-    stroke(&mut pm, &squircle(CENTRE, CENTRE, HALF - 6.0), solid(RIM_DARK, 220), 12.0, t);
+    stroke(
+        &mut pm,
+        &squircle(CENTRE, CENTRE, HALF - 6.0),
+        solid(RIM_DARK, 220),
+        12.0,
+        t,
+    );
     stroke(
         &mut pm,
         &squircle(CENTRE, CENTRE, HALF - 18.0),
@@ -134,11 +144,7 @@ pub fn render(size: u32) -> RgbaImage {
     stroke(
         &mut pm,
         &squircle(CENTRE, CENTRE, HALF - 26.0),
-        grad(
-            100.0,
-            924.0,
-            &[(0.0, [0; 3], 0), (1.0, [0; 3], 110)],
-        ),
+        grad(100.0, 924.0, &[(0.0, [0; 3], 0), (1.0, [0; 3], 110)]),
         6.0,
         t,
     );
@@ -152,8 +158,19 @@ pub fn render(size: u32) -> RgbaImage {
         t,
     );
     let (lx, ly, lw, lh) = LCD;
-    fill(&mut pm, &rrect(lx, ly, lw, lh, 40.0), solid(LCD_BLACK, 255), t);
-    stroke(&mut pm, &rrect(lx, ly, lw, lh, 40.0), solid(LCD_RIM, 255), 8.0, t);
+    fill(
+        &mut pm,
+        &rrect(lx, ly, lw, lh, 40.0),
+        solid(LCD_BLACK, 255),
+        t,
+    );
+    stroke(
+        &mut pm,
+        &rrect(lx, ly, lw, lh, 40.0),
+        solid(LCD_RIM, 255),
+        8.0,
+        t,
+    );
 
     // Equalizer bars: a soft halo, the bar, then dark segment lines over it, and a peak cap.
     for (i, fraction) in BAR_FRACTIONS.iter().enumerate() {
@@ -163,7 +180,13 @@ pub fn render(size: u32) -> RgbaImage {
         for (grow, alpha) in [(22.0, 26u8), (12.0, 36), (5.0, 48)] {
             fill(
                 &mut pm,
-                &rrect(x - grow, top - grow, BAR_W + 2.0 * grow, h + 2.0 * grow, 14.0 + grow),
+                &rrect(
+                    x - grow,
+                    top - grow,
+                    BAR_W + 2.0 * grow,
+                    h + 2.0 * grow,
+                    14.0 + grow,
+                ),
                 solid(LCD_ON, alpha),
                 t,
             );
@@ -174,16 +197,30 @@ pub fn render(size: u32) -> RgbaImage {
             grad(
                 top,
                 BAR_BOTTOM,
-                &[(0.0, LCD_HOT, 255), (0.35, LCD_ON, 255), (1.0, LCD_DEEP, 255)],
+                &[
+                    (0.0, LCD_HOT, 255),
+                    (0.35, LCD_ON, 255),
+                    (1.0, LCD_DEEP, 255),
+                ],
             ),
             t,
         );
         let mut y = BAR_BOTTOM - SEGMENT_PITCH;
         while y > top {
-            fill(&mut pm, &rect(x, y, BAR_W, SEGMENT_LINE), solid(LCD_BLACK, 230), t);
+            fill(
+                &mut pm,
+                &rect(x, y, BAR_W, SEGMENT_LINE),
+                solid(LCD_BLACK, 230),
+                t,
+            );
             y -= SEGMENT_PITCH;
         }
-        fill(&mut pm, &rrect(x, top - 26.0, BAR_W, 9.0, 4.0), solid(LCD_HOT, 255), t);
+        fill(
+            &mut pm,
+            &rrect(x, top - 26.0, BAR_W, 9.0, 4.0),
+            solid(LCD_HOT, 255),
+            t,
+        );
     }
 
     unpremultiply(pm.data(), size)
@@ -261,10 +298,7 @@ fn grad(y0: f32, y1: f32, stops: &[(f32, [u8; 3], u8)]) -> Shader<'static> {
     let stops = stops
         .iter()
         .map(|&(pos, rgb, alpha)| {
-            GradientStop::new(
-                pos,
-                Color::from_rgba8(rgb[0], rgb[1], rgb[2], alpha),
-            )
+            GradientStop::new(pos, Color::from_rgba8(rgb[0], rgb[1], rgb[2], alpha))
         })
         .collect();
     LinearGradient::new(
@@ -286,7 +320,13 @@ fn fill(pm: &mut Pixmap, path: &tiny_skia::Path, shader: Shader<'static>, t: Tra
     pm.fill_path(path, &paint, FillRule::Winding, t, None);
 }
 
-fn stroke(pm: &mut Pixmap, path: &tiny_skia::Path, shader: Shader<'static>, width: f32, t: Transform) {
+fn stroke(
+    pm: &mut Pixmap,
+    path: &tiny_skia::Path,
+    shader: Shader<'static>,
+    width: f32,
+    t: Transform,
+) {
     let paint = Paint {
         shader,
         anti_alias: true,
@@ -321,7 +361,11 @@ mod tests {
     #[test]
     fn corners_are_transparent_and_the_centre_bar_glows_green() {
         let img = render(128);
-        assert_eq!(img.get_pixel(0, 0)[3], 0, "outside the squircle is transparent");
+        assert_eq!(
+            img.get_pixel(0, 0)[3],
+            0,
+            "outside the squircle is transparent"
+        );
         assert_eq!(img.get_pixel(127, 127)[3], 0);
         // The tallest bar (index 3), sampled in the gap under the lowest segment line.
         let x = (bar_x(3) + BAR_W / 2.0) * 128.0 / GRID;

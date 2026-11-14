@@ -5,6 +5,7 @@
 //! so any pixel a renderer does not paint stays transparent in the skin.
 
 use crate::font;
+use crate::theme::{crimson, ACCENT, ACCENT_DARK, ACCENT_HI};
 use image::RgbImage;
 use tiny_skia::{
     Color, GradientStop, LinearGradient, Paint, Pixmap, Point, PremultipliedColorU8, Rect,
@@ -297,6 +298,19 @@ fn dim(c: Rgb) -> Rgb {
     c.map(|v| (u32::from(v) * 86 / 100) as u8)
 }
 
+/// Cuts the four corners of a `w`×`h` rectangle at 45° by `n` px, leaving them transparent. Only
+/// the Crimson Edge style chamfers.
+pub fn chamfer(c: &mut Canvas, x: i32, y: i32, w: i32, h: i32, n: i32) {
+    for i in 0..n {
+        for j in 0..(n - i) {
+            c.set(x + i, y + j, KEY);
+            c.set(x + w - 1 - i, y + j, KEY);
+            c.set(x + i, y + h - 1 - j, KEY);
+            c.set(x + w - 1 - i, y + h - 1 - j, KEY);
+        }
+    }
+}
+
 /// A keyed button: 1 px outline, 1 px bevel and a gradient face. Pressed keys
 /// swap the bevel and darken the face (inset look).
 pub fn key(c: &mut Canvas, x: i32, y: i32, w: i32, h: i32, style: Key, pressed: bool) {
@@ -313,6 +327,9 @@ pub fn key(c: &mut Canvas, x: i32, y: i32, w: i32, h: i32, style: Key, pressed: 
         (style.top, style.bottom)
     };
     c.vgrad(x + 2, y + 2, w - 4, h - 4, top, bottom);
+    if crimson() {
+        chamfer(c, x, y, w, h, 2);
+    }
 }
 
 /// A flat steel key (outline and gradient, no bevel) for labelled buttons.
@@ -331,6 +348,9 @@ pub fn flat_key(c: &mut Canvas, x: i32, y: i32, w: i32, h: i32, pressed: bool) {
         1,
         if pressed { METAL_LO } else { STEEL_HI },
     );
+    if crimson() {
+        chamfer(c, x, y, w, h, 2);
+    }
 }
 
 /// A labelled steel button (bevelled). `led` adds a 2×2 indicator in the top-right
@@ -445,13 +465,73 @@ pub fn label(c: &mut Canvas, x: i32, y: i32, text: &str, ink: Rgb, gap: i32, bol
 
 /// A grooved title strip: vertical gradient with a highlight and shadow line.
 pub fn title_strip(c: &mut Canvas, x: i32, y: i32, w: i32, h: i32, s: &Strip) {
+    if crimson() {
+        // Dark carbon with a red rule along the bottom. Active strips are brighter at the top.
+        let active = luma(s.top) >= 150.0;
+        let (top, rule) = if active {
+            (hex(0x34343C), ACCENT)
+        } else {
+            (hex(0x22222A), ACCENT_DARK)
+        };
+        c.vgrad(x, y + 1, w, h - 2, top, hex(0x0B0B0E));
+        c.fill(x, y, w, 1, s.hi);
+        c.fill(x, y + h - 1, w, 1, rule);
+        return;
+    }
     c.vgrad(x, y + 1, w, h - 2, s.top, s.bottom);
     c.fill(x, y, w, 1, s.hi);
     c.fill(x, y + h - 1, w, 1, s.lo);
 }
 
+/// Rec. 601 luma of a colour.
+fn luma(c: Rgb) -> f32 {
+    0.299 * f32::from(c[0]) + 0.587 * f32::from(c[1]) + 0.114 * f32::from(c[2])
+}
+
+/// The popup's selected-item highlight: steel blue in Classic, red in Crimson Edge.
+pub fn hilite() -> (Rgb, Rgb) {
+    if crimson() {
+        (ACCENT, ACCENT_DARK)
+    } else {
+        (hex(0x3A5DAE), hex(0x1E3A8A))
+    }
+}
+
+/// Text drawn with an italic lean for the Crimson Edge wordmark: each row shifts right by half a
+/// pixel per row from the bottom, so the top leans forward.
+fn slanted_label(c: &mut Canvas, x: i32, y: i32, text: &str, ink: Rgb) {
+    let mut cx = x;
+    for ch in text.chars() {
+        let rows = font::glyph(ch);
+        let w = ink_width(&rows);
+        if w == 0 {
+            cx += SPACE_ADVANCE + 1;
+            continue;
+        }
+        for (ry, row) in rows.iter().enumerate() {
+            let shift = (4 - ry as i32) / 2;
+            for (col, b) in row.chars().enumerate() {
+                if b == '#' {
+                    let px = cx + col as i32 + shift;
+                    c.set(px, y + ry as i32, ink);
+                    c.set(px + 1, y + ry as i32, ink);
+                }
+            }
+        }
+        cx += w + 2;
+    }
+}
+
 /// Bold text centred in a `w`×`h` box, with a one-pixel drop shadow.
 pub fn centred_text(c: &mut Canvas, x: i32, y: i32, w: i32, h: i32, text: &str, s: &Strip) {
+    if crimson() {
+        let tw = label_width(text, 1, true) + 2;
+        let tx = x + (w - tw) / 2;
+        let ty = y + (h - 5) / 2;
+        slanted_label(c, tx + 1, ty + 1, text, s.shadow);
+        slanted_label(c, tx, ty, text, s.text);
+        return;
+    }
     let tw = label_width(text, 1, true);
     let tx = x + (w - tw) / 2;
     let ty = y + (h - 5) / 2;
@@ -462,9 +542,24 @@ pub fn centred_text(c: &mut Canvas, x: i32, y: i32, w: i32, h: i32, text: &str, 
 /// A title bar with grooved rails either side of an optional centred wordmark.
 pub fn wordmark_bar(c: &mut Canvas, x: i32, y: i32, w: i32, h: i32, s: &Strip, text: Option<&str>) {
     title_strip(c, x, y, w, h, s);
-    for (x0, x1) in [(x + 30, x + 104), (x + w - 105, x + w - 31)] {
-        c.fill(x0, y + 6, x1 - x0, 1, s.rail_dark);
-        c.fill(x0, y + 7, x1 - x0, 1, s.rail_light);
+    if crimson() {
+        // Red slashes either side of the wordmark, in place of the grooved rails.
+        for x0 in [x + 30, x + w - 105] {
+            for k in 0..8 {
+                for t in 0..7 {
+                    c.set(
+                        x0 + 4 * k + t,
+                        y + 10 - t,
+                        if k % 2 == 0 { ACCENT_HI } else { ACCENT },
+                    );
+                }
+            }
+        }
+    } else {
+        for (x0, x1) in [(x + 30, x + 104), (x + w - 105, x + w - 31)] {
+            c.fill(x0, y + 6, x1 - x0, 1, s.rail_dark);
+            c.fill(x0, y + 7, x1 - x0, 1, s.rail_light);
+        }
     }
     if let Some(text) = text {
         centred_text(c, x, y, w, h, text, s);

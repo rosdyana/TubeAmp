@@ -4,17 +4,14 @@
 //! offsets put them. The popups have normal and selected item faces with their bars.
 
 use crate::paint::{
-    centred_text, flat_key, glyph, hex, key, label, label_width, pip, recess, title_strip, Canvas,
-    Rgb, Strip, BODY_BOT, BODY_FLAT, BODY_TOP, ICON_CLOSE, ICON_DOWN, ICON_UP, INK, LCD_BG,
+    centred_text, flat_key, glyph, hex, hilite, key, label, label_width, pip, recess, title_strip,
+    Canvas, Rgb, Strip, BODY_BOT, BODY_FLAT, BODY_TOP, ICON_CLOSE, ICON_DOWN, ICON_UP, INK, LCD_BG,
     LCD_RIM, METAL_HI, METAL_LO, SILVER, SILVER_TOP, STEEL, STEEL_TEXT, TITLE_ACTIVE,
     TITLE_INACTIVE, WHITE,
 };
 
 /// Visualiser grid dot colour.
 const VIS_DOT: Rgb = hex(0x10261A);
-/// Selected popup item: a steel-blue highlight.
-const HILITE_TOP: Rgb = hex(0x3A5DAE);
-const HILITE_BOT: Rgb = hex(0x1E3A8A);
 
 /// Mini transport icons, 6 px wide, drawn on 10×10 keys: previous, play, pause, stop,
 /// next, eject.
@@ -247,6 +244,7 @@ fn menu_item(c: &mut Canvas, x: i32, y: i32, text: &str, selected: bool) {
         return;
     }
     c.frame(x, y, 22, 18, METAL_LO);
-    c.vgrad(x + 1, y + 1, 20, 16, HILITE_TOP, HILITE_BOT);
+    let (hi_top, hi_bot) = hilite();
+    c.vgrad(x + 1, y + 1, 20, 16, hi_top, hi_bot);
     label(c, x + (22 - tw) / 2, ty, text, WHITE, 1, false);
 }

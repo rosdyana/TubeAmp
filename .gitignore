@@ -2,4 +2,5 @@
 .DS_Store
 *.wsz
 !assets/default-skin.wsz
+!assets/skins/*.wsz
 /dist/

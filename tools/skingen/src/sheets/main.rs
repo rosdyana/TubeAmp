@@ -15,6 +15,13 @@ pub fn render() -> Canvas {
     // Groove between the title bar and the body.
     c.fill(1, 14, 273, 1, METAL_LO);
     c.fill(1, 15, 273, 1, METAL_HI);
+    if crate::theme::crimson() {
+        // Red rule under the title bar and a short red slash at the left edge.
+        c.fill(1, 14, 273, 1, crate::theme::ACCENT_DARK);
+        for k in 0..5 {
+            c.set(2 + k, 13 - k + 1, crate::theme::ACCENT);
+        }
+    }
 
     // One LCD panel: x 22..=101, y 22..=60. Its interior (24..=99 × 24..=58) holds the
     // play indicator (26,28), the time digits (48..=99 × 26..=38) and the visualiser

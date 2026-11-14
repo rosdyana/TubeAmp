@@ -14,6 +14,7 @@ mod icon;
 mod paint;
 mod sheets;
 mod text_files;
+mod theme;
 
 use image::{DynamicImage, ImageFormat};
 use std::error::Error;
@@ -21,12 +22,23 @@ use std::fs;
 use std::io::{Cursor, Write};
 use std::path::PathBuf;
 
-const USAGE: &str = "usage: tubeamp-skingen <output-dir>
+const USAGE: &str = "usage: tubeamp-skingen [--theme classic|crimson-edge] <output-dir>
        tubeamp-skingen icon <output-dir>   (writes TubeAmp.iconset/ and TubeAmp.icns)";
 
 fn main() -> Result<(), Box<dyn Error>> {
     let mut args = std::env::args_os().skip(1);
-    let first = args.next().ok_or(USAGE)?;
+    let mut first = args.next().ok_or(USAGE)?;
+    let mut style = theme::Style::Classic;
+    if first == "--theme" {
+        let name = args.next().ok_or(USAGE)?;
+        style = match name.to_str() {
+            Some("classic") => theme::Style::Classic,
+            Some("crimson-edge") => theme::Style::CrimsonEdge,
+            _ => return Err(format!("unknown theme {name:?}: use classic or crimson-edge").into()),
+        };
+        first = args.next().ok_or(USAGE)?;
+    }
+    theme::set_style(style);
     if first == "icon" {
         let out_dir = args.next().map(PathBuf::from).ok_or(USAGE)?;
         for path in icon::write(&out_dir)? {
@@ -37,7 +49,10 @@ fn main() -> Result<(), Box<dyn Error>> {
     let out_dir = PathBuf::from(first);
 
     let mut files: Vec<(String, Vec<u8>)> = Vec::new();
-    for (name, img) in sheets::render_all() {
+    for (name, mut img) in sheets::render_all() {
+        if theme::crimson() {
+            theme::recolour(&mut img);
+        }
         let mut bytes = Vec::new();
         DynamicImage::ImageRgb8(img).write_to(&mut Cursor::new(&mut bytes), ImageFormat::Bmp)?;
         files.push((format!("{name}.BMP"), bytes));
@@ -51,8 +66,16 @@ fn main() -> Result<(), Box<dyn Error>> {
         fs::write(out_dir.join(name), data)?;
     }
 
-    let dir = out_dir.to_string_lossy();
-    let wsz = PathBuf::from(format!("{}.wsz", dir.trim_end_matches('/')));
+    let wsz = match style {
+        theme::Style::Classic => {
+            let dir = out_dir.to_string_lossy();
+            PathBuf::from(format!("{}.wsz", dir.trim_end_matches('/')))
+        }
+        theme::Style::CrimsonEdge => out_dir
+            .parent()
+            .unwrap_or(std::path::Path::new("."))
+            .join("Crimson Edge.wsz"),
+    };
     fs::write(&wsz, zip_files(&files)?)?;
 
     println!(

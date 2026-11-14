@@ -15,6 +15,7 @@ mod posbar;
 mod shufrep;
 mod text;
 mod titlebar;
+mod video;
 mod volume;
 
 use image::RgbImage;
@@ -40,5 +41,6 @@ pub fn render_all() -> Vec<(&'static str, RgbImage)> {
         ("EQ_EX", eq_ex::render().into_rgb()),
         ("GEN", gen::render().into_rgb()),
         ("GENEX", genex::render().into_rgb()),
+        ("VIDEO", video::render().into_rgb()),
     ]
 }

@@ -3,4 +3,3 @@
 *.wsz
 !assets/default-skin.wsz
 /dist/
-docs/

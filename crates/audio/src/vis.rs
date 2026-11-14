@@ -360,3 +360,38 @@ mod tests {
         assert_eq!(js_round(-2.6), -3.0);
     }
 }
+
+#[cfg(test)]
+mod level_tests {
+    use super::*;
+
+    /// A sine at `dbfs` (relative to full scale) at 1 kHz, one analysis window long.
+    fn sine_dbfs(dbfs: f32) -> Vec<f32> {
+        let amp = 10f32.powf(dbfs / 20.0);
+        (0..WINDOW)
+            .map(|i| amp * (2.0 * std::f32::consts::PI * 1000.0 * i as f32 / 48_000.0).sin())
+            .collect()
+    }
+
+    #[test]
+    fn a_minus_20_dbfs_sine_fills_most_of_the_column() {
+        let mut vis = Vis::new();
+        let frame = vis.update(&sine_dbfs(-20.0)).clone();
+        let tallest = frame.bars.iter().map(|b| b.height).max().unwrap();
+        assert!(tallest >= 12, "a -20 dBFS tone reached only row {tallest} of {MAX_HEIGHT}");
+    }
+
+    #[test]
+    fn the_falloff_takes_about_a_third_of_a_second_at_sixty_steps_a_second() {
+        // Webamp's "moderate" falloff at 60 Hz: 12/16 of a row per step, so a full column
+        // (15 rows) empties in 20 steps.
+        let mut vis = Vis::new();
+        vis.update(&sine_dbfs(0.0));
+        let mut steps = 0;
+        while vis.frame().bars[20].height > 0 && steps < 200 {
+            vis.update(&[0.0; WINDOW]);
+            steps += 1;
+        }
+        assert!((18..=22).contains(&steps), "emptied in {steps} steps");
+    }
+}

@@ -1316,7 +1316,7 @@ mod tests {
     fn fit_text_adds_an_ellipsis_and_keeps_short_text() {
         assert_eq!(fit_text("abc", 1000.0), "abc");
         let cut = fit_text("A very long track title indeed", 60.0);
-        assert!(cut.ends_with("..."), "{cut}");
+        assert!(cut.ends_with(crate::font::ELLIPSIS), "{cut}");
         assert!(text_width(&cut) <= 60.0);
         assert_eq!(fit_text("abcdef", 0.0), "");
     }

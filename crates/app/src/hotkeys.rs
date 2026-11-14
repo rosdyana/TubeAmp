@@ -131,6 +131,28 @@ pub fn stroke_from_page(
     })
 }
 
+/// The shortcut for a key the page forwarded, or `None` when the key runs nothing.
+///
+/// A page key only counts while the window that forwarded it is shown (`source_shown`): a page
+/// can only have the keyboard while its window is up, so a key that arrives after the window was
+/// hidden is stale, and it must not start or stop playback. `repeat` is `KeyboardEvent.repeat`, so
+/// an auto-repeating key does what the same key does natively.
+pub fn page_shortcut(
+    key: &str,
+    code: &str,
+    ctrl: bool,
+    alt: bool,
+    meta: bool,
+    repeat: bool,
+    source_shown: bool,
+) -> Option<Shortcut> {
+    if !source_shown {
+        return None;
+    }
+    let stroke = stroke_from_page(key, code, ctrl, alt, meta)?;
+    shortcut_for(&stroke, repeat)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -345,6 +367,37 @@ mod tests {
             None
         );
         assert_eq!(stroke_from_page("", "", false, false, false), None);
+    }
+
+    #[test]
+    fn a_page_key_runs_its_shortcut_only_while_the_video_window_is_shown() {
+        assert_eq!(
+            page_shortcut("x", "KeyX", false, false, false, false, true),
+            Some(Shortcut::Play)
+        );
+        assert_eq!(
+            page_shortcut("x", "KeyX", false, false, false, false, false),
+            None,
+            "a key from a hidden video window is stale"
+        );
+        assert_eq!(
+            page_shortcut("ArrowLeft", "ArrowLeft", false, false, false, false, false),
+            None
+        );
+    }
+
+    #[test]
+    fn a_repeated_page_key_does_not_repeat_a_press_only_shortcut() {
+        assert_eq!(
+            page_shortcut("x", "KeyX", false, false, false, true, true),
+            None,
+            "holding x must not fire Play again and again"
+        );
+        assert_eq!(
+            page_shortcut("ArrowRight", "ArrowRight", false, false, false, true, true),
+            Some(Shortcut::SeekForward),
+            "held arrows keep seeking, as they do natively"
+        );
     }
 
     #[test]

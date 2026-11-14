@@ -73,6 +73,10 @@ const MARQUEE_STEP_PX: u32 = 5;
 const MARQUEE_INTERVAL: Duration = Duration::from_millis(220);
 /// Redraw interval while playing or dragging (about 30 fps).
 const FRAME_ACTIVE: Duration = Duration::from_millis(33);
+/// Analyser step interval while playing: 60 Hz, like Webamp's `requestAnimationFrame` loop. The
+/// bar falloff is a fixed amount per step, so stepping at the redraw rate would make the bars fall
+/// at half the wall-clock speed of Webamp's.
+const VIS_STEP: Duration = Duration::from_millis(16);
 /// Redraw interval otherwise (about 4 fps).
 const FRAME_IDLE: Duration = Duration::from_millis(250);
 /// How often to retry the audio tap while playing.
@@ -92,6 +96,14 @@ const BROWSER_MIN: (u32, u32) = (800, 600);
 const DOUBLE_CLICK: Duration = Duration::from_millis(500);
 /// Rows scrolled per wheel notch, as Winamp does.
 const WHEEL_ROWS: isize = 3;
+
+/// The modifier keys of a key the page forwarded.
+#[derive(Debug, Clone, Copy)]
+struct PageMods {
+    ctrl: bool,
+    alt: bool,
+    meta: bool,
+}
 
 /// Settings from the command line and environment.
 #[derive(Debug, Clone)]
@@ -327,6 +339,7 @@ struct App {
     quit_at: Option<Instant>,
     next_marquee: Instant,
     next_frame: Instant,
+    next_vis: Instant,
     /// The saved settings, skin, media controls and tray (see `window/session.rs`).
     session: session::Session,
 }
@@ -426,6 +439,7 @@ pub fn run(skin: Skin, opts: Options) -> Result<(), winit::error::EventLoopError
         quit_at,
         next_marquee: started + MARQUEE_INTERVAL,
         next_frame: started,
+        next_vis: started,
         session,
     };
     let result = event_loop.run_app(&mut app);
@@ -1073,11 +1087,23 @@ impl App {
     /// A key the YouTube Music page forwarded (video view). The same shortcut as a native press.
     /// When TubeAmp used the key, its main window takes the keyboard, so the page does not keep
     /// it: the next keys come to TubeAmp's own windows.
-    fn on_page_key(&mut self, key: &str, code: &str, ctrl: bool, alt: bool, meta: bool) {
-        let Some(stroke) = hotkeys::stroke_from_page(key, code, ctrl, alt, meta) else {
-            return;
-        };
-        let Some(shortcut) = hotkeys::shortcut_for(&stroke, false) else {
+    fn on_page_key(
+        &mut self,
+        key: &str,
+        code: &str,
+        mods: PageMods,
+        repeat: bool,
+        source_shown: bool,
+    ) {
+        let Some(shortcut) = hotkeys::page_shortcut(
+            key,
+            code,
+            mods.ctrl,
+            mods.alt,
+            mods.meta,
+            repeat,
+            source_shown,
+        ) else {
             return;
         };
         if self.run_shortcut(shortcut) {
@@ -2398,7 +2424,16 @@ impl App {
                 ctrl,
                 alt,
                 meta,
-            } => self.on_page_key(&key, &code, ctrl, alt, meta),
+            } => {
+                // The Milkdrop page has no repeat flag, so its keys count as presses.
+                let shown = self.milkdrop.visible();
+                let mods = PageMods {
+                    ctrl,
+                    alt,
+                    meta,
+                };
+                self.on_page_key(&key, &code, mods, false, shown);
+            }
             other => self.milkdrop.on_msg(other),
         }
     }
@@ -2694,8 +2729,19 @@ impl App {
                 ctrl,
                 alt,
                 meta,
+                repeat,
                 ..
-            } => self.on_page_key(key, code, *ctrl, *alt, *meta),
+            } => self.on_page_key(
+                key,
+                code,
+                PageMods {
+                    ctrl: *ctrl,
+                    alt: *alt,
+                    meta: *meta,
+                },
+                *repeat,
+                self.video_visible,
+            ),
             // Escape reaches us from the page when the webview has focus. It leaves fullscreen.
             Evt::Escape => {
                 if self.video_fullscreen {
@@ -3055,6 +3101,9 @@ impl App {
 
     fn next_wake(&self, playing: bool) -> Instant {
         let mut wake = self.next_frame.min(self.next_marquee);
+        if playing {
+            wake = wake.min(self.next_vis);
+        }
         if playing && self.audio.is_none() && !self.audio_given_up {
             wake = wake.min(self.audio_retry_at);
         }
@@ -3094,10 +3143,12 @@ impl App {
         }
         self.milkdrop.tick(now, self.audio.as_ref());
 
+        if playing && now >= self.next_vis {
+            self.step_vis();
+            self.next_vis = now + VIS_STEP;
+        }
+
         if now >= self.next_frame {
-            if playing {
-                self.step_vis();
-            }
             self.refresh_display(now);
             self.request_redraw();
             let active = playing || self.drag.is_some() || self.eq_drag.is_some();

@@ -89,6 +89,9 @@ pub struct Session {
     hidden: bool,
     /// Whether the first-run question is due (no config yet).
     first_run: bool,
+    /// Until when the tray's playback items are ignored. Set when the first-run dialog closes: the
+    /// dialog is modal, so events it leaves behind must not start or stop playback.
+    tray_quiet_until: Option<Instant>,
     media: Option<NowPlaying>,
     tray: Option<Tray>,
 }
@@ -127,11 +130,15 @@ impl Session {
             downloading: false,
             hidden: false,
             first_run,
+            tray_quiet_until: None,
             media: None,
             tray: None,
         }
     }
 }
+
+/// How long the tray's playback items ignore clicks after the first-run dialog closes.
+const TRAY_QUIET_AFTER_DIALOG: Duration = Duration::from_secs(1);
 
 /// The resize steps as the config stores them.
 fn steps_array((sx, sy): (u32, u32)) -> [u32; 2] {
@@ -541,6 +548,14 @@ impl App {
     /// A menu item of the skin browser, the O menu's additions or the tray. Returns whether the id
     /// was one of ours.
     pub(super) fn on_session_menu(&mut self, el: &ActiveEventLoop, id: &str) -> bool {
+        let playback_item = matches!(
+            id,
+            tray::ID_PLAY_PAUSE | tray::ID_NEXT | tray::ID_PREVIOUS | tray::ID_STOP
+        );
+        if playback_item && self.tray_is_quiet(Instant::now()) {
+            self.log(format!("tray: ignored {id} right after the first-run dialog"));
+            return true;
+        }
         if let Some(choice) = Choice::from_menu_id(id) {
             self.apply_choice(choice);
         } else {
@@ -571,6 +586,11 @@ impl App {
         }
         self.request_redraw();
         true
+    }
+
+    /// Whether the tray's playback items are ignored at `now` (see `tray_quiet_until`).
+    fn tray_is_quiet(&self, now: Instant) -> bool {
+        self.session.tray_quiet_until.is_some_and(|until| now < until)
     }
 
     /// Hides every window, or shows them again: the ones that were open come back open. The
@@ -715,7 +735,9 @@ impl App {
 
     /// The first-run question, asked once. Yes starts the download.
     pub(super) fn first_run_prompt(&mut self) {
-        match firstrun::ask() {
+        let answer = firstrun::ask();
+        self.session.tray_quiet_until = Some(Instant::now() + TRAY_QUIET_AFTER_DIALOG);
+        match answer {
             firstrun::Answer::Yes => {
                 self.remember_first_run_answer();
                 self.get_classic_skin();

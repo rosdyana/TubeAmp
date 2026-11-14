@@ -93,6 +93,10 @@ pub enum Evt {
         shift: bool,
         #[serde(default)]
         meta: bool,
+        /// The key is auto-repeating (`KeyboardEvent.repeat`). Repeats never run a press-only
+        /// shortcut (play, pause, stop, the letters), as they do not for native keys.
+        #[serde(default)]
+        repeat: bool,
     },
     /// Something failed in the page. `at` names the place, `msg` is the message.
     Error {
@@ -333,6 +337,7 @@ mod tests {
             alt: false,
             shift: false,
             meta: false,
+            repeat: false,
         });
         round_trip_evt(Evt::Key {
             key: "√".to_string(),
@@ -341,6 +346,7 @@ mod tests {
             alt: true,
             shift: true,
             meta: true,
+            repeat: true,
         });
     }
 
@@ -358,9 +364,10 @@ mod tests {
                 alt: false,
                 shift: true,
                 meta: false,
+                repeat: false,
             }
         );
-        // The modifier flags default to false when the page leaves them out.
+        // The modifier flags and the repeat flag default to false when the page leaves them out.
         assert_eq!(
             serde_json::from_str::<Evt>(r#"{"t":"key","key":"x","code":"KeyX"}"#).unwrap(),
             Evt::Key {
@@ -370,6 +377,22 @@ mod tests {
                 alt: false,
                 shift: false,
                 meta: false,
+                repeat: false,
+            }
+        );
+        assert_eq!(
+            serde_json::from_str::<Evt>(
+                r#"{"t":"key","key":"x","code":"KeyX","repeat":true}"#
+            )
+            .unwrap(),
+            Evt::Key {
+                key: "x".to_string(),
+                code: "KeyX".to_string(),
+                ctrl: false,
+                alt: false,
+                shift: false,
+                meta: false,
+                repeat: true,
             }
         );
         assert!(serde_json::from_str::<Evt>(r#"{"t":"key","key":"x"}"#).is_err());

@@ -21,6 +21,7 @@ mod demo;
 mod eq;
 mod firstrun;
 mod hotkeys;
+mod instance;
 mod layout;
 mod library;
 mod milkdrop;
@@ -549,6 +550,21 @@ fn run() -> Result<(), Box<dyn Error>> {
     let setup = config::Setup {
         enabled: !args.no_config && dir.is_some(),
         dir: dir.unwrap_or_default(),
+    };
+    // One copy per config folder (see instance.rs). The lock lives until `run` returns.
+    let _instance = if setup.enabled {
+        match instance::acquire(&setup.dir)? {
+            instance::Acquired::Held(lock) => Some(lock),
+            instance::Acquired::Taken => {
+                eprintln!(
+                    "tubeamp: TubeAmp is already running with the config folder {}; not starting a second copy",
+                    setup.dir.display()
+                );
+                return Ok(());
+            }
+        }
+    } else {
+        None
     };
     let loaded = config::load(&setup);
     // `--skin` wins over the saved skin. A saved skin that fails to load gives the built-in one.

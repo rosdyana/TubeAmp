@@ -299,6 +299,7 @@ html.tubeamp-video video { object-fit: contain !important; }
         alt: !!e.altKey,
         shift: !!e.shiftKey,
         meta: !!e.metaKey,
+        repeat: !!e.repeat,
       });
       if (handled) e.preventDefault();
     },

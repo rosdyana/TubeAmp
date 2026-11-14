@@ -9,15 +9,15 @@
 //! playlist uses a TrueType font, not TEXT.BMP. Labels on the bottom buttons and the running time
 //! use TEXT.BMP like Winamp does.
 //!
-//! Where a skin draws nothing into a bottom button (the TubeAmp default skin's corner panels are
-//! plain), the button gets a text label or a small pixel icon instead, so it can still be found and
-//! clicked. Skins that do draw their own buttons keep them.
+//! Like Winamp, the renderer only blits skin sprites. The bottom buttons, the mini transport and
+//! the time wells are drawn by the skin's PLEDIT corner art (see the bottom corners in
+//! [`render_playlist`]); a skin that leaves them out shows them missing, as Winamp does.
 
 use std::sync::OnceLock;
 
 use fontdue::{Font, FontSettings};
 use tubeamp_playlist::Playlist;
-use tubeamp_skin::{Sheet, Skin, SpriteView};
+use tubeamp_skin::{Sheet, Skin};
 
 use crate::canvas::{Canvas, Rect};
 use crate::labels::time_truncated;
@@ -59,10 +59,9 @@ const HANDLE_H: i32 = 18;
 const MENU_H: i32 = 18;
 /// Width of a bottom menu button and of a popup item.
 const MENU_W: i32 = 22;
-/// Pixel size of the track font (Winamp's playlist uses 9 px).
-const FONT_PX: f32 = 9.0;
-/// Coverage at or above this draws a pixel of the glyph: crisp, bitmap-like text.
-const GLYPH_THRESHOLD: u8 = 100;
+/// Pixel size of the track font. 10 px keeps Liberation Sans's strokes (the t crossbar, the
+/// n in Lanterns) at 9 px-ish x-heights while still fitting the 13 px row pitch; 9 px dropped them.
+const FONT_PX: f32 = 10.0;
 /// Liberation Sans Regular, SIL Open Font License (see `assets/fonts/`).
 const FONT_BYTES: &[u8] = include_bytes!("../assets/fonts/LiberationSans-Regular.ttf");
 
@@ -144,17 +143,6 @@ impl PlMenu {
             PlMenu::Select => "PLAYLIST_SELECT_MENU_BAR",
             PlMenu::Misc => "PLAYLIST_MISC_MENU_BAR",
             PlMenu::List => "PLAYLIST_LIST_BAR",
-        }
-    }
-
-    /// Label for the fallback face.
-    fn label(self) -> &'static str {
-        match self {
-            PlMenu::Add => "ADD",
-            PlMenu::Remove => "REM",
-            PlMenu::Select => "SEL",
-            PlMenu::Misc => "MISC",
-            PlMenu::List => "LIST",
         }
     }
 }
@@ -553,7 +541,9 @@ fn fit_text(text: &str, max_w: f32) -> String {
     String::new()
 }
 
-/// Draws `text` with its baseline at `baseline`, starting at `x`, clipped to `clip`.
+/// Draws `text` with its baseline at `baseline`, starting at `x`, clipped to `clip`. Each glyph's
+/// coverage is blended over the pixels already on the canvas (the row background), so strokes keep
+/// their anti-aliased edges.
 fn draw_track_text(canvas: &mut Canvas, text: &str, x: i32, baseline: i32, color: u32, clip: Rect) {
     let mut pen = x as f32;
     for c in text.chars() {
@@ -562,7 +552,8 @@ fn draw_track_text(canvas: &mut Canvas, text: &str, x: i32, baseline: i32, color
         let gy = baseline - g.ymin - g.h as i32;
         for row in 0..g.h {
             for col in 0..g.w {
-                if g.coverage[row * g.w + col] < GLYPH_THRESHOLD {
+                let a = g.coverage[row * g.w + col];
+                if a == 0 {
                     continue;
                 }
                 let px = gx + col as i32;
@@ -573,12 +564,24 @@ fn draw_track_text(canvas: &mut Canvas, text: &str, x: i32, baseline: i32, color
                     && (px as u32) < canvas.w
                     && (py as u32) < canvas.h
                 {
-                    canvas.px[(py as u32 * canvas.w + px as u32) as usize] = color;
+                    let i = (py as u32 * canvas.w + px as u32) as usize;
+                    canvas.px[i] = blend(canvas.px[i], color, a);
                 }
             }
         }
         pen += g.advance;
     }
+}
+
+/// `fg` over `bg` with coverage `a` (0..=255), channel by channel; the result is opaque.
+fn blend(bg: u32, fg: u32, a: u8) -> u32 {
+    let a = u32::from(a);
+    let mix = |shift: u32| {
+        let b = (bg >> shift) & 0xFF;
+        let f = (fg >> shift) & 0xFF;
+        (f * a + b * (255 - a) + 127) / 255
+    };
+    0xFF00_0000 | (mix(16) << 16) | (mix(8) << 8) | mix(0)
 }
 
 // Drawing.
@@ -812,7 +815,7 @@ fn draw_scrollbar(
 }
 
 /// The bottom bar: the corners and tiles, the visualiser panel when the window is wide enough,
-/// the bottom buttons (or their fallback faces), the running time, the mini transport and mini
+/// the bottom buttons (drawn by the corner art), the running time, the mini transport and mini
 /// time.
 fn draw_bottom_bar(
     skin: &Skin,
@@ -844,12 +847,6 @@ fn draw_bottom_bar(
         );
     }
 
-    for menu in PlMenu::ALL {
-        if st.open_menu != Some(menu) {
-            draw_menu_face(skin, l, menu, canvas);
-        }
-    }
-
     let (rx, ry) = l.running_time();
     let total = pl.total_secs();
     let selected = pl.selected_secs();
@@ -867,85 +864,12 @@ fn draw_bottom_bar(
         Rect::new(rx, ry, BOTTOM_RIGHT_W - 14, 6),
     );
 
-    for t in PlTransport::ALL {
-        draw_transport_face(skin, l, t, canvas);
-    }
-
     let mini = l.mini_time();
     if let Some(secs) = st.mini_time_secs {
         let sign = if st.mini_remaining { "-" } else { "" };
         let text = format!("{sign}{}", time_truncated(secs));
         draw_text(canvas, skin, &text, mini.x, mini.y, mini);
     }
-}
-
-/// Brightest luma (0..=255) that still counts as an empty panel. The TubeAmp default skin's
-/// panels are about 45; the button faces and labels in classic skins are 150 and up.
-const BLANK_MAX_LUMA: f32 = 96.0;
-
-/// Whether the `rel` rectangle of a PLEDIT sprite has nothing light in it, so the skin draws no
-/// button there and the fallback should. Out-of-sprite rectangles are not blank.
-fn is_blank(view: &SpriteView<'_>, rel: Rect) -> bool {
-    if rel.x < 0 || rel.y < 0 || rel.x + rel.w > view.w as i32 || rel.y + rel.h > view.h as i32 {
-        return false;
-    }
-    (0..rel.h).all(|dy| {
-        (0..rel.w).all(|dx| {
-            let px = view.pixel((rel.x + dx) as u32, (rel.y + dy) as u32);
-            luma(px) < BLANK_MAX_LUMA
-        })
-    })
-}
-
-/// Rec. 601 luma of a `0xAARRGGBB` pixel.
-fn luma(px: u32) -> f32 {
-    let channel = |shift: u32| ((px >> shift) & 0xFF) as f32;
-    0.299 * channel(16) + 0.587 * channel(8) + 0.114 * channel(0)
-}
-
-/// A closed bottom button: the skin's own art if it has any, otherwise a bordered face with its
-/// label in the TEXT font.
-fn draw_menu_face(skin: &Skin, l: Layout, menu: PlMenu, canvas: &mut Canvas) {
-    let button = l.menu(menu);
-    let (corner, corner_x) = if menu == PlMenu::List {
-        ("PLAYLIST_BOTTOM_RIGHT_CORNER", l.right_corner_x())
-    } else {
-        ("PLAYLIST_BOTTOM_LEFT_CORNER", 0)
-    };
-    let Some(view) = skin.sprite(Sheet::Pledit, corner) else {
-        return;
-    };
-    // The button's offset inside the corner panel that the skin would draw it on.
-    let rel = Rect::new(button.x - corner_x, button.y - l.bottom_y(), MENU_W, MENU_H);
-    if !is_blank(&view, rel) {
-        return;
-    }
-    let edge = dim(skin.pledit.normal, 0.5);
-    draw_outline(canvas, button, edge);
-    draw_text(
-        canvas,
-        skin,
-        menu.label(),
-        button.x + 1,
-        button.y + 6,
-        button,
-    );
-}
-
-/// A mini transport button: the skin's art if it has any, otherwise a small pixel icon.
-fn draw_transport_face(skin: &Skin, l: Layout, t: PlTransport, canvas: &mut Canvas) {
-    let rect = l.transport(t);
-    let Some(view) = skin.sprite(Sheet::Pledit, "PLAYLIST_BOTTOM_RIGHT_CORNER") else {
-        return;
-    };
-    let index = PlTransport::ALL.iter().position(|&x| x == t).unwrap_or(0) as i32;
-    let rel = Rect::new(3 + 10 * index, 22, 10, 10);
-    if !is_blank(&view, rel) {
-        return;
-    }
-    let color = skin.pledit.normal;
-    draw_outline(canvas, rect, dim(color, 0.5));
-    draw_icon(canvas, rect, t, color);
 }
 
 /// A popup: the bar on the left, then the items from the top (the hovered one in its selected
@@ -961,61 +885,6 @@ fn draw_popup(skin: &Skin, l: Layout, menu: PlMenu, hover: Option<PlHit>, canvas
             normal
         };
         blit_pledit(skin, canvas, name, rect.x, rect.y);
-    }
-}
-
-/// Outlines `rect` with one pixel of `color`.
-fn draw_outline(canvas: &mut Canvas, rect: Rect, color: u32) {
-    canvas.fill(Rect::new(rect.x, rect.y, rect.w, 1), color);
-    canvas.fill(Rect::new(rect.x, rect.y + rect.h - 1, rect.w, 1), color);
-    canvas.fill(Rect::new(rect.x, rect.y, 1, rect.h), color);
-    canvas.fill(Rect::new(rect.x + rect.w - 1, rect.y, 1, rect.h), color);
-}
-
-/// `color` scaled towards black by `factor` (RGB only; the alpha is opaque).
-fn dim(color: u32, factor: f32) -> u32 {
-    let channel = |shift: u32| ((((color >> shift) & 0xFF) as f32) * factor) as u32;
-    0xFF00_0000 | (channel(16) << 16) | (channel(8) << 8) | channel(0)
-}
-
-/// A 10×10 transport icon drawn in `color` inside `rect`.
-fn draw_icon(canvas: &mut Canvas, rect: Rect, t: PlTransport, color: u32) {
-    let fill = |canvas: &mut Canvas, x: i32, y: i32, w: i32, h: i32| {
-        canvas.fill(Rect::new(rect.x + x, rect.y + y, w, h), color);
-    };
-    // Right-pointing triangle with its flat side at column `x0`: column c spans rows c..=7-c.
-    let play = |canvas: &mut Canvas, x0: i32| {
-        for c in 0..4 {
-            fill(canvas, x0 + c, 1 + c, 1, 8 - 2 * c);
-        }
-    };
-    // Left-pointing triangle with its flat side at column `x1`.
-    let rewind = |canvas: &mut Canvas, x1: i32| {
-        for c in 0..4 {
-            fill(canvas, x1 - c, 1 + c, 1, 8 - 2 * c);
-        }
-    };
-    match t {
-        PlTransport::Play => play(canvas, 3),
-        PlTransport::Pause => {
-            fill(canvas, 2, 1, 2, 8);
-            fill(canvas, 6, 1, 2, 8);
-        }
-        PlTransport::Stop => fill(canvas, 1, 1, 8, 8),
-        PlTransport::Previous => {
-            fill(canvas, 0, 1, 2, 8);
-            rewind(canvas, 7);
-        }
-        PlTransport::Next => {
-            play(canvas, 1);
-            fill(canvas, 7, 1, 2, 8);
-        }
-        PlTransport::Eject => {
-            for r in 0..4 {
-                fill(canvas, 4 - r, 1 + r, 2 + 2 * r, 1);
-            }
-            fill(canvas, 1, 6, 8, 2);
-        }
     }
 }
 
@@ -1244,9 +1113,13 @@ mod tests {
                 .map(|(x, yy)| px(&c, x, yy))
                 .collect::<Vec<u32>>()
         };
-        assert!(text_row(1).contains(&skin.pledit.current));
-        assert!(!text_row(0).contains(&skin.pledit.current));
-        assert!(text_row(0).contains(&skin.pledit.normal));
+        // Text is anti-aliased, so check by channel: white text has a bright red channel, the
+        // green normal text does not (its red is 0x1E), and a row shows its own text.
+        let red = |p: u32| (p >> 16) & 0xFF;
+        let green = |p: u32| (p >> 8) & 0xFF;
+        assert!(text_row(1).iter().any(|&p| red(p) > 0xA0), "current row has white text");
+        assert!(text_row(0).iter().all(|&p| red(p) < 0x60), "normal row has no white text");
+        assert!(text_row(0).iter().any(|&p| green(p) > 0xB0), "normal row has green text");
     }
 
     #[test]
@@ -1338,72 +1211,27 @@ mod tests {
     }
 
     #[test]
-    fn closed_bottom_buttons_show_skin_art_when_the_skin_has_it() {
-        // A light sheet stands in for a classic skin's button faces.
+    fn bottom_buttons_are_blitted_from_the_corner_art_only() {
+        // A flat sheet stands in for the skin: a closed button shows exactly the corner's pixels,
+        // with no border or label added by the renderer.
         let (w, h) = testkit::sheet_size(Sheet::Pledit);
-        let light = tubeamp_skin::Rgba {
-            w,
-            h,
-            px: vec![0xFFE0_E0E0; (w * h) as usize],
-        };
-        let skin =
-            Skin::load(&testkit::synthetic_zip_with(&[], &[(Sheet::Pledit, light)])).expect("skin");
+        let flat = 0xFF10_2030;
+        let skin = Skin::load(&testkit::synthetic_zip_with(
+            &[],
+            &[(Sheet::Pledit, tubeamp_skin::Rgba { w, h, px: vec![flat; (w * h) as usize] })],
+        ))
+        .expect("skin");
         let st = PlaylistWindowState {
             size_steps: (0, 4),
             ..PlaylistWindowState::default()
         };
         let c = render(&skin, &playlist(3), &st);
         let add = Layout::new((0, 4)).menu(PlMenu::Add);
-        // No fallback border: the skin's own light face shows through.
-        assert_eq!(px(&c, add.x, add.y), 0xFFE0_E0E0);
-        assert_eq!(px(&c, add.x + add.w - 1, add.y + add.h - 1), 0xFFE0_E0E0);
-    }
-
-    #[test]
-    fn flat_bottom_buttons_get_a_label_and_a_border() {
-        let (w, h) = testkit::sheet_size(Sheet::Pledit);
-        let flat = tubeamp_skin::Rgba {
-            w,
-            h,
-            px: vec![0xFF10_2030; (w * h) as usize],
-        };
-        let bytes = testkit::synthetic_zip_with(&[], &[(Sheet::Pledit, flat)]);
-        let skin = Skin::load(&bytes).expect("skin");
-        let st = PlaylistWindowState {
-            size_steps: (0, 4),
-            ..PlaylistWindowState::default()
-        };
-        let c = render(&skin, &playlist(3), &st);
-        let add = Layout::new((0, 4)).menu(PlMenu::Add);
-        let edge = dim(skin.pledit.normal, 0.5);
-        assert_eq!(px(&c, add.x, add.y), edge, "top-left border pixel");
-        assert_eq!(px(&c, add.x + add.w - 1, add.y + add.h - 1), edge);
-        let flat_colour = 0xFF10_2030;
-        let labelled = (add.x + 1..add.x + add.w - 1)
-            .flat_map(|x| (add.y + 1..add.y + add.h - 1).map(move |y| (x, y)))
-            .any(|(x, y)| px(&c, x, y) != flat_colour && px(&c, x, y) != edge);
-        assert!(labelled, "the label is drawn inside the border");
-    }
-
-    #[test]
-    fn flat_transport_buttons_get_an_icon() {
-        let (w, h) = testkit::sheet_size(Sheet::Pledit);
-        let flat = tubeamp_skin::Rgba {
-            w,
-            h,
-            px: vec![0xFF10_2030; (w * h) as usize],
-        };
-        let skin =
-            Skin::load(&testkit::synthetic_zip_with(&[], &[(Sheet::Pledit, flat)])).expect("skin");
-        let st = PlaylistWindowState {
-            size_steps: (0, 4),
-            ..PlaylistWindowState::default()
-        };
-        let c = render(&skin, &playlist(3), &st);
-        let play = Layout::new((0, 4)).transport(PlTransport::Play);
-        let drawn = (play.x..play.x + play.w)
-            .any(|x| (play.y..play.y + play.h).any(|y| px(&c, x, y) == skin.pledit.normal));
-        assert!(drawn, "the play icon is drawn");
+        for y in add.y..add.y + add.h {
+            for x in add.x..add.x + add.w {
+                assert_eq!(px(&c, x, y), flat, "no fallback pixel at ({x},{y})");
+            }
+        }
     }
 
     #[test]
@@ -1526,7 +1354,12 @@ mod tests {
         let colour = 0xFF00_FF00;
         let mut canvas = Canvas::new(60, 14);
         draw_track_text(&mut canvas, "Hi", 2, 10, colour, Rect::new(0, 0, 60, 14));
-        assert!(canvas.px.contains(&colour), "some pixels are drawn");
+        // The canvas starts opaque black; drawing changes pixels away from it.
+        let black = 0xFF00_0000;
+        let drawn = |c: &Canvas| c.px.iter().filter(|&&p| p != black).count();
+        assert!(drawn(&canvas) > 10, "some pixels are drawn");
+        // Anti-aliased edges: some pixel is a blend, neither background nor full ink.
+        assert!(canvas.px.iter().any(|&p| p != black && p != colour), "edges are blended");
         // Clipped to the first column: nothing may be drawn to its right.
         let mut clipped = Canvas::new(60, 14);
         draw_track_text(&mut clipped, "Hi", 2, 10, colour, Rect::new(0, 0, 1, 14));
@@ -1534,6 +1367,6 @@ mod tests {
             .px
             .iter()
             .enumerate()
-            .all(|(i, &p)| p != colour || i % 60 < 1));
+            .all(|(i, &p)| p == black || i % 60 < 1));
     }
 }

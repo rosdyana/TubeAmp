@@ -30,7 +30,8 @@ use tubeamp_playlist::parse_video_id;
 use tubeamp_skin::Skin;
 use tubeamp_ui::eq_window as eqw;
 use tubeamp_ui::playlist_window::{self as plw, MAX_STEPS};
-use tubeamp_ui::{render_eq, render_main, render_playlist, Canvas, MainState, HEIGHT, WIDTH};
+use tubeamp_ui::playlist_window::PlaylistWindowState;
+use tubeamp_ui::{render_eq, render_main, render_playlist, Canvas, MainState, PlMenu, HEIGHT, WIDTH};
 
 /// The built-in default skin (TubeAmp Classic), embedded at build time.
 const DEFAULT_SKIN: &[u8] = include_bytes!(concat!(
@@ -43,7 +44,7 @@ const USAGE: &str = "usage:
           [--open-eq] [--eq-preset NAME]
   tubeamp --render-main SKIN.wsz OUT.png [--zoom N]
   tubeamp --render-eq SKIN.wsz OUT.png [--zoom N] [--eq-preset NAME]
-  tubeamp --render-pl SKIN.wsz OUT.png [--zoom N] [--size-steps SX,SY]
+  tubeamp --render-pl SKIN.wsz OUT.png [--zoom N] [--size-steps SX,SY] [--open-menu add|rem|sel|misc|list]
 
   --zoom N                 integer scale of the 275x116 window (1..=8, default 1)
   --screenshot-after S F   save the live main window (2x) to F after S seconds, and the
@@ -54,6 +55,7 @@ const USAGE: &str = "usage:
   --open-pl                open the playlist editor at startup
   --add ID1,ID2,...        append YouTube videos (ids or links) to the playlist at startup
   --size-steps SX,SY       playlist size in resize steps (width 275+25*SX, height 116+29*SY)
+  --open-menu NAME         with --render-pl: open the add, rem, sel, misc or list popup
 
 environment:
   TUBEAMP_AUTOLOAD=ID      load YouTube video ID six seconds after start
@@ -69,6 +71,7 @@ struct Args {
     render_eq: Option<(PathBuf, PathBuf)>,
     render_pl: Option<(PathBuf, PathBuf)>,
     size_steps: Option<(u32, u32)>,
+    open_menu: Option<PlMenu>,
     zoom: Option<u32>,
     screenshot: Option<(Duration, PathBuf)>,
     quit_after: Option<Duration>,
@@ -96,6 +99,18 @@ fn next_seconds(args: &mut impl Iterator<Item = String>, flag: &str) -> Result<D
         return Err(format!("{flag} needs a non-negative number, got {value}"));
     }
     Ok(Duration::from_secs_f64(secs))
+}
+
+/// Parses a popup name for `--open-menu`.
+fn parse_menu(value: &str) -> Result<PlMenu, String> {
+    match value {
+        "add" => Ok(PlMenu::Add),
+        "rem" => Ok(PlMenu::Remove),
+        "sel" => Ok(PlMenu::Select),
+        "misc" => Ok(PlMenu::Misc),
+        "list" => Ok(PlMenu::List),
+        other => Err(format!("--open-menu takes add, rem, sel, misc or list, got {other}")),
+    }
 }
 
 /// Parses `SX,SY` for `--size-steps`. Each step count is at most [`MAX_STEPS`].
@@ -152,6 +167,10 @@ fn parse_args(mut args: impl Iterator<Item = String>) -> Result<Args, String> {
             "--size-steps" => {
                 let value = args.next().ok_or("--size-steps needs SX,SY")?;
                 out.size_steps = Some(parse_steps(&value)?);
+            }
+            "--open-menu" => {
+                let value = args.next().ok_or("--open-menu needs add, rem, sel, misc or list")?;
+                out.open_menu = Some(parse_menu(&value)?);
             }
             "--open-pl" => out.open_pl = true,
             "--add" => {
@@ -246,7 +265,10 @@ fn run() -> Result<(), Box<dyn Error>> {
         let skin = Skin::load_path(&skin_path)?;
         let steps = args.size_steps.unwrap_or(plw::DEFAULT_STEPS);
         let playlist = demo::pl_demo_playlist();
-        let state = demo::pl_demo_state(steps);
+        let state = PlaylistWindowState {
+            open_menu: args.open_menu,
+            ..demo::pl_demo_state(steps)
+        };
         let (w, h) = plw::window_size(steps);
         let mut canvas = Canvas::new(w, h);
         render_playlist(&skin, &playlist, &state, &mut canvas);

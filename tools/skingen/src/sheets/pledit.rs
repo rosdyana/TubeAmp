@@ -1,14 +1,41 @@
-//! PLEDIT.BMP (280×186): the playlist window frame (title tiles, side and bottom
-//! panels, the visualiser well), list buttons, scroll handle and shade strips.
+//! PLEDIT.BMP (280×186): the playlist window art. The bottom corners carry the
+//! bottom buttons (ADD, REM, SEL, MISC, LIST), the running-time and mini-time LCD
+//! wells, the mini transport and the resize grip, painted where the window's CSS
+//! offsets put them. The popups have normal and selected item faces with their bars.
 
 use crate::paint::{
-    centred_text, flat_key, hex, key, label, label_width, pip, title_strip, Canvas, Rgb, Strip,
-    BODY_BOT, BODY_FLAT, BODY_TOP, ICON_CLOSE, ICON_DOWN, ICON_UP, INK, LCD_BG, LCD_RIM, METAL_HI,
-    METAL_LO, SILVER, STEEL_TEXT, TITLE_ACTIVE, TITLE_INACTIVE, WHITE,
+    centred_text, flat_key, glyph, hex, key, label, label_width, pip, recess, steel_button,
+    title_strip, Canvas, Rgb, Strip, BODY_BOT, BODY_FLAT, BODY_TOP, ICON_CLOSE, ICON_DOWN, ICON_UP,
+    INK, LCD_BG, LCD_RIM, METAL_HI, METAL_LO, SILVER, SILVER_TOP, STEEL, STEEL_TEXT, TITLE_ACTIVE,
+    TITLE_INACTIVE, WHITE,
 };
 
 /// Visualiser grid dot colour.
 const VIS_DOT: Rgb = hex(0x10261A);
+/// Selected popup item: a steel-blue highlight.
+const HILITE_TOP: Rgb = hex(0x3A5DAE);
+const HILITE_BOT: Rgb = hex(0x1E3A8A);
+
+/// Mini transport icons, 6 px wide, drawn on 10×10 keys: previous, play, pause, stop,
+/// next, eject.
+const PREVIOUS_ICON: [&str; 7] = ["##...#", "##..##", "##.###", "######", "##.###", "##..##", "##...#"];
+const PLAY_ICON: [&str; 7] = ["#.....", "##....", "###...", "####..", "###...", "##....", "#....."];
+const PAUSE_ICON: [&str; 7] = ["##.##.", "##.##.", "##.##.", "##.##.", "##.##.", "##.##.", "##.##."];
+const STOP_ICON: [&str; 7] = ["#####.", "#####.", "#####.", "#####.", "#####.", "#####.", "#####."];
+const NEXT_ICON: [&str; 7] = ["#...##", "##..##", "###.##", "######", "###.##", "##..##", "#...##"];
+const EJECT_ICON: [&str; 6] = ["..##..", ".####.", "######", "......", "######", "######"];
+const TRANSPORT_ICONS: [&[&str]; 6] = [
+    &PREVIOUS_ICON,
+    &PLAY_ICON,
+    &PAUSE_ICON,
+    &STOP_ICON,
+    &NEXT_ICON,
+    &EJECT_ICON,
+];
+
+/// The bottom-left and bottom-right corner panels (sheet origins (0,72) and (126,72)).
+const CORNER_LEFT: (i32, i32) = (0, 72);
+const CORNER_RIGHT: (i32, i32) = (126, 72);
 
 pub fn render() -> Canvas {
     let mut c = Canvas::new(280, 186);
@@ -27,7 +54,7 @@ pub fn render() -> Canvas {
     title_strip(&mut c, 72, 57, 25, 14, &TITLE_INACTIVE);
     title_strip(&mut c, 99, 57, 50, 14, &TITLE_INACTIVE);
 
-    // Close, collapse, expand (all pressed/selected versions).
+    // Close, collapse, expand (pressed/selected versions).
     pip(&mut c, 52, 42, &ICON_CLOSE, true, INK);
     pip(&mut c, 62, 42, &ICON_DOWN, true, INK);
     pip(&mut c, 150, 42, &ICON_UP, true, INK);
@@ -39,12 +66,10 @@ pub fn render() -> Canvas {
     // Visualiser well 75×38 at (205,0).
     visualiser(&mut c, 205, 0);
 
-    // Bottom panels: bottom tile (179,0) 25×38, bottom-left (0,72) 125×38, bottom-right (126,72) 150×38.
+    // Bottom panels: bottom tile (179,0) 25×38, then the two corners.
     bottom_panel(&mut c, 179, 0, 25, 38);
-    bottom_panel(&mut c, 0, 72, 125, 38);
-    c.fill(0, 72, 1, 38, METAL_LO);
-    bottom_panel(&mut c, 126, 72, 150, 38);
-    c.fill(275, 72, 1, 38, METAL_LO);
+    bottom_left_corner(&mut c);
+    bottom_right_corner(&mut c);
 
     // Menu separators (3 px wide).
     menu_bar(&mut c, 48, 111, 54);
@@ -53,7 +78,7 @@ pub fn render() -> Canvas {
     menu_bar(&mut c, 200, 111, 54);
     menu_bar(&mut c, 250, 111, 54);
 
-    // List buttons: normal at (x, y), selected at (x + 23, y), 22×18.
+    // Popup items, 22×18: normal at (x, y), selected at (x + 23, y).
     for (x, y, text) in [
         (0, 111, "URL"),
         (0, 130, "DIR"),
@@ -72,7 +97,8 @@ pub fn render() -> Canvas {
         (204, 130, "SAVE"),
         (204, 149, "LOAD"),
     ] {
-        list_button(&mut c, x, y, text);
+        menu_item(&mut c, x, y, text, false);
+        menu_item(&mut c, x + 23, y, text, true);
     }
     c
 }
@@ -127,6 +153,56 @@ fn bottom_panel(c: &mut Canvas, x: i32, y: i32, w: i32, h: i32) {
     c.fill(x, y + h - 1, w, 1, METAL_LO);
 }
 
+/// Bottom-left corner (125×38): the four popup buttons ADD, REM, SEL and MISC, 22×18
+/// each at 14, 43, 72 and 101 px, 8 px above the bottom edge (Webamp's `bottom: 12px`).
+fn bottom_left_corner(c: &mut Canvas) {
+    let (ox, oy) = CORNER_LEFT;
+    bottom_panel(c, ox, oy, 125, 38);
+    c.fill(ox, oy, 1, 38, METAL_LO);
+    for (x, text) in [(14, "ADD"), (43, "REM"), (72, "SEL"), (101, "MISC")] {
+        steel_button(c, (ox + x, oy + 8, 22, 18), text, false, false, false);
+    }
+}
+
+/// Bottom-right corner (150×38): the running-time well (7,10), the mini transport (3,22)
+/// as six 10×10 keys, the mini-time well (66,23), the LIST button at (106,8) and the
+/// resize grip in the bottom-right 20×20.
+fn bottom_right_corner(c: &mut Canvas) {
+    let (ox, oy) = CORNER_RIGHT;
+    bottom_panel(c, ox, oy, 150, 38);
+    c.fill(ox + 149, oy, 1, 38, METAL_LO);
+
+    steel_button(c, (ox + 106, oy + 8, 22, 18), "LIST", false, false, false);
+
+    // Running-time well: LCD interior x 7..=64, rows 10..=17 (text rows 10..=15).
+    recess(c, ox + 5, oy + 8, 62, 12);
+    // Mini-time well: LCD interior x 66..=93, rows 23..=28 (text rows 23..=28).
+    recess(c, ox + 64, oy + 21, 32, 10);
+
+    for (i, icon) in TRANSPORT_ICONS.iter().enumerate() {
+        transport_key(c, ox + 3 + 10 * i as i32, oy + 22, icon);
+    }
+    resize_grip(c, ox, oy);
+}
+
+/// A 10×10 mini-transport key with its icon centred in silver.
+fn transport_key(c: &mut Canvas, x: i32, y: i32, icon: &[&str]) {
+    key(c, x, y, 10, 10, STEEL, false);
+    let gw = icon.iter().map(|r| r.len() as i32).max().unwrap_or(0);
+    let gh = icon.len() as i32;
+    glyph(c, x + (10 - gw) / 2, y + (10 - gh) / 2, icon, SILVER_TOP);
+}
+
+/// Three diagonal grip lines in the bottom-right 20×20 of the corner.
+fn resize_grip(c: &mut Canvas, ox: i32, oy: i32) {
+    for k in 0..3 {
+        let o = 3 + 3 * k;
+        for t in 0..=o {
+            c.set(ox + 149 - t, oy + 37 - (o - t), METAL_HI);
+        }
+    }
+}
+
 /// A 3 px popup-menu separator.
 fn menu_bar(c: &mut Canvas, x: i32, y: i32, h: i32) {
     c.fill(x, y, 1, h, METAL_HI);
@@ -134,12 +210,17 @@ fn menu_bar(c: &mut Canvas, x: i32, y: i32, h: i32) {
     c.fill(x + 2, y, 1, h, METAL_LO);
 }
 
-/// A 22×18 labelled button at `(x, y)` (normal) and `(x + 23, y)` (selected).
-fn list_button(c: &mut Canvas, x: i32, y: i32, text: &str) {
+/// One 22×18 popup item. Normal items are steel buttons; the selected (hovered) item is a
+/// steel-blue highlight with white text.
+fn menu_item(c: &mut Canvas, x: i32, y: i32, text: &str, selected: bool) {
     let tw = label_width(text, 1, false);
     let ty = y + (18 - 5) / 2;
-    flat_key(c, x, y, 22, 18, false);
-    label(c, x + (22 - tw) / 2, ty, text, STEEL_TEXT, 1, false);
-    flat_key(c, x + 23, y, 22, 18, true);
-    label(c, x + 23 + (22 - tw) / 2, ty + 1, text, WHITE, 1, false);
+    if !selected {
+        flat_key(c, x, y, 22, 18, false);
+        label(c, x + (22 - tw) / 2, ty, text, STEEL_TEXT, 1, false);
+        return;
+    }
+    c.frame(x, y, 22, 18, METAL_LO);
+    c.vgrad(x + 1, y + 1, 20, 16, HILITE_TOP, HILITE_BOT);
+    label(c, x + (22 - tw) / 2, ty, text, WHITE, 1, false);
 }

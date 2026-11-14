@@ -21,7 +21,7 @@
 - **Any classic skin:** drop a `.wsz` file onto any window, or pick one from the Skins menu. Thousands are available at the [Winamp Skin Museum](https://skins.webamp.org). On first run TubeAmp can download Winamp's original 2.91 skin for you.
 - **A real equalizer (macOS):** 10 bands at Winamp's frequencies, a preamp, the 17 classic presets, and `.eqf` import/export. It processes the actual audio through a Core Audio process tap.
 - **Visualizers:** the classic spectrum analyser and oscilloscope, plus a Milkdrop window running [butterchurn](https://github.com/jberg/butterchurn).
-- **YouTube Music inside:** search, Home, your Library, Liked songs and playlists in a skinned Media Library. The playlist editor decides what plays next. The video window shows music videos, or the album art for audio-only songs.
+- **YouTube Music inside:** search, Home, your Library, Liked songs and playlists in a skinned Media Library. The playlist editor decides what plays next, and it can import whole playlists, albums and artists from a link. The video window shows music videos, or the album art for audio-only songs.
 - **Desktop integration:** media keys, a single Now Playing entry, and a menu-bar icon. It remembers your layout, EQ, playlist and skin.
 - **No API keys:** TubeAmp hosts the real music.youtube.com page in a hidden webview and drives YouTube's own player. You sign in with your own Google account (Premium works).
 
@@ -41,13 +41,27 @@ When asked, allow **System Audio Recording**. The equalizer and visualizers need
 
 ### Windows
 
-Work in progress. CI builds Windows binaries, but the Windows audio path is not finished yet.
+Work in progress. Releases include a `TubeAmp-*-windows-x64.zip`, but the Windows audio and EQ path is not finished yet.
 
 ## First steps
 
 1. Press **L** to open the video window in browser view and sign in to YouTube Music.
 2. Press **Alt+L** for the Media Library, search, and press **Enter** on a track to play it.
 3. Click **EQ** on the main window to open the equalizer, and **PL** for the playlist.
+
+### Building a playlist
+
+Use the buttons at the bottom of the playlist editor (**PL**):
+
+- **ADD ▸ URL** reads YouTube or YouTube Music links from the clipboard. You can copy several at once.
+  - A song link (`watch?v=…`, `youtu.be/…`) or a bare video id adds that song.
+  - A playlist link (`playlist?list=…`, or `watch?v=…&list=…`) adds the whole playlist. A radio mix (`list=RD…`) adds just the song.
+  - An album link (`browse/MPREb_…` or an `OLAK5uy_…` playlist) adds the album.
+  - An artist link (`/channel/UC…`) adds all of the artist's songs. `@handle` links are not supported yet.
+  - Songs appear as each page loads, up to 5,000 per link.
+- **ADD ▸ FILE** appends one or more `.txt`, `.m3u` or `.json` files. Text files hold links one per line or comma-separated (`#` lines are ignored). The format is detected automatically.
+- **LIST ▸ SAVE** writes a `.txt` file of links (one per line) when you name it `.txt`, and JSON otherwise. **LIST ▸ LOAD** reads either format and replaces the playlist. To expand playlist, album or artist links from a text file, use ADD ▸ FILE instead.
+- **REM**, **SEL** and **MISC ▸ SORT** remove, select and sort entries as in Winamp.
 
 ### Keyboard shortcuts
 
@@ -79,7 +93,7 @@ bash tools/package-macos.sh               # dist/TubeAmp.app, .dmg and .zip
 | `crates/ytm` | parsers for YouTube Music's own (InnerTube) responses |
 | `crates/audio` | macOS Core Audio process tap, spectrum analyser |
 | `crates/eq` | Winamp-accurate 10-band EQ model, presets, `.eqf` |
-| `crates/playlist` | playlist model (selection, sort, shuffle, repeat) |
+| `crates/playlist` | playlist model (selection, sort, shuffle, repeat) and YouTube link parsing |
 | `tools/skingen` | generates the original default skin and the app icon |
 
 Design notes live in [docs/PLAN.md](docs/PLAN.md), and the macOS audio findings in [docs/M0-FINDINGS.md](docs/M0-FINDINGS.md).

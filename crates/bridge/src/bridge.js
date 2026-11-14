@@ -195,7 +195,50 @@ html.tubeamp-video video {
   z-index: 2147483000 !important; background: #000 !important;
 }
 html.tubeamp-video video { object-fit: contain !important; }
+#tubeamp-art { display: none; }
+html.tubeamp-video #tubeamp-art.on {
+  display: block !important; visibility: visible !important;
+  position: fixed !important; inset: 0 !important; z-index: 2147483600 !important;
+  background-color: #000 !important; background-position: center !important;
+  background-size: contain !important; background-repeat: no-repeat !important;
+}
+html.tubeamp-video #tubeamp-art.on::before {
+  content: ""; position: absolute; inset: -40px;
+  background-image: inherit; background-position: center; background-repeat: no-repeat;
+  background-size: cover; filter: blur(28px) brightness(0.45); z-index: -1;
+}
+html.tubeamp-video #tubeamp-art.on::after {
+  content: ""; position: absolute; inset: 0;
+  background-image: inherit; background-position: center; background-repeat: no-repeat;
+  background-size: contain;
+}
 `;
+
+  // Audio-only items (YouTube Music "songs", MUSIC_VIDEO_TYPE_ATV) have no video frames, so the
+  // video view would be black. Show the track's artwork instead, larger than the reported size.
+  const bigArt = (url) => url.replace(/=w\d+-h\d+/, "=w1200-h1200");
+  const applyArt = () => {
+    const body = document.body;
+    if (!body) return;
+    let art = document.getElementById("tubeamp-art");
+    if (!art) {
+      art = document.createElement("div");
+      art.id = "tubeamp-art";
+      body.appendChild(art);
+    }
+    const video = document.querySelector("video");
+    const noFrames = !video || !video.videoWidth;
+    const url = attempt(artworkUrl);
+    const show = !!(T.viewMode && noFrames && url);
+    if (show) {
+      const css = `url("${bigArt(url).replace(/"/g, "%22")}")`;
+      if (art.dataset.src !== css) {
+        art.style.backgroundImage = css;
+        art.dataset.src = css;
+      }
+    }
+    art.classList.toggle("on", show);
+  };
 
   const parentOf = (el) => el.parentElement || (el.parentNode && el.parentNode.host) || null;
 
@@ -238,6 +281,7 @@ html.tubeamp-video video { object-fit: contain !important; }
       T.keepRoot = null;
     }
     root.classList.toggle("tubeamp-video", !!keepRoot);
+    applyArt();
   };
 
   // Escape goes to the page while the webview has focus. Rust uses it to leave fullscreen.

@@ -1,8 +1,8 @@
 //! Hand-drawn 5×6 bitmap font for the TEXT sheet and the label helpers.
 //!
 //! Each glyph is six rows of five characters (`#` = ink). Rows 0–4 hold the
-//! letter (cap height 5), row 5 is blank, and column 4 is always blank so glyphs
-//! never touch when they are placed on the fixed 5 px grid of TEXT.BMP.
+//! letter (cap height 5) and row 5 is blank. Most glyphs leave column 4 blank for spacing;
+//! M, N and W use all five columns so they stay distinct at this size.
 
 /// One glyph: six rows of five characters.
 pub type Glyph = [&'static str; 6];
@@ -113,9 +113,9 @@ const LETTERS: [Glyph; 26] = [
     // l
     ["#....", "#....", "#....", "#....", "####.", "....."],
     // m
-    ["#..#.", "####.", "#.##.", "#..#.", "#..#.", "....."],
+    ["#...#", "##.##", "#.#.#", "#...#", "#...#", "....."], // M: vertex at the top, clear of N
     // n
-    ["#..#.", "##.#.", "#.##.", "#..#.", "#..#.", "....."],
+    ["#...#", "##..#", "#.#.#", "#..##", "#...#", "....."], // N
     // o
     [".##..", "#..#.", "#..#.", "#..#.", ".##..", "....."],
     // p
@@ -133,7 +133,7 @@ const LETTERS: [Glyph; 26] = [
     // v
     ["#..#.", "#..#.", "#..#.", ".##..", ".##..", "....."],
     // w
-    ["#..#.", "#..#.", "#..#.", "####.", ".#.#.", "....."],
+    ["#...#", "#...#", "#.#.#", "##.##", "#...#", "....."], // W: vertex at the bottom
     // x
     ["#..#.", "#..#.", ".##..", "#..#.", "#..#.", "....."],
     // y
@@ -206,7 +206,6 @@ mod tests {
             let g = glyph(ch);
             for row in g {
                 assert_eq!(row.len(), 5, "glyph {ch:?} row {row:?}");
-                assert_eq!(row.as_bytes()[4], b'.', "glyph {ch:?} uses column 4");
             }
         }
     }

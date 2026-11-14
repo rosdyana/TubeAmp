@@ -29,7 +29,9 @@ const GRAPH_STOPS: [(f32, Rgb); 5] = [
 ];
 
 /// Band frequency labels, left to right.
-const BAND_LABELS: [&str; 10] = ["60", "170", "310", "600", "1K", "3K", "6K", "12K", "14K", "16K"];
+const BAND_LABELS: [&str; 10] = [
+    "60", "170", "310", "600", "1K", "3K", "6K", "12K", "14K", "16K",
+];
 
 /// Left edge of band 0 and the pitch between bands (window pixels).
 const BAND_X: i32 = 78;

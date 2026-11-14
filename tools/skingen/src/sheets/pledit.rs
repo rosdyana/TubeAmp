@@ -4,9 +4,9 @@
 //! offsets put them. The popups have normal and selected item faces with their bars.
 
 use crate::paint::{
-    centred_text, flat_key, glyph, hex, key, label, label_width, pip, recess, steel_button,
-    title_strip, Canvas, Rgb, Strip, BODY_BOT, BODY_FLAT, BODY_TOP, ICON_CLOSE, ICON_DOWN, ICON_UP,
-    INK, LCD_BG, LCD_RIM, METAL_HI, METAL_LO, SILVER, SILVER_TOP, STEEL, STEEL_TEXT, TITLE_ACTIVE,
+    centred_text, flat_key, glyph, hex, key, label, label_width, pip, recess, title_strip, Canvas,
+    Rgb, Strip, BODY_BOT, BODY_FLAT, BODY_TOP, ICON_CLOSE, ICON_DOWN, ICON_UP, INK, LCD_BG,
+    LCD_RIM, METAL_HI, METAL_LO, SILVER, SILVER_TOP, STEEL, STEEL_TEXT, TITLE_ACTIVE,
     TITLE_INACTIVE, WHITE,
 };
 
@@ -18,11 +18,21 @@ const HILITE_BOT: Rgb = hex(0x1E3A8A);
 
 /// Mini transport icons, 6 px wide, drawn on 10×10 keys: previous, play, pause, stop,
 /// next, eject.
-const PREVIOUS_ICON: [&str; 7] = ["##...#", "##..##", "##.###", "######", "##.###", "##..##", "##...#"];
-const PLAY_ICON: [&str; 7] = ["#.....", "##....", "###...", "####..", "###...", "##....", "#....."];
-const PAUSE_ICON: [&str; 7] = ["##.##.", "##.##.", "##.##.", "##.##.", "##.##.", "##.##.", "##.##."];
-const STOP_ICON: [&str; 7] = ["#####.", "#####.", "#####.", "#####.", "#####.", "#####.", "#####."];
-const NEXT_ICON: [&str; 7] = ["#...##", "##..##", "###.##", "######", "###.##", "##..##", "#...##"];
+const PREVIOUS_ICON: [&str; 7] = [
+    "##...#", "##..##", "##.###", "######", "##.###", "##..##", "##...#",
+];
+const PLAY_ICON: [&str; 7] = [
+    "#.....", "##....", "###...", "####..", "###...", "##....", "#.....",
+];
+const PAUSE_ICON: [&str; 7] = [
+    "##.##.", "##.##.", "##.##.", "##.##.", "##.##.", "##.##.", "##.##.",
+];
+const STOP_ICON: [&str; 7] = [
+    "#####.", "#####.", "#####.", "#####.", "#####.", "#####.", "#####.",
+];
+const NEXT_ICON: [&str; 7] = [
+    "#...##", "##..##", "###.##", "######", "###.##", "##..##", "#...##",
+];
 const EJECT_ICON: [&str; 6] = ["..##..", ".####.", "######", "......", "######", "######"];
 const TRANSPORT_ICONS: [&[&str]; 6] = [
     &PREVIOUS_ICON,
@@ -160,8 +170,24 @@ fn bottom_left_corner(c: &mut Canvas) {
     bottom_panel(c, ox, oy, 125, 38);
     c.fill(ox, oy, 1, 38, METAL_LO);
     for (x, text) in [(14, "ADD"), (43, "REM"), (72, "SEL"), (101, "MISC")] {
-        steel_button(c, (ox + x, oy + 8, 22, 18), text, false, false, false);
+        corner_button(c, ox + x, oy + 8, text);
     }
+}
+
+/// A bottom-bar button face (22×18): a flat steel key with its label centred. The flat face
+/// leaves 20 px inside for labels such as MISC.
+fn corner_button(c: &mut Canvas, x: i32, y: i32, text: &str) {
+    flat_key(c, x, y, 22, 18, false);
+    let tw = label_width(text, 1, false);
+    label(
+        c,
+        x + (22 - tw) / 2,
+        y + (18 - 5) / 2,
+        text,
+        STEEL_TEXT,
+        1,
+        false,
+    );
 }
 
 /// Bottom-right corner (150×38): the running-time well (7,10), the mini transport (3,22)
@@ -172,7 +198,7 @@ fn bottom_right_corner(c: &mut Canvas) {
     bottom_panel(c, ox, oy, 150, 38);
     c.fill(ox + 149, oy, 1, 38, METAL_LO);
 
-    steel_button(c, (ox + 106, oy + 8, 22, 18), "LIST", false, false, false);
+    corner_button(c, ox + 106, oy + 8, "LIST");
 
     // Running-time well: LCD interior x 7..=64, rows 10..=17 (text rows 10..=15).
     recess(c, ox + 5, oy + 8, 62, 12);

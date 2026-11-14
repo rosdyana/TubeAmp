@@ -16,8 +16,14 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Duration;
 
-use tubeamp_skin::{testkit, Skin};
+use tubeamp_skin::Skin;
 use tubeamp_ui::{render_main, Canvas, MainState, HEIGHT, WIDTH};
+
+/// The built-in default skin (TubeAmp Classic), embedded at build time.
+const DEFAULT_SKIN: &[u8] = include_bytes!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../assets/default-skin.wsz"
+));
 
 const USAGE: &str = "usage:
   tubeamp [--skin PATH.wsz] [--zoom N] [--screenshot-after SECS OUT.png] [--quit-after SECS]
@@ -136,10 +142,7 @@ fn run() -> Result<(), Box<dyn Error>> {
 
     let skin = match args.skin {
         Some(path) => Skin::load_path(&path)?,
-        None => {
-            eprintln!("tubeamp: no --skin given, using the built-in synthetic test skin");
-            testkit::synthetic_skin()
-        }
+        None => Skin::load(DEFAULT_SKIN)?,
     };
     let options = window::Options {
         zoom,

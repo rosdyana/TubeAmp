@@ -1,0 +1,11 @@
+[package]
+name = "tubeamp-skingen"
+version = "0.0.0"
+edition = "2021"
+publish = false
+description = "Generates TubeAmp Classic, an original Winamp-2.x-style default skin, from procedural code"
+
+[dependencies]
+tiny-skia = "0.11"
+image = { version = "0.25", default-features = false, features = ["bmp", "png"] }
+zip = { version = "2", default-features = false, features = ["deflate"] }

@@ -1,0 +1,45 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  macos:
+    name: macOS (test + clippy)
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Test
+        run: cargo test --workspace --exclude m0-spike
+      - name: Clippy
+        run: cargo clippy --workspace --exclude m0-spike -- -D warnings
+
+  windows:
+    name: Windows (build + test)
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build
+        run: cargo build -p tubeamp
+      - name: Test
+        run: cargo test --workspace --exclude m0-spike
+      - name: Upload debug build
+        uses: actions/upload-artifact@v4
+        with:
+          name: tubeamp-windows-debug
+          path: target/debug/tubeamp.exe

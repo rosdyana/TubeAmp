@@ -1,20 +1,18 @@
 //! Loads a real classic skin from disk. Ignored by default because the skin is
 //! a local file, not part of the repository (`*.wsz` is gitignored).
 //!
-//! Run with `cargo test -p tubeamp-skin -- --ignored`. Set `TUBEAMP_TEST_WSZ`
-//! to point at a different skin.
+//! Run with `TUBEAMP_TEST_WSZ=/path/to/base-2.91.wsz cargo test -p tubeamp-skin -- --ignored`.
 
 use std::path::PathBuf;
 use tubeamp_skin::{Sheet, Skin};
 
-const DEFAULT_SKIN: &str = "/private/tmp/claude-501/-Users-rosdyanakusuma-Ross-projects-tubeamp/08692f71-936e-4803-94a6-8f2fc1d26ee1/scratchpad/skins/base-2.91.wsz";
-
 #[test]
 #[ignore = "needs a local .wsz skin (base-2.91.wsz); run with --ignored"]
 fn loads_base_2_91_skin_when_present() {
-    let path = std::env::var_os("TUBEAMP_TEST_WSZ")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(DEFAULT_SKIN));
+    let Some(path) = std::env::var_os("TUBEAMP_TEST_WSZ").map(PathBuf::from) else {
+        eprintln!("skipping: set TUBEAMP_TEST_WSZ to a classic .wsz skin");
+        return;
+    };
     if !path.exists() {
         eprintln!("skipping: {} does not exist", path.display());
         return;

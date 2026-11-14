@@ -1,0 +1,52 @@
+# TubeAmp: a YouTube Music player with a classic Winamp 2.x skin, in Rust
+
+## Context
+TubeAmp is a desktop app that only plays YouTube Music, with the classic Winamp look and behaviour: main window, 10-band EQ, playlist editor, video window, plus a skinned Media Library for browsing. It's written in Rust and targets macOS and Windows. `projects/tubeamp` is empty right now; it becomes its own git repo.
+
+### Decisions made in discussion
+- **No Google API.** The Data API v3 is ruled out: search costs 100 quota units (~100 searches a day), it has no YouTube Music library, and its terms require the unmodified embedded player, which makes a real EQ impossible. Instead, a hidden **music.youtube.com webview** runs YouTube's own player. The user signs in there, so library, likes and Premium all work. An injected `bridge.js` reads player state and metadata, controls playback, and builds the Web Audio EQ and analyser. We never extract streams or separate audio from video.
+- **UI is native Rust**: `winit` frameless windows + `softbuffer`/`tiny-skia` pixel rendering of `.wsz` sprite sheets. `wry` is used only for the YTM webview.
+- **Platforms:** macOS + Windows.
+- **v1 scope:** main/EQ/playlist/video windows, skinned Media Library, any `.wsz` skin plus a skin browser, media keys + OS Now Playing, Milkdrop window, windowshade for all windows, tray/menu-bar icon.
+- **Legal:** the name "Winamp" and the Nullsoft base skin are never shipped. The app ships an **original default skin** and users load any classic `.wsz`.
+
+## Architecture
+```
+          ┌──────── Rust app (winit event loop, single state store) ────────┐
+  winit windows: Main · EQ · Playlist · Video · Library · Milkdrop          │
+  (softbuffer, pixel-exact sprites, region masks, snap/dock manager)        │
+          │ Commands (serde enum)               ▲ Events (now-playing, time,│
+          ▼                                     │  FFT/PCM frames, search)  │
+  wry WebView ── music.youtube.com + bridge.js (initialization script) ─────┘
+     lives as a child of the Video window; that window hides instead of closing
+```
+- **Bridge protocol:** Rust → JS goes through `evaluate_script("tubeamp.cmd({...})")`; JS → Rust goes through `window.ipc.postMessage(JSON)`. Messages are typed in Rust (`enum Cmd`, `enum Evt`) and mirrored in `bridge.js`.
+- **Playback control:** `#movie_player` API (`loadVideoById`, `playVideo/pauseVideo`, `seekTo`, `setVolume`, `getVideoData`, `getCurrentTime/getDuration`). YTM autoplay is turned off; on the `ended` event the bridge tells Rust, and **TubeAmp's playlist decides what plays next**.
+- **Audio path, macOS (decided after M0, see docs/M0-FINDINGS.md):** YTM plays at full quality. A Core Audio process tap (`CATapMutedWhenTapped`) on our WebKit GPU process feeds a private aggregate device, and its IOProc runs the Rust DSP (preamp → 10 peaking biquads → balance → limiter) and also supplies the vis FFT and Milkdrop PCM. macOS 14.2+ only.
+- **Audio graph, Windows (in page):** `createMediaElementSource(video)` → preamp Gain → 10 × BiquadFilter peaking at 60/170/310/600/1k/3k/6k/12k/14k/16k (±12 dB, as in Winamp) → StereoPanner (balance) → AnalyserNode → output. The bridge sends spectrum bytes (main-window vis) and time-domain floats (Milkdrop) at about 60 fps.
+- **Library data:** `bridge.js` calls YTM's own InnerTube endpoints from inside the signed-in page (same-origin `fetch('/youtubei/v1/search'|'browse'|'next')` using the page's `ytcfg`). Rust parses the JSON with serde into `Track/Album/Artist/Playlist` models (field paths informed by ytmusicapi/rustypipe; no code copied). No API key, no PO tokens.
+
+## Workspace layout (cargo workspace)
+- `crates/skin`: `.wsz` loader (`zip` + `image` bmp, case-insensitive names, nums_ex/numbers fallback, missing-file fallback to the default skin), sprite map (coordinates taken from Webamp's `skinSprites.ts` as reference, MIT), `viscolor.txt`, `pledit.txt`, `region.txt`, text/number bitmap fonts.
+- `crates/ui`: window manager (10px snap, docked group drag with main, double size Ctrl+D, windowshade), widgets (button, toggle, h/v slider, marquee, LCD time, scrollbar), layouts for main/eq/pledit/video/gen(library, milkdrop frames). Context menus use native `muda` menus (Winamp used native menus too).
+- `crates/bridge`: wry host (persistent data dir so login survives restarts), `bridge.js` via `include_str!`, Cmd/Evt types.
+- `crates/ytm`: InnerTube JSON parsers + models, with fixture-based tests.
+- `crates/vis`: spectrum/oscilloscope (Winamp falloff/peaks) + Milkdrop window via the `projectm` crate (libprojectM 4, dynamic link, LGPL) in a glutin/glow context, fed PCM from the bridge.
+- `app`: main loop, state store, config/persistence (`toml` in the OS config dir: window positions/docking, EQ + presets, playlist, skin), tray (`tray-icon`), media keys + Now Playing (`souvlaki`: MPNowPlayingInfo on macOS, SMTC on Windows), keyboard map (Z X C V B, J, L, Ctrl+T/D, Alt+E/G…), `.eqf` import/export.
+- `assets/default-skin/`: original TubeAmp skin. Its BMPs are generated reproducibly by a small Rust `xtask` (tiny-skia), with every classic sprite file present.
+
+## Milestones
+- **M0 spike (risks first):** (a) wry loads YTM, login persists; (b) Web Audio on YTM's MSE-fed `<video>` is audible and the EQ is clearly audible; (c) audio keeps playing while the host window is hidden on both macOS (WKWebView) and Windows (WebView2); (d) the webview embeds as a child of a winit window; (e) Now Playing conflict: WKWebView's own mediaSession entry vs souvlaki (fix by clearing mediaSession in `bridge.js` if they collide). **Stop and re-plan if (b) or (c) fails.**
+- **M1:** skin engine, main window rendered statically from any `.wsz`, pixel-diff tests.
+- **M2:** main window interactive and wired to the bridge: transport, seek, volume/balance, marquee, time toggle, bitrate/kHz field, clutterbar, spectrum vis.
+- **M3:** EQ window + audio graph, spline graph, presets, auto, `.eqf`.
+- **M4:** playlist editor (pledit colours, multi-select, sort/misc/add/remove menus) + Media Library window (search, Home, Library, Playlists, Liked; send to playlist).
+- **M5:** video window hosting the webview, docking/snap, windowshade for all windows, double size.
+- **M6:** Milkdrop window, media keys/Now Playing, tray, skin browser (folder + drag-drop `.wsz`), persistence, default skin.
+- **M7:** packaging: macOS `.app` + codesign/notarize, Windows MSI (cargo-wix) with WebView2 bootstrapper.
+
+## Verification
+- `cargo test`: skin parser against fixture `.wsz` files (sprite rects, colours, region polygons); ytm parsers against saved InnerTube JSON fixtures; snap/dock geometry unit tests; Cmd/Evt serde round-trips.
+- Pixel fidelity: render the main/EQ/playlist windows headless to PNG with a locally provided classic skin (not committed) and diff them against Webamp screenshots of the same skin.
+- Bridge integration test: wry pointed at a local fixture page that mimics `#movie_player` + `<video>` to exercise every Cmd/Evt without hitting YouTube.
+- Manual end-to-end on macOS and Windows: sign in, search → add to playlist → play, EQ audibly changes sound, the vis moves, the video window shows video, media keys work, skin swap, restart restores state.

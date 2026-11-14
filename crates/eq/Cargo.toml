@@ -1,0 +1,8 @@
+[package]
+name = "tubeamp-eq"
+version = "0.0.0"
+edition = "2021"
+publish = false
+description = "Winamp-2.x-style 10-band equalizer: slider model, presets, .eqf I/O, realtime DSP"
+
+[dependencies]

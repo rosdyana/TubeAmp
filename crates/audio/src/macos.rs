@@ -1,11 +1,13 @@
 //! macOS audio engine: Core Audio process tap (see `tap.m`) + EQ in the IOProc.
 
 use std::ffi::{c_int, c_void};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use tubeamp_eq::EqProcessor;
 
+use crate::guard;
 use crate::{AudioError, LatestSamples, PARAMS};
 
 type IoCallback = extern "C" fn(*const f32, u32, *mut f32, u32, u32, *mut c_void);
@@ -22,12 +24,27 @@ const RING_CAPACITY: usize = 1 << 15;
 /// Only one tap can exist at a time (the C side keeps global state).
 static RUNNING: AtomicBool = AtomicBool::new(false);
 
+/// `TapWatch::last_sound_ns` before the callback has heard any sound.
+const NEVER: u64 = u64::MAX;
+
+/// What the audio callback reports back to the engine, read from the main thread.
+struct TapWatch {
+    /// When the tap started. `last_sound_ns` counts from here.
+    epoch: Instant,
+    /// Nanoseconds after `epoch` of the last block with a non-zero input sample, or `NEVER`.
+    last_sound_ns: AtomicU64,
+    /// Dev hook (`TUBEAMP_FAKE_DENIED=1`): the callback treats its input as silent, so the denial
+    /// path can be tested on a machine that has the permission.
+    fake_denied: bool,
+}
+
 /// State owned by the audio callback. Allocated before the IOProc starts and freed after it stops.
 struct Callback {
     eq: EqProcessor,
     tx: rtrb::Producer<f32>,
     /// The newest samples, for `AudioEngine::copy_latest`. The engine keeps its own handle.
     latest: Arc<LatestSamples>,
+    watch: Arc<TapWatch>,
 }
 
 /// Runs on the Core Audio thread. Must not allocate or block.
@@ -54,6 +71,10 @@ extern "C" fn on_audio(
     // `frames` to both buffers), and `ic`/`oc` are the channel counts it reported.
     let input = unsafe { std::slice::from_raw_parts(inp, n * ic) };
     let output = unsafe { std::slice::from_raw_parts_mut(out, n * oc) };
+    if !cb.watch.fake_denied && !guard::is_silent(input) {
+        let ns = cb.watch.epoch.elapsed().as_nanos() as u64;
+        cb.watch.last_sound_ns.store(ns, Ordering::Relaxed);
+    }
     cb.eq.process(&PARAMS, input, ic, output, oc, n);
     for frame in output.chunks_exact(oc) {
         let left = frame[0];
@@ -78,6 +99,7 @@ pub struct AudioEngine {
     latest: Arc<LatestSamples>,
     sample_rate: u32,
     callback: *mut Callback,
+    watch: Arc<TapWatch>,
 }
 
 impl AudioEngine {
@@ -98,6 +120,15 @@ impl AudioEngine {
     /// Device sample rate in Hz, as read before the IOProc started.
     pub fn sample_rate(&self) -> u32 {
         self.sample_rate
+    }
+
+    /// When the tap last delivered a non-zero sample, or when it started if it never has. A tap
+    /// that is denied, or whose IOProc never runs, keeps this at its start. See `guard`.
+    pub fn last_sound_at(&self) -> Instant {
+        match self.watch.last_sound_ns.load(Ordering::Relaxed) {
+            NEVER => self.watch.epoch,
+            ns => self.watch.epoch + Duration::from_nanos(ns),
+        }
     }
 
     /// Replaces `out` with the mono post-EQ samples produced since the last call.
@@ -126,6 +157,15 @@ impl AudioEngine {
 fn start_inner() -> Result<AudioEngine, AudioError> {
     let verbose = c_int::from(std::env::var_os("TUBEAMP_LOG").is_some());
     let owner = c_int::try_from(std::process::id()).unwrap_or(0);
+    let fake_denied = std::env::var_os("TUBEAMP_FAKE_DENIED").is_some_and(|v| v == "1");
+    if fake_denied {
+        eprintln!("tubeamp: TUBEAMP_FAKE_DENIED=1: the tap's input is treated as silent (dev test)");
+    }
+    let watch = Arc::new(TapWatch {
+        epoch: Instant::now(),
+        last_sound_ns: AtomicU64::new(NEVER),
+        fake_denied,
+    });
 
     let mut sr = 0.0f64;
     // SAFETY: `sr` is a valid out-pointer for the duration of the call.
@@ -144,6 +184,7 @@ fn start_inner() -> Result<AudioEngine, AudioError> {
         eq: EqProcessor::new(sr as f32),
         tx,
         latest: Arc::clone(&latest),
+        watch: Arc::clone(&watch),
     }));
 
     // SAFETY: `callback` stays valid until `AudioEngine::drop` (or the failure branch below)
@@ -162,6 +203,7 @@ fn start_inner() -> Result<AudioEngine, AudioError> {
         latest,
         sample_rate,
         callback,
+        watch,
     })
 }
 

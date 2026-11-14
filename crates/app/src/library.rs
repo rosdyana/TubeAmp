@@ -670,6 +670,8 @@ pub const CMD_RADIO: &str = "lib.radio";
 pub const MAIN_LIBRARY: &str = "main.library";
 /// The O menu's Video item: shows or hides the video window.
 pub const MAIN_VIDEO: &str = "main.video";
+/// The O menu's Retry audio capture item: tries the audio tap again after a denial.
+pub const MAIN_RETRY_AUDIO: &str = "main.retry_audio";
 
 /// Maps a menu id from the library's menus to its command.
 pub fn command_for_id(id: &str) -> Option<LibCommand> {
@@ -707,6 +709,12 @@ pub fn build_main_menu() -> Result<muda::Menu, muda::Error> {
     menu.append(&MenuItem::with_id(
         crate::milkdrop::MAIN_MILKDROP,
         "Milkdrop",
+        true,
+        None,
+    ))?;
+    menu.append(&MenuItem::with_id(
+        MAIN_RETRY_AUDIO,
+        "Retry audio capture",
         true,
         None,
     ))?;

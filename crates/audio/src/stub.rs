@@ -17,6 +17,10 @@ impl AudioEngine {
         self.sample_rate
     }
 
+    pub fn last_sound_at(&self) -> std::time::Instant {
+        std::time::Instant::now()
+    }
+
     pub fn drain_samples(&mut self, out: &mut Vec<f32>) {
         out.clear();
     }

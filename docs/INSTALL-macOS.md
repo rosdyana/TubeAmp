@@ -53,8 +53,19 @@ capture system audio for that. The audio never leaves your Mac.
 2. If you missed it or clicked **Don't Allow**, open **System Settings ▸ Privacy & Security ▸ Screen &
    System Audio Recording**, turn on **TubeAmp**, then quit and reopen TubeAmp.
 
-TubeAmp mutes YouTube Music's own output while it captures the audio, so **without the permission
-YouTube Music may play silently**. Turn the permission on and restart TubeAmp to hear it.
+TubeAmp takes over YouTube Music's output while it captures the audio. If macOS refuses the permission,
+the capture is silent, so TubeAmp watches for that: when YouTube Music is playing but TubeAmp hears
+nothing for about 4 seconds, it **switches the EQ off and hands the output back to YouTube Music**, so you
+still hear the music. The marquee then reads **EQ OFF: ALLOW SYSTEM AUDIO RECORDING FOR TUBEAMP** for about
+8 seconds.
+
+To get the EQ and visualizer back after allowing the permission, use either:
+
+- the **O** menu's **Retry audio capture** item, or
+- the EQ window's **ON** switch (turning it on retries the capture).
+
+TubeAmp does not retry by itself after such a switch-off, so it will not keep interrupting playback. A
+restart also retries.
 
 ## 4. Sign in to YouTube Music
 
@@ -91,7 +102,9 @@ the config folder below, not in the app.
 
 - **"TubeAmp is damaged and can't be opened"**: this is Gatekeeper on a quarantined, ad-hoc signed
   copy. Use step 2, Option C.
-- **Equalizer and visualizer do nothing**: check the System Audio Recording permission (step 3), then
-  restart TubeAmp.
+- **EQ OFF message in the marquee**: the permission is missing or was refused. Allow it (step 3), then
+  use **Retry audio capture** from the O menu or turn the EQ ON. The music keeps playing meanwhile.
+- **Equalizer and visualizer do nothing, no message**: check the System Audio Recording permission
+  (step 3), then restart TubeAmp.
 - **Two copies of TubeAmp cannot run together**: they would share one config folder. The second copy
   quits with a message. This is intended.

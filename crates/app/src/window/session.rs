@@ -786,7 +786,7 @@ impl App {
     }
 
     /// Shows `text` in the marquee until `for_` has passed (`None`: until another message).
-    fn show_message(&mut self, text: String, for_: Option<Duration>) {
+    pub(super) fn show_message(&mut self, text: String, for_: Option<Duration>) {
         self.session.message = Some((text, for_.map(|d| Instant::now() + d)));
     }
 

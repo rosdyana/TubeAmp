@@ -10,6 +10,7 @@
 //! - [`LatestSamples`] keeps the newest mono samples for a second reader (the Milkdrop window),
 //!   fed by the same audio callback. [`AudioEngine::copy_latest`] reads it.
 
+pub mod guard;
 pub mod latest;
 pub mod vis;
 

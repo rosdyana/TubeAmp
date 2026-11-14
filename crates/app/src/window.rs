@@ -18,6 +18,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use tubeamp_audio::vis::{Vis, VisFrame};
+use tubeamp_audio::guard::{denial_suspected, DENIAL_WINDOW};
 use tubeamp_audio::{params as eq_params, AudioEngine, AudioError};
 use tubeamp_bridge::{Bridge, Cmd, Evt};
 use tubeamp_eq::model::ZERO_VALUE;
@@ -82,6 +83,10 @@ const VIS_STEP: Duration = Duration::from_millis(16);
 const FRAME_IDLE: Duration = Duration::from_millis(250);
 /// How often to retry the audio tap while playing.
 const AUDIO_RETRY: Duration = Duration::from_secs(2);
+/// The marquee message when the tap is silent while the page plays (no System Audio Recording).
+const AUDIO_OFF_NOTICE: &str = "EQ OFF: ALLOW SYSTEM AUDIO RECORDING FOR TUBEAMP";
+/// How long that message stays in the marquee.
+const AUDIO_OFF_SHOWN: Duration = Duration::from_secs(8);
 /// Delay before `TUBEAMP_AUTOLOAD` loads its video.
 const AUTOLOAD_DELAY: Duration = Duration::from_secs(6);
 /// Arrow-key seek step, in seconds (Winamp).
@@ -329,6 +334,10 @@ struct App {
     audio_given_up: bool,
     audio_error_shown: bool,
     audio_retry_at: Instant,
+    /// Set when the tap was torn down as silent: no automatic retry until the user asks.
+    audio_denied: bool,
+    /// When the page began reporting playing (`ps == 1`), or `None` while it does not.
+    playing_since: Option<Instant>,
     vis: Vis,
     vis_frame: VisFrame,
     samples: Vec<f32>,
@@ -429,6 +438,8 @@ pub fn run(skin: Skin, opts: Options) -> Result<(), winit::error::EventLoopError
         audio_given_up: false,
         audio_error_shown: false,
         audio_retry_at: started,
+        audio_denied: false,
+        playing_since: None,
         vis: Vis::new(),
         vis_frame: VisFrame::default(),
         samples: Vec::new(),
@@ -2669,11 +2680,44 @@ impl App {
         }
     }
 
-    /// ON: the bypass switch. The audio tap applies the curve only while this is on.
+    /// ON: the bypass switch. The audio tap applies the curve only while this is on. Turning it
+    /// on also asks for the audio tap again, if a silent tap was switched off.
     fn toggle_power(&mut self) {
         let on = !self.eq_state.settings.on;
         self.eq_state.settings.on = on;
         eq_params().set_on(on);
+        if on {
+            self.retry_audio_capture(Instant::now());
+        }
+        self.request_redraw();
+    }
+
+    /// The tap was silent while the page played, so it is torn down. Dropping the engine stops the
+    /// device, and YouTube Music's own output plays again (the EQ is bypassed). The marquee says
+    /// what to allow. No automatic retry follows: see `retry_audio_capture`.
+    fn audio_tap_silent(&mut self) {
+        eprintln!(
+            "tubeamp: the audio tap is silent while YouTube Music plays; tearing it down (EQ off). \
+             Allow System Audio Recording for TubeAmp, then turn the EQ on or use Retry audio capture."
+        );
+        self.audio = None;
+        self.audio_denied = true;
+        self.playing_since = None;
+        self.show_message(AUDIO_OFF_NOTICE.to_string(), Some(AUDIO_OFF_SHOWN));
+        self.request_redraw();
+    }
+
+    /// Asks for the audio tap again: from the EQ's ON switch or the O menu's Retry audio capture.
+    /// The tap starts on the next tick while the page plays. A tap that is still silent is torn
+    /// down again after the window.
+    fn retry_audio_capture(&mut self, now: Instant) {
+        if self.audio.is_some() {
+            return;
+        }
+        eprintln!("tubeamp: audio capture retry requested");
+        self.audio_denied = false;
+        self.audio_error_shown = false;
+        self.audio_retry_at = now;
         self.request_redraw();
     }
 
@@ -3171,7 +3215,7 @@ impl App {
         if playing {
             wake = wake.min(self.next_vis);
         }
-        if playing && self.audio.is_none() && !self.audio_given_up {
+        if playing && self.audio.is_none() && !self.audio_given_up && !self.audio_denied {
             wake = wake.min(self.audio_retry_at);
         }
         if let Some(t) = self.milkdrop.next_wake() {
@@ -3214,7 +3258,28 @@ impl App {
         }
 
         let playing = self.playback.status == Status::Play;
-        if playing && self.audio.is_none() && !self.audio_given_up && now >= self.audio_retry_at {
+        self.playing_since = match (self.playback.ps == Some(1), self.playing_since) {
+            (true, since) => since.or(Some(now)),
+            (false, _) => None,
+        };
+        if let Some(engine) = self.audio.as_ref() {
+            let suspect = denial_suspected(
+                now,
+                engine.last_sound_at(),
+                self.playing_since,
+                self.state.volume > 0,
+                DENIAL_WINDOW,
+            );
+            if suspect {
+                self.audio_tap_silent();
+            }
+        }
+        if playing
+            && self.audio.is_none()
+            && !self.audio_given_up
+            && !self.audio_denied
+            && now >= self.audio_retry_at
+        {
             self.try_start_audio(now);
         }
         self.milkdrop.tick(now, self.audio.as_ref());
@@ -3522,6 +3587,8 @@ impl ApplicationHandler<UserEvent> for App {
                     self.show_library();
                 } else if id == library::MAIN_VIDEO {
                     self.toggle_video();
+                } else if id == library::MAIN_RETRY_AUDIO {
+                    self.retry_audio_capture(Instant::now());
                 } else if id == milkdrop::MAIN_MILKDROP {
                     self.toggle_milkdrop();
                 } else if let Some(cmd) = milkdrop::command_for_id(&id) {

@@ -31,7 +31,7 @@ TubeAmp is a desktop app that only plays YouTube Music, with the classic Winamp 
 - `crates/ui`: window manager (10px snap, docked group drag with main, double size Ctrl+D, windowshade), widgets (button, toggle, h/v slider, marquee, LCD time, scrollbar), layouts for main/eq/pledit/video/gen(library, milkdrop frames). Context menus use native `muda` menus (Winamp used native menus too).
 - `crates/bridge`: wry host (persistent data dir so login survives restarts), `bridge.js` via `include_str!`, Cmd/Evt types.
 - `crates/ytm`: InnerTube JSON parsers + models, with fixture-based tests.
-- `crates/vis`: spectrum/oscilloscope (Winamp falloff/peaks) + Milkdrop window via the `projectm` crate (libprojectM 4, dynamic link, LGPL) in a glutin/glow context, fed PCM from the bridge.
+- `crates/vis`: spectrum/oscilloscope (Winamp falloff/peaks) + Milkdrop window. **Changed in M6:** it uses butterchurn (MIT, Webamp's WebGL Milkdrop engine) in a second wry webview served offline over a custom protocol, fed 1024-sample PCM frames from the tap. projectM was dropped because Homebrew ships only 3.x, it would add an LGPL native dependency, and butterchurn behaves the same on macOS and Windows.
 - `app`: main loop, state store, config/persistence (`toml` in the OS config dir: window positions/docking, EQ + presets, playlist, skin), tray (`tray-icon`), media keys + Now Playing (`souvlaki`: MPNowPlayingInfo on macOS, SMTC on Windows), keyboard map (Z X C V B, J, L, Ctrl+T/D, Alt+E/G…), `.eqf` import/export.
 - `assets/default-skin/`: original TubeAmp skin. Its BMPs are generated reproducibly by a small Rust `xtask` (tiny-skia), with every classic sprite file present.
 

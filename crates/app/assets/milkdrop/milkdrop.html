@@ -1,0 +1,297 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Milkdrop</title>
+<style>
+  html, body { margin: 0; height: 100%; overflow: hidden; background: #000; }
+  canvas { position: absolute; left: 0; top: 0; width: 100%; height: 100%; display: block; }
+  #name {
+    position: absolute; left: 8px; bottom: 8px; max-width: calc(100% - 16px);
+    padding: 2px 6px; color: #fff; background: rgba(0, 0, 0, 0.6);
+    font: 12px/1.3 -apple-system, "Segoe UI", Arial, sans-serif;
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+    pointer-events: none; opacity: 0; transition: opacity 0.8s ease;
+  }
+  #name.on { opacity: 1; }
+</style>
+</head>
+<body>
+<canvas id="v"></canvas>
+<div id="name"></div>
+<!-- Vendored from butterchurn@2.6.7 and butterchurn-presets@2.4.7 (MIT). See LICENSE-*.txt. -->
+<script src="butterchurn.min.js"></script>
+<script src="butterchurnPresets.min.js"></script>
+<script>
+(function () {
+  "use strict";
+
+  // Timings, as Webamp has them: presets blend for 2.7 s, and random cycling changes the preset
+  // every 15 s. The name stays up for a while after each change.
+  var BLEND_SECS = 2.7;
+  var CYCLE_MS = 15000;
+  var NAME_MS = 2500;
+  // Samples per audio feed. Butterchurn's analyser has 1024 (fftSize), and Rust sends that many.
+  var FEED = 1024;
+
+  var canvas = document.getElementById("v");
+  var nameEl = document.getElementById("name");
+  var viz = null;
+  var presets = null;
+  var names = [];
+  var index = -1;
+  var active = false;   // the window is showing
+  var random = false;   // random cycling is on
+  var rafId = 0;
+  var cycleId = 0;
+  var nameId = 0;
+  var audioBytes = new Uint8Array(FEED).fill(128);
+  // Counts for the once-a-second stats message.
+  var statFrames = 0;
+  var statFeeds = 0;
+  var statAt = 0;
+
+  // Messages to Rust: JSON strings in `window.ipc`, as the YouTube Music bridge does.
+  function post(msg) {
+    if (window.ipc && window.ipc.postMessage) {
+      window.ipc.postMessage(JSON.stringify(msg));
+    }
+  }
+
+  // The error's name, message and first stack lines. Safari's `stack` has no message, so it is added.
+  function describe(err) {
+    if (!err) return "unknown error";
+    var head = (err.name || "Error") + ": " + (err.message || String(err));
+    var lines = String(err.stack || "").split("\n").slice(0, 3).join(" | ");
+    return lines ? head + " @ " + lines : head;
+  }
+
+  // Butterchurn draws its last pass at `width` x `height` (its viewport) and expects the canvas to
+  // be that size, so the canvas and the renderer both get the device's pixels, and the pixel ratio
+  // is 1 (the renderer's textures are then the same device size).
+  var RENDER = { pixelRatio: 1, meshWidth: 32, meshHeight: 24 };
+
+  function deviceSize() {
+    var dpr = window.devicePixelRatio || 1;
+    return {
+      w: Math.max(1, Math.round(window.innerWidth * dpr)),
+      h: Math.max(1, Math.round(window.innerHeight * dpr))
+    };
+  }
+
+  function sizeCanvas() {
+    var d = deviceSize();
+    canvas.width = d.w;
+    canvas.height = d.h;
+    if (viz) {
+      viz.setRendererSize(d.w, d.h, RENDER);
+    }
+  }
+
+  function showName(text) {
+    nameEl.textContent = text;
+    nameEl.className = "on";
+    clearTimeout(nameId);
+    nameId = setTimeout(function () { nameEl.className = ""; }, NAME_MS);
+  }
+
+  function loadIndex(i, blend) {
+    if (!viz || names.length === 0) return;
+    index = ((i % names.length) + names.length) % names.length;
+    var name = names[index];
+    viz.loadPreset(presets[name], blend);
+    showName(name);
+  }
+
+  function pickRandom() {
+    if (names.length < 2) return 0;
+    var i;
+    do {
+      i = Math.floor(Math.random() * names.length);
+    } while (i === index);
+    return i;
+  }
+
+  function next() { loadIndex(index + 1, BLEND_SECS); }
+  function prev() { loadIndex(index - 1, BLEND_SECS); }
+  function cycle() { loadIndex(pickRandom(), BLEND_SECS); }
+
+  function stopCycle() {
+    clearInterval(cycleId);
+    cycleId = 0;
+  }
+
+  function restartCycle() {
+    stopCycle();
+    if (active && random && viz) {
+      cycleId = setInterval(cycle, CYCLE_MS);
+    }
+  }
+
+  function setRandom(on) {
+    random = !!on;
+    restartCycle();
+    post({ t: "random", on: random });
+  }
+
+  function stats(now) {
+    if (!statAt) statAt = now;
+    if (now - statAt < 1000) return;
+    // The canvas and the GL viewport the renderer drew with, for checking the sizes.
+    var gl = canvas.getContext("webgl2") || canvas.getContext("webgl");
+    var vp = gl ? Array.prototype.join.call(gl.getParameter(gl.VIEWPORT), "x") : "none";
+    post({
+      t: "stats",
+      fps: Math.round(statFrames * 1000 / (now - statAt)),
+      feeds: Math.round(statFeeds * 1000 / (now - statAt)),
+      size: "canvas " + canvas.width + "x" + canvas.height + " viewport " + vp +
+        " css " + window.innerWidth + "x" + window.innerHeight +
+        " dpr " + (window.devicePixelRatio || 1)
+    });
+    statFrames = 0;
+    statFeeds = 0;
+    statAt = now;
+  }
+
+  // The animation loop. It runs only while the window shows (Rust pauses it when hidden).
+  function frame() {
+    rafId = 0;
+    if (!active || !viz) return;
+    try {
+      viz.render({
+        audioLevels: { timeByteArray: audioBytes, timeByteArrayL: audioBytes, timeByteArrayR: audioBytes }
+      });
+    } catch (err) {
+      post({ t: "error", msg: "render: " + describe(err) });
+      return;
+    }
+    statFrames++;
+    stats(performance.now());
+    rafId = requestAnimationFrame(frame);
+  }
+
+  function setActive(on) {
+    active = !!on;
+    if (active) {
+      if (viz && !rafId) rafId = requestAnimationFrame(frame);
+      restartCycle();
+    } else {
+      if (rafId) cancelAnimationFrame(rafId);
+      rafId = 0;
+      stopCycle();
+    }
+  }
+
+  // Rust sends the latest samples as base64 of 1024 unsigned bytes, 128 being silence.
+  function audio(b64) {
+    var bin = atob(b64);
+    var n = Math.min(bin.length, FEED);
+    for (var i = 0; i < n; i++) audioBytes[i] = bin.charCodeAt(i);
+    statFeeds++;
+  }
+
+  // The Milkdrop keys. Anything else goes to Rust as a key press, so the global shortcuts still work.
+  function milkAction(k) {
+    switch (k) {
+      case " ":
+      case "n":
+        return "next";
+      case "Backspace":
+      case "p":
+        return "prev";
+      case "r":
+        return "random";
+      case "f":
+        return "fullscreen";
+      case "Escape":
+        return "escape";
+      default:
+        return null;
+    }
+  }
+
+  function runAction(what) {
+    if (what === "next") next();
+    else if (what === "prev") prev();
+    else if (what === "random") setRandom(!random);
+    else if (what === "fullscreen") post({ t: "fullscreen" });
+    else if (what === "escape") post({ t: "escape" });
+  }
+
+  // A key press, from the page or from Rust (when the native window has the focus). Returns
+  // whether the key was a Milkdrop key.
+  function key(k, code, ctrl, alt, meta) {
+    k = String(k || "");
+    var name = k.length === 1 ? k.toLowerCase() : k;
+    var what = milkAction(name);
+    if (what && what !== "escape" && (ctrl || alt || meta)) what = null;
+    if (what) {
+      runAction(what);
+      return true;
+    }
+    post({ t: "key", key: k, code: code || "", ctrl: !!ctrl, alt: !!alt, meta: !!meta });
+    return false;
+  }
+
+  window.tubeamp = {
+    next: next,
+    prev: prev,
+    setRandom: setRandom,
+    setActive: setActive,
+    audio: audio,
+    key: key
+  };
+
+  document.addEventListener("keydown", function (e) {
+    if (e.isComposing) return;
+    // Auto-repeat moves only the arrows (the global seek and volume keys), as the native windows do.
+    if (e.repeat && !/^Arrow/.test(e.key)) return;
+    if (key(e.key, e.code, e.ctrlKey, e.altKey, e.metaKey)) e.preventDefault();
+  }, true);
+
+  document.addEventListener("dblclick", function () { post({ t: "fullscreen" }); });
+
+  // The right-click menu is native (muda), so the page only sends the point.
+  document.addEventListener("contextmenu", function (e) {
+    e.preventDefault();
+    post({ t: "menu", x: e.clientX, y: e.clientY });
+  });
+
+  window.addEventListener("resize", sizeCanvas);
+  window.addEventListener("error", function (e) {
+    post({ t: "error", msg: e.message || "script error" });
+  });
+
+  function init() {
+    try {
+      // An offline context: butterchurn wants a context for its analysers, but nothing plays
+      // through it, so no audio device is opened.
+      var Ctx = window.OfflineAudioContext || window.webkitOfflineAudioContext;
+      var ctx = new Ctx(1, 1024, 44100);
+      // The bundles are webpack modules: the API is the `default` export when there is one.
+      var presetApi = window.butterchurnPresets.default || window.butterchurnPresets;
+      var bc = window.butterchurn.default || window.butterchurn;
+      presets = presetApi.getPresets();
+      names = Object.keys(presets);
+      var d = deviceSize();
+      canvas.width = d.w;
+      canvas.height = d.h;
+      viz = bc.createVisualizer(ctx, canvas, {
+        width: d.w,
+        height: d.h,
+        pixelRatio: RENDER.pixelRatio,
+        meshWidth: RENDER.meshWidth,
+        meshHeight: RENDER.meshHeight
+      });
+      loadIndex(Math.floor(Math.random() * names.length), 0);
+      post({ t: "ready", presets: names.length });
+    } catch (err) {
+      post({ t: "error", msg: "init: " + describe(err) });
+    }
+  }
+
+  init();
+})();
+</script>
+</body>
+</html>

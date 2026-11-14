@@ -26,6 +26,9 @@ pub enum Cmd {
     Volume { level: u8 },
     /// `loadVideoById(video_id)`: load and start a video.
     Load { video_id: String },
+    /// `cueVideoById(video_id, secs)`: load a video at `secs` without starting it (restores the
+    /// last track paused, at its position).
+    Cue { video_id: String, secs: f64 },
     /// Switches the page between the video view and the full YouTube Music page. `video: true`
     /// shows only the player's video, filling the view. `false` shows the whole page (browser mode).
     SetViewMode { video: bool },
@@ -66,6 +69,9 @@ pub enum Evt {
         /// Audio codec from the player's stats, when it can be read.
         #[serde(default)]
         codec: Option<String>,
+        /// Cover art URL from the page's media session artwork, when the page has one.
+        #[serde(default)]
+        thumbnail: Option<String>,
     },
     /// The current video reached its end (player state 0).
     Ended,
@@ -137,6 +143,10 @@ mod tests {
         round_trip_cmd(Cmd::Load {
             video_id: "kJQP7kiw5Fk".to_string(),
         });
+        round_trip_cmd(Cmd::Cue {
+            video_id: "kJQP7kiw5Fk".to_string(),
+            secs: 42.5,
+        });
         round_trip_cmd(Cmd::Api {
             req: 7,
             endpoint: "search".to_string(),
@@ -161,6 +171,18 @@ mod tests {
                 "endpoint": "browse",
                 "body": {"browseId": "FEmusic_home"}
             })
+        );
+    }
+
+    #[test]
+    fn cue_wire_format_matches_bridge_js() {
+        assert_eq!(
+            serde_json::to_string(&Cmd::Cue {
+                video_id: "abc".to_string(),
+                secs: 12.5
+            })
+            .unwrap(),
+            r#"{"t":"cue","video_id":"abc","secs":12.5}"#
         );
     }
 
@@ -215,6 +237,7 @@ mod tests {
             ps: Some(1),
             kbps: Some(128.0),
             codec: Some("opus".to_string()),
+            thumbnail: Some("https://lh3.googleusercontent.com/cover=w226".to_string()),
         });
         round_trip_evt(Evt::State {
             video_id: None,
@@ -225,6 +248,7 @@ mod tests {
             ps: None,
             kbps: None,
             codec: None,
+            thumbnail: None,
         });
         round_trip_evt(Evt::Ended);
         round_trip_evt(Evt::Escape);

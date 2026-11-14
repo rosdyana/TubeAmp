@@ -16,6 +16,10 @@
 //
 // Audio is not handled here on macOS: the EQ and the analyser run in Rust on a Core Audio tap of
 // the WebKit process. There is no Web Audio graph in this file.
+//
+// Media session: the page's navigator.mediaSession is shadowed below, so WebKit does not publish
+// its own Now Playing entry or handle media keys itself. TubeAmp's entry (see nowplaying.rs) is the
+// only one. The page's metadata is still read here, for the cover art in each state snapshot.
 (() => {
   if (window.top !== window || window.__tubeamp) return;
 
@@ -23,6 +27,42 @@
     try {
       window.ipc.postMessage(JSON.stringify(msg));
     } catch (_) {}
+  };
+
+  const shadowMediaSession = () => {
+    const ms = navigator.mediaSession;
+    if (!ms) return;
+    let metadata = null;
+    let playbackState = "none";
+    try {
+      Object.defineProperty(ms, "metadata", {
+        configurable: true,
+        get: () => metadata,
+        set: (value) => {
+          metadata = value;
+        },
+      });
+      Object.defineProperty(ms, "playbackState", {
+        configurable: true,
+        get: () => playbackState,
+        set: (value) => {
+          playbackState = value;
+        },
+      });
+      Object.defineProperty(ms, "setActionHandler", {
+        configurable: true,
+        value: () => {},
+      });
+    } catch (_) {}
+  };
+  shadowMediaSession();
+
+  const artworkUrl = () => {
+    const meta = navigator.mediaSession && navigator.mediaSession.metadata;
+    const art = meta && meta.artwork;
+    if (!art || !art.length) return null;
+    const last = art[art.length - 1];
+    return last && typeof last.src === "string" && last.src ? last.src : null;
   };
 
   const T = (window.__tubeamp = {
@@ -88,6 +128,7 @@
       ps: attempt(() => p.getPlayerState()),
       kbps: T.stats.kbps,
       codec: T.stats.codec,
+      thumbnail: attempt(artworkUrl),
     };
   };
 
@@ -214,7 +255,7 @@ html.tubeamp-video video { object-fit: contain !important; }
   // also prevented from reaching the page. Any other key still goes to the page, so YouTube
   // Music's own shortcuts keep working. Keep this list in step with PAGE_KEYS (an app test checks it).
   const PLAIN_KEYS = ["arrowleft", "arrowright", "arrowup", "arrowdown", "z", "x", "c", "v", "b", "l"];
-  const CTRL_KEYS = ["d", "t", "l"];
+  const CTRL_KEYS = ["d", "t", "l", "m"];
   const ALT_KEYS = ["l", "v"];
 
   // The key's letter: under Alt or Ctrl on macOS, KeyboardEvent.key is a symbol, so letters come
@@ -400,6 +441,9 @@ html.tubeamp-video video { object-fit: contain !important; }
           break;
         case "load":
           p.loadVideoById(c.video_id);
+          break;
+        case "cue":
+          p.cueVideoById(c.video_id, Number(c.secs) || 0);
           break;
         default:
           post({ t: "error", where: "cmd", msg: "unknown command " + c.t });

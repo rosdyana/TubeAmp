@@ -704,6 +704,12 @@ pub fn build_main_menu() -> Result<muda::Menu, muda::Error> {
         None,
     ))?;
     menu.append(&MenuItem::with_id(MAIN_VIDEO, "Video", true, None))?;
+    menu.append(&MenuItem::with_id(
+        crate::milkdrop::MAIN_MILKDROP,
+        "Milkdrop",
+        true,
+        None,
+    ))?;
     Ok(menu)
 }
 

@@ -18,6 +18,7 @@ pub enum Win {
     Playlist,
     Library,
     Video,
+    Milkdrop,
 }
 
 /// A window's rectangle in physical pixels.

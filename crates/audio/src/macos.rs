@@ -2,10 +2,11 @@
 
 use std::ffi::{c_int, c_void};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
 use tubeamp_eq::EqProcessor;
 
-use crate::{AudioError, PARAMS};
+use crate::{AudioError, LatestSamples, PARAMS};
 
 type IoCallback = extern "C" fn(*const f32, u32, *mut f32, u32, u32, *mut c_void);
 
@@ -25,6 +26,8 @@ static RUNNING: AtomicBool = AtomicBool::new(false);
 struct Callback {
     eq: EqProcessor,
     tx: rtrb::Producer<f32>,
+    /// The newest samples, for `AudioEngine::copy_latest`. The engine keeps its own handle.
+    latest: Arc<LatestSamples>,
 }
 
 /// Runs on the Core Audio thread. Must not allocate or block.
@@ -55,8 +58,10 @@ extern "C" fn on_audio(
     for frame in output.chunks_exact(oc) {
         let left = frame[0];
         let right = if oc > 1 { frame[1] } else { left };
+        let mono = 0.5 * (left + right);
         // A full ring drops the sample; the UI only needs a recent window.
-        let _ = cb.tx.push(0.5 * (left + right));
+        let _ = cb.tx.push(mono);
+        cb.latest.push(mono);
     }
 }
 
@@ -70,6 +75,7 @@ fn map_error(code: c_int, stage: &'static str) -> AudioError {
 /// The running tap. Dropping it stops the device.
 pub struct AudioEngine {
     rx: rtrb::Consumer<f32>,
+    latest: Arc<LatestSamples>,
     sample_rate: u32,
     callback: *mut Callback,
 }
@@ -108,6 +114,13 @@ impl AudioEngine {
             chunk.commit_all();
         }
     }
+
+    /// Replaces `out` with the newest `n` mono post-EQ samples (at most [`LATEST_CAPACITY`]),
+    /// oldest first, without touching the samples `drain_samples` reads. Returns the total number
+    /// of samples written so far: when it has not changed since the last call, no new audio came.
+    pub fn copy_latest(&self, out: &mut Vec<f32>, n: usize) -> u64 {
+        self.latest.copy_latest(out, n)
+    }
 }
 
 fn start_inner() -> Result<AudioEngine, AudioError> {
@@ -126,9 +139,11 @@ fn start_inner() -> Result<AudioEngine, AudioError> {
 
     // Build the DSP for the real device rate before any callback can run.
     let (tx, rx) = rtrb::RingBuffer::<f32>::new(RING_CAPACITY);
+    let latest = Arc::new(LatestSamples::new());
     let callback = Box::into_raw(Box::new(Callback {
         eq: EqProcessor::new(sr as f32),
         tx,
+        latest: Arc::clone(&latest),
     }));
 
     // SAFETY: `callback` stays valid until `AudioEngine::drop` (or the failure branch below)
@@ -144,6 +159,7 @@ fn start_inner() -> Result<AudioEngine, AudioError> {
     }
     Ok(AudioEngine {
         rx,
+        latest,
         sample_rate,
         callback,
     })

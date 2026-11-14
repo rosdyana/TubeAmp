@@ -29,6 +29,8 @@ pub struct Playback {
     pub ps: Option<i32>,
     pub kbps: Option<u32>,
     pub codec: Option<String>,
+    /// Cover art URL from the page's media session, for Now Playing.
+    pub thumbnail: Option<String>,
     /// The position from the last state update, in seconds (not rounded).
     cur_secs: f64,
     /// When the last state update arrived.
@@ -47,6 +49,7 @@ impl Default for Playback {
             ps: None,
             kbps: None,
             codec: None,
+            thumbnail: None,
             cur_secs: 0.0,
             updated_at: None,
         }
@@ -83,8 +86,10 @@ impl Playback {
             ps,
             kbps,
             codec,
+            thumbnail,
         } = evt
         {
+            self.thumbnail = thumbnail.clone();
             self.video_id = video_id.clone();
             self.title = title.clone().unwrap_or_default();
             self.author = author.clone().unwrap_or_default();
@@ -225,6 +230,7 @@ mod tests {
             ps,
             kbps: None,
             codec: None,
+            thumbnail: None,
         }
     }
 
@@ -312,6 +318,7 @@ mod tests {
             ps: Some(1),
             kbps: Some(160.4),
             codec: Some("opus".to_string()),
+            thumbnail: None,
         };
         p.apply(&reported, t0());
         assert_eq!(p.kbps_for_display(), Some(160));
@@ -351,6 +358,7 @@ mod tests {
             ps: Some(1),
             kbps: None,
             codec: None,
+            thumbnail: None,
         };
         p.apply(&evt, at);
         assert_eq!(p.time_at(at + Duration::from_secs(20)), 30);

@@ -11,6 +11,8 @@
 //! of windows connected to it. Changing a window's size (double size, windowshade) moves the
 //! windows touching it, as Webamp does.
 
+mod session;
+
 use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -44,16 +46,26 @@ use winit::keyboard::{Key, ModifiersState, NamedKey};
 use winit::platform::modifier_supplement::KeyEventExtModifierSupplement;
 use winit::window::{Fullscreen, WindowAttributes, WindowId};
 
+use crate::config::{Loaded, Setup};
 use crate::eq::{self, EqCommand};
 use crate::hotkeys::{self, KeyName, Shortcut, Stroke};
 use crate::layout::{self, Bx, Win, SNAP_DISTANCE};
+use crate::nowplaying::MediaAction;
 use crate::library::{self, Action, LibCommand, Library};
+use crate::milkdrop::{self, Effect as MilkdropEffect, Msg as MilkdropMsg, MilkdropWindow};
 use crate::player::{Playback, RateMeter, FALLBACK_KHZ};
 use crate::playlist::{self as pl_app, PlAction, SortCommand};
 use crate::skinned::{self, scaled, SkinnedWindow};
 
 /// Every window, in the order the layout visits them.
-const ALL_WINDOWS: [Win; 5] = [Win::Main, Win::Eq, Win::Playlist, Win::Library, Win::Video];
+const ALL_WINDOWS: [Win; 6] = [
+    Win::Main,
+    Win::Eq,
+    Win::Playlist,
+    Win::Library,
+    Win::Video,
+    Win::Milkdrop,
+];
 
 /// Marquee step: one character cell, as in Webamp's `Marquee.tsx`.
 const MARQUEE_STEP_PX: u32 = 5;
@@ -109,12 +121,20 @@ pub struct Options {
     pub library_search: Option<String>,
     /// Show the video window at startup.
     pub open_video: bool,
+    /// Show the Milkdrop window at startup.
+    pub open_milkdrop: bool,
     /// Start the video window in the browser view (the full YouTube Music page), not video only.
     pub video_browser: bool,
     /// Which windows start in windowshade mode.
     pub shade: ShadeSet,
     /// Print the window rectangles and connections to stderr when a drag ends.
     pub layout_dump: bool,
+    /// Where the settings are kept, and whether they are used (`--config-dir`, `--no-config`).
+    pub setup: Setup,
+    /// The settings read at startup (see `config.rs`).
+    pub loaded: Loaded,
+    /// A note for the marquee at startup, such as a skin that could not be loaded.
+    pub startup_notice: Option<String>,
 }
 
 /// The windows that start in windowshade mode (`--shade`).
@@ -132,6 +152,14 @@ pub enum UserEvent {
     Bridge(Evt),
     /// A PRESETS menu item was chosen. The payload is its menu id.
     Menu(String),
+    /// A message from the Milkdrop window's page.
+    Milkdrop(MilkdropMsg),
+    /// A media key or Now Playing request from the OS (see `nowplaying.rs`).
+    Media(MediaAction),
+    /// The classic skin download finished: the file, or why it failed.
+    Download(Result<PathBuf, String>),
+    /// Asks the first-run question (posted once, when there is no config yet).
+    FirstRun,
 }
 
 /// A slider or seek drag in progress.
@@ -279,6 +307,8 @@ struct App {
     /// The video window's size before the browser view enlarged it.
     video_saved_size: Option<(u32, u32)>,
     video_fullscreen: bool,
+    /// The Milkdrop window and its webview (see `milkdrop.rs`).
+    milkdrop: MilkdropWindow,
     /// Gaps between the bridge's state updates, for the log.
     state_rate: RateMeter,
     audio: Option<AudioEngine>,
@@ -297,13 +327,26 @@ struct App {
     quit_at: Option<Instant>,
     next_marquee: Instant,
     next_frame: Instant,
+    /// The saved settings, skin, media controls and tray (see `window/session.rs`).
+    session: session::Session,
 }
 
 /// Opens the windows and runs the event loop until the main window is closed.
 pub fn run(skin: Skin, opts: Options) -> Result<(), winit::error::EventLoopError> {
     let event_loop = EventLoop::<UserEvent>::with_user_event().build()?;
     let started = Instant::now();
+    let mut opts = opts;
+    // The saved double size applies unless `--zoom` asked for a size.
+    if opts.zoom == 1 && opts.loaded.config.main.doubled {
+        opts.zoom = 2;
+    }
     let zoom = opts.zoom;
+    let session = session::Session::new(
+        opts.setup.clone(),
+        opts.loaded.clone(),
+        opts.startup_notice.clone(),
+        started,
+    );
     let screenshot_at = opts.screenshot.as_ref().map(|(after, _)| started + *after);
     let quit_at = opts.quit_after.map(|after| started + after);
     let autoload_at = opts.autoload.as_ref().map(|_| started + AUTOLOAD_DELAY);
@@ -365,6 +408,7 @@ pub fn run(skin: Skin, opts: Options) -> Result<(), winit::error::EventLoopError
         video_browser: false,
         video_saved_size: None,
         video_fullscreen: false,
+        milkdrop: MilkdropWindow::default(),
         state_rate: RateMeter::default(),
         audio: None,
         audio_given_up: false,
@@ -382,8 +426,12 @@ pub fn run(skin: Skin, opts: Options) -> Result<(), winit::error::EventLoopError
         quit_at,
         next_marquee: started + MARQUEE_INTERVAL,
         next_frame: started,
+        session,
     };
-    event_loop.run_app(&mut app)
+    let result = event_loop.run_app(&mut app);
+    // However the loop ended, the settings of the last state are written.
+    app.save_config_now();
+    result
 }
 
 /// `shot.png` → `shot-eq.png`, in the same folder.
@@ -503,6 +551,7 @@ impl App {
             Win::Playlist => self.pl.as_ref(),
             Win::Library => self.lib.as_ref(),
             Win::Video => self.video.as_ref(),
+            Win::Milkdrop => self.milkdrop.window(),
         }
     }
 
@@ -513,6 +562,7 @@ impl App {
             Win::Playlist => self.pl_visible,
             Win::Library => self.lib_visible,
             Win::Video => self.video_visible,
+            Win::Milkdrop => self.milkdrop.visible(),
         }
     }
 
@@ -525,6 +575,7 @@ impl App {
             Win::Playlist => plw::window_size_for(self.pl_state.size_steps, self.pl_state.shade),
             Win::Library => gen::window_size(self.library.state.size_steps),
             Win::Video => (self.video_state.w, self.video_state.h),
+            Win::Milkdrop => gen::window_size(self.milkdrop.steps()),
         }
     }
 
@@ -748,6 +799,7 @@ impl App {
                 Win::Playlist => self.pl.as_mut(),
                 Win::Library => self.lib.as_mut(),
                 Win::Video => self.video.as_mut(),
+                Win::Milkdrop => self.milkdrop.window_mut(),
             };
             if let Some(sw) = slot {
                 sw.set_zoom(zoom);
@@ -778,7 +830,7 @@ impl App {
             Win::Main => self.toggle_main_shade(),
             Win::Eq => self.toggle_eq_shade(),
             Win::Playlist => self.toggle_pl_shade(),
-            Win::Library | Win::Video => {}
+            Win::Library | Win::Video | Win::Milkdrop => {}
         }
     }
 
@@ -998,6 +1050,7 @@ impl App {
             Shortcut::ToggleRemaining => self.state.remaining_mode = !self.state.remaining_mode,
             Shortcut::ToggleLibrary => self.toggle_library(),
             Shortcut::ToggleVideo => self.toggle_video(),
+            Shortcut::ToggleMilkdrop => self.toggle_milkdrop(),
             Shortcut::SeekBack => self.seek_relative(-SEEK_STEP_SECS),
             Shortcut::SeekForward => self.seek_relative(SEEK_STEP_SECS),
             Shortcut::VolumeUp => self.nudge_volume(VOLUME_STEP),
@@ -1669,7 +1722,7 @@ impl App {
             return;
         };
         let zoom = f64::from(main.zoom());
-        let menu = match library::build_main_menu() {
+        let menu = match self.main_menu() {
             Ok(menu) => menu,
             Err(e) => {
                 eprintln!("tubeamp: could not build the menu: {e}");
@@ -2314,6 +2367,62 @@ impl App {
         }
     }
 
+    // Milkdrop window (the logic is in `milkdrop.rs`; these carry out what it asks of the app).
+
+    /// Shows the Milkdrop window. The first time, it goes to the right of the main window.
+    fn show_milkdrop(&mut self) {
+        let beside = self.main.as_ref().and_then(|main| {
+            let pos = main.window.outer_position().ok()?;
+            let (main_w, _) = self.window_px_size(Win::Main);
+            Some((pos.x + main_w as i32, pos.y))
+        });
+        self.milkdrop.show(beside);
+        self.request_redraw();
+    }
+
+    fn toggle_milkdrop(&mut self) {
+        if self.milkdrop.visible() {
+            self.milkdrop.hide();
+        } else {
+            self.show_milkdrop();
+        }
+    }
+
+    /// A message from the Milkdrop page. Its keys that the page does not use run as page keys,
+    /// so the global shortcuts work from the Milkdrop window too.
+    fn on_milkdrop_msg(&mut self, msg: MilkdropMsg) {
+        match msg {
+            MilkdropMsg::Key {
+                key,
+                code,
+                ctrl,
+                alt,
+                meta,
+            } => self.on_page_key(&key, &code, ctrl, alt, meta),
+            other => self.milkdrop.on_msg(other),
+        }
+    }
+
+    /// A window event of the Milkdrop window. The move it asks for is carried out here, because
+    /// the other windows are the app's.
+    fn milkdrop_event(&mut self, event: WindowEvent) {
+        if matches!(event, WindowEvent::RedrawRequested) {
+            self.milkdrop.redraw(&self.skin);
+            return;
+        }
+        match self.milkdrop.event(event) {
+            Some(MilkdropEffect::BeginDrag) => self.begin_window_drag(Win::Milkdrop),
+            Some(MilkdropEffect::DragMoved) => self.drag_moved(Win::Milkdrop),
+            Some(MilkdropEffect::EndDrag) => self.end_window_drag(),
+            Some(MilkdropEffect::Resize(w, h)) => {
+                let (w, h) = self.snapped_skin_size(Win::Milkdrop, w, h);
+                let steps = gen::steps_for_size(w.round() as i32, h.round() as i32);
+                self.milkdrop.set_steps(steps);
+            }
+            None => {}
+        }
+    }
+
     // Equalizer window.
 
     fn toggle_eq(&mut self) {
@@ -2566,11 +2675,10 @@ impl App {
                 self.playback.apply(&evt, now);
                 self.library.set_playing(self.playback.video_id.as_deref());
                 self.log_transitions(&before);
-                // Push the slider's volume to the player once the player exists.
+                // Once the player exists: the slider's volume, and the track restored at startup.
                 if !self.volume_synced && self.playback.ps.is_some() {
                     self.volume_synced = true;
-                    let level = self.state.volume;
-                    self.send(Cmd::Volume { level });
+                    self.on_player_ready();
                 }
                 self.follow_playlist();
             }
@@ -2762,9 +2870,9 @@ impl App {
 
     /// Copies playback and drag state into the main window's state.
     fn refresh_display(&mut self, now: Instant) {
+        self.state.status = self.display_status();
         let p = &self.playback;
         let time = p.time_at(now);
-        self.state.status = p.status;
         self.state.time_secs = time;
         self.state.duration_secs = p.duration_secs;
         self.state.kbps = p.kbps_for_display().or(self.state.kbps);
@@ -2794,6 +2902,10 @@ impl App {
                 _ => self.marquee_text(),
             }
         };
+        // A skin error or a download note takes the marquee for a few seconds.
+        if let Some(text) = self.active_message(now) {
+            self.state.title = text;
+        }
         // The playlist's mini time follows the main window's time mode while playing or paused.
         self.pl_state.mini_time_secs =
             (self.state.status != Status::Stop).then(|| displayed_secs(&self.state));
@@ -2938,12 +3050,16 @@ impl App {
                 }
             }
         }
+        self.milkdrop.save_screenshots(&self.skin, path);
     }
 
     fn next_wake(&self, playing: bool) -> Instant {
         let mut wake = self.next_frame.min(self.next_marquee);
         if playing && self.audio.is_none() && !self.audio_given_up {
             wake = wake.min(self.audio_retry_at);
+        }
+        if let Some(t) = self.milkdrop.next_wake() {
+            wake = wake.min(t);
         }
         for t in [self.autoload_at, self.screenshot_at, self.quit_at]
             .into_iter()
@@ -2976,6 +3092,7 @@ impl App {
         if playing && self.audio.is_none() && !self.audio_given_up && now >= self.audio_retry_at {
             self.try_start_audio(now);
         }
+        self.milkdrop.tick(now, self.audio.as_ref());
 
         if now >= self.next_frame {
             if playing {
@@ -2996,6 +3113,8 @@ impl App {
             self.request_redraw();
         }
 
+        self.sync_system(now);
+        self.save_config_if_due(now);
         el.set_control_flow(ControlFlow::WaitUntil(self.next_wake(playing)));
     }
 
@@ -3034,6 +3153,12 @@ impl App {
                 ElementState::Pressed => self.on_press(),
                 ElementState::Released => self.on_release(event_loop),
             },
+            // Right click: the menu with the skins (the same as the O button's).
+            WindowEvent::MouseInput {
+                state: ElementState::Pressed,
+                button: MouseButton::Right,
+                ..
+            } => self.open_main_context_menu(),
             WindowEvent::KeyboardInput { event, .. } => self.on_key(&event),
             _ => {}
         }
@@ -3182,6 +3307,18 @@ impl ApplicationHandler<UserEvent> for App {
             "video view: WebKit occlusion detection off = {}",
             bridge.occlusion_detection_off()
         ));
+        // The Milkdrop window. Its webview is made when it first shows.
+        let milkdrop_proxy = self.proxy.clone();
+        self.milkdrop = match MilkdropWindow::create(event_loop, zoom, move |msg| {
+            let _ = milkdrop_proxy.send_event(UserEvent::Milkdrop(msg));
+        }) {
+            Ok(milkdrop) => milkdrop,
+            Err(e) => {
+                eprintln!("tubeamp: {e}");
+                event_loop.exit();
+                return;
+            }
+        };
 
         self.main = Some(main);
         self.eq = Some(eq);
@@ -3194,6 +3331,9 @@ impl ApplicationHandler<UserEvent> for App {
         self.state.shade = self.opts.shade.main;
         self.eq_state.shade = self.opts.shade.eq;
         self.pl_state.shade = self.opts.shade.pl;
+        // The saved settings come back here, before any window is shown (see `window/session.rs`).
+        self.restore_session(event_loop);
+        self.start_system_integration();
         self.apply_sizes();
         self.update_video_bounds();
         if self.opts.video_browser {
@@ -3220,14 +3360,24 @@ impl ApplicationHandler<UserEvent> for App {
         if self.opts.open_video {
             self.show_video();
         }
+        if self.opts.open_milkdrop {
+            self.show_milkdrop();
+        }
         self.request_redraw();
     }
 
-    fn user_event(&mut self, _event_loop: &ActiveEventLoop, event: UserEvent) {
+    fn user_event(&mut self, event_loop: &ActiveEventLoop, event: UserEvent) {
         match event {
             UserEvent::Bridge(evt) => self.on_bridge_event(evt),
+            UserEvent::Milkdrop(msg) => self.on_milkdrop_msg(msg),
+            UserEvent::Media(action) => self.on_media_action(action),
+            UserEvent::Download(result) => self.on_download_done(result),
+            UserEvent::FirstRun => self.first_run_prompt(),
             UserEvent::Menu(id) => {
                 self.log(format!("menu item {id}"));
+                if self.on_session_menu(event_loop, &id) {
+                    return;
+                }
                 if let Some(cmd) = eq::command_for_id(&id) {
                     self.run_eq_command(cmd);
                 } else if let Some(cmd) = pl_app::sort_command_for_id(&id) {
@@ -3238,6 +3388,10 @@ impl ApplicationHandler<UserEvent> for App {
                     self.show_library();
                 } else if id == library::MAIN_VIDEO {
                     self.toggle_video();
+                } else if id == milkdrop::MAIN_MILKDROP {
+                    self.toggle_milkdrop();
+                } else if let Some(cmd) = milkdrop::command_for_id(&id) {
+                    self.milkdrop.command(cmd);
                 }
             }
         }
@@ -3249,6 +3403,10 @@ impl ApplicationHandler<UserEvent> for App {
         window_id: WindowId,
         event: WindowEvent,
     ) {
+        if let WindowEvent::DroppedFile(path) = &event {
+            self.on_dropped_file(window_id, path.clone());
+            return;
+        }
         if self.video.as_ref().is_some_and(|v| v.id() == window_id) {
             self.video_event(event);
         } else if self.eq.as_ref().is_some_and(|e| e.id() == window_id) {
@@ -3257,6 +3415,8 @@ impl ApplicationHandler<UserEvent> for App {
             self.pl_event(event);
         } else if self.lib.as_ref().is_some_and(|l| l.id() == window_id) {
             self.lib_event(event);
+        } else if self.milkdrop.owns(window_id) {
+            self.milkdrop_event(event);
         } else if self.main.as_ref().is_some_and(|m| m.id() == window_id) {
             self.main_event(event_loop, event);
         }

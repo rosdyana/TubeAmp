@@ -16,14 +16,20 @@
 //! after start, and `TUBEAMP_LOG=1` prints bridge events and state changes to stderr.
 
 mod api;
+mod config;
 mod demo;
 mod eq;
+mod firstrun;
 mod hotkeys;
 mod layout;
 mod library;
+mod milkdrop;
+mod nowplaying;
 mod player;
 mod playlist;
 mod skinned;
+mod skins;
+mod tray;
 mod window;
 
 use std::error::Error;
@@ -63,7 +69,8 @@ const USAGE: &str = "usage:
   --screenshot-after S F   save the live main window (2x) to F after S seconds, and the
                            equalizer (2x) to F-eq.png and the playlist to F-pl.png when open,
                            the video frame to F-video.png and the real video window (macOS,
-                           screencapture) to F-video-live.png when it is showing
+                           screencapture) to F-video-live.png when it is showing, and the
+                           Milkdrop frame to F-milkdrop.png and window to F-milkdrop-live.png
   --quit-after S           exit after S seconds
   --open-eq                open the equalizer window below the main window at startup
   --eq-preset NAME         apply a built-in EQ preset (e.g. \"Rock\") at startup or in a render
@@ -75,6 +82,7 @@ const USAGE: &str = "usage:
   --library-search QUERY   run QUERY in the media library once the page is ready
   --fixture PATH.json      with --render-library: a captured response to render instead
   --open-video             open the video window at startup (Alt+V toggles it)
+  --open-milkdrop          open the Milkdrop window at startup (Ctrl+M toggles it)
   --video-mode MODE        video (default: only the video shows) or browser (the whole
                            YouTube Music page, and a larger window)
   --size WxH               with --render-video: the frame size in skin pixels (default 275x232)
@@ -82,6 +90,8 @@ const USAGE: &str = "usage:
   --render-shade WHICH     with --render-shade: the windowshade of main, eq or pl, headless
   --layout-dump            print the window rectangles and their connections to stderr when a
                            drag ends (for tests)
+  --config-dir PATH        keep config.toml, playlist.json and skins/ in PATH (for tests)
+  --no-config              do not read or write the saved settings, or the skins folder
 
 environment:
   TUBEAMP_AUTOLOAD=ID      load YouTube video ID six seconds after start
@@ -116,12 +126,17 @@ struct Args {
     /// `--size WxH` for `--render-video`, in skin pixels.
     size: Option<(u32, u32)>,
     open_video: bool,
+    open_milkdrop: bool,
     video_browser: bool,
     /// `--shade`: which windows start in windowshade mode.
     shade: window::ShadeSet,
     /// `--render-shade`: the window, skin and output file.
     render_shade: Option<(ShadeTarget, PathBuf, PathBuf)>,
     layout_dump: bool,
+    /// `--config-dir PATH`: where the saved settings are kept.
+    config_dir: Option<PathBuf>,
+    /// `--no-config`: the saved settings are neither read nor written.
+    no_config: bool,
     help: bool,
 }
 
@@ -308,6 +323,7 @@ fn parse_args(mut args: impl Iterator<Item = String>) -> Result<Args, String> {
                 out.size = Some(parse_frame_size(&value)?);
             }
             "--open-video" => out.open_video = true,
+            "--open-milkdrop" => out.open_milkdrop = true,
             "--shade" => {
                 let value = args.next().ok_or("--shade needs main, eq or pl")?;
                 out.shade = parse_shade_set(&value)?;
@@ -320,6 +336,8 @@ fn parse_args(mut args: impl Iterator<Item = String>) -> Result<Args, String> {
                 out.render_shade = Some((target, skin, png));
             }
             "--layout-dump" => out.layout_dump = true,
+            "--config-dir" => out.config_dir = Some(next_path(&mut args, "--config-dir")?),
+            "--no-config" => out.no_config = true,
             "--video-mode" => {
                 let value = args.next().ok_or("--video-mode needs video or browser")?;
                 out.video_browser = parse_video_mode(&value)?;
@@ -526,11 +544,22 @@ fn run() -> Result<(), Box<dyn Error>> {
         return Ok(());
     }
 
-    let skin = match args.skin {
-        Some(path) => Skin::load_path(&path)?,
-        None => Skin::load(DEFAULT_SKIN)?,
+    // The saved settings. Nothing about them stops the app: missing or broken files give defaults.
+    let dir = args.config_dir.clone().or_else(config::default_dir);
+    let setup = config::Setup {
+        enabled: !args.no_config && dir.is_some(),
+        dir: dir.unwrap_or_default(),
+    };
+    let loaded = config::load(&setup);
+    // `--skin` wins over the saved skin. A saved skin that fails to load gives the built-in one.
+    let (skin, startup_notice) = match args.skin {
+        Some(path) => (Skin::load_path(&path)?, None),
+        None => skins::startup_skin(&loaded.config.skin, DEFAULT_SKIN)?,
     };
     let options = window::Options {
+        setup,
+        loaded,
+        startup_notice,
         zoom,
         screenshot: args.screenshot,
         quit_after: args.quit_after,
@@ -545,6 +574,7 @@ fn run() -> Result<(), Box<dyn Error>> {
         open_library: args.open_library,
         library_search: args.library_search,
         open_video: args.open_video,
+        open_milkdrop: args.open_milkdrop,
         video_browser: args.video_browser,
         shade: args.shade,
         layout_dump: args.layout_dump,

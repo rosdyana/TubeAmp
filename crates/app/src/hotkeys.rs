@@ -4,7 +4,8 @@
 //!
 //! Winamp's bindings: Z, X, C, V, B for previous, play, pause, stop and next; the arrow keys seek
 //! and change the volume; Ctrl+D doubles, Ctrl+T toggles the time, Alt+V and L toggle the video,
-//! and Alt+L the media library. Webamp has no key for windowshade, so none is bound here.
+//! Alt+L the media library, and Ctrl+M the Milkdrop window (a [`Stroke`] does not carry Shift, so
+//! it is the plain Ctrl letter). Webamp has no key for windowshade, so none is bound here.
 //! Modifiers other than Ctrl and Alt (Cmd or the Windows key) are never shortcuts: on macOS Cmd+V
 //! is paste, not Stop.
 
@@ -36,6 +37,8 @@ pub enum Shortcut {
     ToggleRemaining,
     ToggleLibrary,
     ToggleVideo,
+    /// Shows or hides the Milkdrop window.
+    ToggleMilkdrop,
     SeekBack,
     SeekForward,
     VolumeUp,
@@ -65,6 +68,7 @@ pub fn shortcut_for(stroke: &Stroke, repeat: bool) -> Option<Shortcut> {
             KeyName::Char('d') => Some(Shortcut::ToggleDouble),
             KeyName::Char('t') => Some(Shortcut::ToggleRemaining),
             KeyName::Char('l') => Some(Shortcut::ToggleLibrary),
+            KeyName::Char('m') => Some(Shortcut::ToggleMilkdrop),
             _ => None,
         };
     }
@@ -147,7 +151,7 @@ mod tests {
         "l",
     ];
     /// Letters with Ctrl (`CTRL_KEYS` in `bridge.js`).
-    const PAGE_CTRL_KEYS: &[&str] = &["d", "t", "l"];
+    const PAGE_CTRL_KEYS: &[&str] = &["d", "t", "l", "m"];
     /// Letters with Alt (`ALT_KEYS` in `bridge.js`).
     const PAGE_ALT_KEYS: &[&str] = &["l", "v"];
 
@@ -227,6 +231,16 @@ mod tests {
         assert_eq!(
             shortcut_for(&with(KeyName::Char('l'), true, false, false), false),
             Some(Shortcut::ToggleLibrary)
+        );
+        assert_eq!(
+            shortcut_for(&with(KeyName::Char('m'), true, false, false), false),
+            Some(Shortcut::ToggleMilkdrop)
+        );
+        // Plain M is nothing, and so is Alt+M.
+        assert_eq!(shortcut_for(&plain(KeyName::Char('m')), false), None);
+        assert_eq!(
+            shortcut_for(&with(KeyName::Char('m'), false, true, false), false),
+            None
         );
         assert_eq!(
             shortcut_for(&with(KeyName::Char('l'), false, true, false), false),

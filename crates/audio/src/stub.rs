@@ -20,4 +20,9 @@ impl AudioEngine {
     pub fn drain_samples(&mut self, out: &mut Vec<f32>) {
         out.clear();
     }
+
+    pub fn copy_latest(&self, out: &mut Vec<f32>, _n: usize) -> u64 {
+        out.clear();
+        0
+    }
 }

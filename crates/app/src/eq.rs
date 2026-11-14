@@ -71,29 +71,9 @@ pub fn build_presets_menu() -> Result<muda::Menu, muda::Error> {
 /// run on the main thread. Item clicks arrive later as menu events.
 #[cfg(any(target_os = "macos", target_os = "windows"))]
 pub fn show_presets_menu(window: &winit::window::Window, x: f64, y: f64) -> Result<(), String> {
-    use muda::dpi::{LogicalPosition, Position};
-    use muda::ContextMenu;
-    use raw_window_handle::{HasWindowHandle, RawWindowHandle};
-
     let menu = build_presets_menu().map_err(|e| e.to_string())?;
-    let handle = window.window_handle().map_err(|e| e.to_string())?;
-    let position = Some(Position::Logical(LogicalPosition::new(x, y)));
-    match handle.as_raw() {
-        #[cfg(target_os = "macos")]
-        RawWindowHandle::AppKit(appkit) => {
-            // SAFETY: the view belongs to `window`, which is alive for the whole call, and this
-            // runs on the main thread that owns the AppKit view.
-            unsafe { menu.show_context_menu_for_nsview(appkit.ns_view.as_ptr(), position) };
-            Ok(())
-        }
-        #[cfg(target_os = "windows")]
-        RawWindowHandle::Win32(win32) => {
-            // SAFETY: the HWND belongs to `window`, which is alive for the whole call.
-            unsafe { menu.show_context_menu_for_hwnd(win32.hwnd.get(), position) };
-            Ok(())
-        }
-        _ => Err("the equalizer window has no native view for a menu".to_string()),
-    }
+    crate::skinned::show_context_menu(window, &menu, x, y)
+        .map_err(|e| format!("the equalizer window: {e}"))
 }
 
 /// Other platforms have no PRESETS menu yet (macOS and Windows only).
@@ -155,8 +135,14 @@ mod tests {
         assert_eq!(command_for_id(LOAD_EQF), Some(EqCommand::LoadEqf));
         assert_eq!(command_for_id(SAVE_EQF), Some(EqCommand::SaveEqf));
         assert_eq!(command_for_id(RESET), Some(EqCommand::Reset));
-        assert_eq!(command_for_id("eq.load.preset.0"), Some(EqCommand::Builtin(0)));
-        assert_eq!(command_for_id("eq.load.preset.16"), Some(EqCommand::Builtin(16)));
+        assert_eq!(
+            command_for_id("eq.load.preset.0"),
+            Some(EqCommand::Builtin(0))
+        );
+        assert_eq!(
+            command_for_id("eq.load.preset.16"),
+            Some(EqCommand::Builtin(16))
+        );
         assert_eq!(command_for_id("eq.load.preset.17"), None);
         assert_eq!(command_for_id("eq.load.preset.x"), None);
         assert_eq!(command_for_id("something else"), None);
@@ -165,7 +151,10 @@ mod tests {
     #[test]
     fn every_builtin_has_a_menu_id() {
         for i in 0..BUILTIN.len() {
-            assert_eq!(command_for_id(&format!("{PRESET_PREFIX}{i}")), Some(EqCommand::Builtin(i)));
+            assert_eq!(
+                command_for_id(&format!("{PRESET_PREFIX}{i}")),
+                Some(EqCommand::Builtin(i))
+            );
         }
     }
 

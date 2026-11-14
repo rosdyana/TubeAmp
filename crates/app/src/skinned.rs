@@ -78,6 +78,18 @@ impl SkinnedWindow {
         let _ = self.window.request_inner_size(self.logical_size());
     }
 
+    /// Changes the skin size (for example a resized playlist) and asks the OS for the matching
+    /// window size at the current zoom.
+    pub fn set_base(&mut self, base: (u32, u32)) {
+        self.base = base;
+        let _ = self.window.request_inner_size(self.logical_size());
+    }
+
+    /// The last pointer position over the window, in physical pixels.
+    pub fn cursor_position(&self) -> Option<PhysicalPosition<f64>> {
+        self.cursor
+    }
+
     /// Integer scale from skin pixels to physical pixels: round(scale factor) × zoom.
     pub fn factor(&self) -> u32 {
         let scale = self.window.scale_factor();
@@ -147,6 +159,46 @@ impl SkinnedWindow {
             eprintln!("tubeamp: present failed: {e}");
         }
     }
+}
+
+/// Shows `menu` as a context menu with its top-left at `(x, y)` in logical pixels of `window`'s
+/// content view. The call blocks until the menu closes, so it must run on the main thread. Item
+/// clicks arrive later as menu events.
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+pub fn show_context_menu(window: &Window, menu: &muda::Menu, x: f64, y: f64) -> Result<(), String> {
+    use muda::dpi::{LogicalPosition, Position};
+    use muda::ContextMenu;
+    use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+
+    let handle = window.window_handle().map_err(|e| e.to_string())?;
+    let position = Some(Position::Logical(LogicalPosition::new(x, y)));
+    match handle.as_raw() {
+        #[cfg(target_os = "macos")]
+        RawWindowHandle::AppKit(appkit) => {
+            // SAFETY: the view belongs to `window`, which is alive for the whole call, and this
+            // runs on the main thread that owns the AppKit view.
+            unsafe { menu.show_context_menu_for_nsview(appkit.ns_view.as_ptr(), position) };
+            Ok(())
+        }
+        #[cfg(target_os = "windows")]
+        RawWindowHandle::Win32(win32) => {
+            // SAFETY: the HWND belongs to `window`, which is alive for the whole call.
+            unsafe { menu.show_context_menu_for_hwnd(win32.hwnd.get(), position) };
+            Ok(())
+        }
+        _ => Err("the window has no native view for a menu".to_string()),
+    }
+}
+
+/// Other platforms have no context menus yet (macOS and Windows only).
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+pub fn show_context_menu(
+    _window: &Window,
+    _menu: &muda::Menu,
+    _x: f64,
+    _y: f64,
+) -> Result<(), String> {
+    Err("context menus need macOS or Windows".to_string())
 }
 
 /// Centres `size` pixels within `total`, cropping if it does not fit.

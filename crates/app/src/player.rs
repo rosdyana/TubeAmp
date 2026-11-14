@@ -96,9 +96,10 @@ impl Playback {
         })
     }
 
-    /// The marquee text while nothing is being dragged.
-    pub fn marquee_text(&self) -> String {
-        labels::now_playing(&self.author, &self.title, self.duration_secs)
+    /// The marquee text with the track's playlist number (1 for a track that is not in the
+    /// playlist).
+    pub fn marquee_text_numbered(&self, number: u32) -> String {
+        labels::now_playing_numbered(number, &self.author, &self.title, self.duration_secs)
             .unwrap_or_else(|| labels::IDLE_TEXT.to_string())
     }
 }
@@ -149,7 +150,7 @@ mod tests {
         assert_eq!(p.duration_secs, 229);
         assert_eq!(p.status, Status::Play);
         assert_eq!(
-            p.marquee_text(),
+            p.marquee_text_numbered(labels::TRACK_NUMBER),
             "1. Luis Fonsi & Daddy Yankee - Despacito (3:49)"
         );
     }
@@ -168,8 +169,21 @@ mod tests {
     }
 
     #[test]
+    fn marquee_uses_the_given_playlist_number() {
+        let mut p = Playback::default();
+        p.apply(&state(Some(1)));
+        assert_eq!(
+            p.marquee_text_numbered(7),
+            "7. Luis Fonsi & Daddy Yankee - Despacito (3:49)"
+        );
+    }
+
+    #[test]
     fn idle_player_shows_the_app_name() {
-        assert_eq!(Playback::default().marquee_text(), "TubeAmp");
+        assert_eq!(
+            Playback::default().marquee_text_numbered(labels::TRACK_NUMBER),
+            "TubeAmp"
+        );
     }
 
     #[test]

@@ -1,7 +1,7 @@
 //! Marquee text, as Winamp and Webamp show it (Webamp `js/marqueeUtils.tsx`, `getMarqueeText`
 //! and `getMediaText` in `js/selectors.ts`).
 
-/// Track number shown before the title. There is no playlist yet, so it is always 1.
+/// Track number shown before the title when the track is not in the playlist.
 pub const TRACK_NUMBER: u32 = 1;
 
 /// Text shown when nothing is loaded.
@@ -9,6 +9,16 @@ pub const IDLE_TEXT: &str = "TubeAmp";
 
 /// `1. Artist - Title (m:ss)`. The artist is omitted when unknown. `None` when there is no title.
 pub fn now_playing(author: &str, title: &str, duration_secs: u32) -> Option<String> {
+    now_playing_numbered(TRACK_NUMBER, author, title, duration_secs)
+}
+
+/// [`now_playing`] with the track's playlist number instead of 1.
+pub fn now_playing_numbered(
+    number: u32,
+    author: &str,
+    title: &str,
+    duration_secs: u32,
+) -> Option<String> {
     let title = title.trim();
     if title.is_empty() {
         return None;
@@ -20,7 +30,7 @@ pub fn now_playing(author: &str, title: &str, duration_secs: u32) -> Option<Stri
         format!("{author} - {title}")
     };
     Some(format!(
-        "{TRACK_NUMBER}. {name} ({})",
+        "{number}. {name} ({})",
         time_truncated(duration_secs)
     ))
 }
@@ -97,6 +107,14 @@ mod tests {
         assert_eq!(
             now_playing("Luis Fonsi & Daddy Yankee", "Despacito", 229).as_deref(),
             Some("1. Luis Fonsi & Daddy Yankee - Despacito (3:49)")
+        );
+    }
+
+    #[test]
+    fn now_playing_can_carry_the_playlist_number() {
+        assert_eq!(
+            now_playing_numbered(12, "Artist", "Song", 65).as_deref(),
+            Some("12. Artist - Song (1:05)")
         );
     }
 

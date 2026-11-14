@@ -1,6 +1,7 @@
-//! The windows and their event loop: the main window and the equalizer window (both skinned, see
-//! `skinned.rs`), the YouTube Music bridge, the audio tap, the EQ and the visualiser, wired
-//! together.
+//! The windows and their event loop: the main window, the equalizer and the playlist editor (all
+//! skinned, see `skinned.rs`), the YouTube Music bridge, the audio tap, the EQ and the visualiser,
+//! wired together. The playlist decides what plays next: the main window's previous and next
+//! buttons, Z and B, and the end of each track all go through it.
 //!
 //! The bridge webview lives in a hidden host window. The Eject button and the L key show it.
 
@@ -13,17 +14,21 @@ use tubeamp_audio::{params as eq_params, AudioEngine, AudioError};
 use tubeamp_bridge::{Bridge, Cmd, Evt};
 use tubeamp_eq::model::ZERO_VALUE;
 use tubeamp_eq::{Preset, BANDS_HZ, BUILTIN};
+use tubeamp_playlist::{Entry, Playlist};
 use tubeamp_skin::Skin;
 use tubeamp_ui::eq_window as eqw;
 use tubeamp_ui::main_window::{BALANCE, POSITION, VOLUME};
+use tubeamp_ui::playlist_window as plw;
 use tubeamp_ui::{
-    hit_test_eq, hit_test_main, labels, marquee_period_px, press_grab, render_eq, render_main,
-    render_vis, sliders, slider_value_at, Canvas, EqHit, EqSlider, EqWindowState, MainButton,
-    MainHit, MainState, Status, HEIGHT, PRESETS_BTN, WIDTH,
+    displayed_secs, hit_test_eq, hit_test_main, hit_test_playlist, labels, marquee_period_px,
+    menu_button_rect, press_grab, render_eq, render_main, render_playlist, render_vis,
+    row_index_at, slider_value_at, sliders, Canvas, EqHit, EqSlider, EqWindowState, MainButton,
+    MainHit, MainState, PlHit, PlMenu, PlTransport, PlaylistWindowState, Status, HEIGHT,
+    PRESETS_BTN, WIDTH,
 };
 use winit::application::ApplicationHandler;
 use winit::dpi::{LogicalSize, PhysicalPosition, PhysicalSize};
-use winit::event::{ElementState, KeyEvent, MouseButton, WindowEvent};
+use winit::event::{ElementState, KeyEvent, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
 use winit::keyboard::{Key, ModifiersState, NamedKey};
 use winit::platform::modifier_supplement::KeyEventExtModifierSupplement;
@@ -31,7 +36,8 @@ use winit::window::{WindowAttributes, WindowId};
 
 use crate::eq::{self, EqCommand};
 use crate::player::{Playback, FALLBACK_KHZ};
-use crate::skinned::{scaled, SharedWindow, SkinnedWindow};
+use crate::playlist::{self as pl_app, PlAction, SortCommand};
+use crate::skinned::{self, scaled, SharedWindow, SkinnedWindow};
 
 /// Marquee step: one character cell, as in Webamp's `Marquee.tsx`.
 const MARQUEE_STEP_PX: u32 = 5;
@@ -52,6 +58,10 @@ const VOLUME_STEP: i32 = 2;
 /// Host window size (logical pixels).
 const HOST_WIDTH: f64 = 480.0;
 const HOST_HEIGHT: f64 = 360.0;
+/// Two clicks on the same playlist row this close together play it.
+const DOUBLE_CLICK: Duration = Duration::from_millis(500);
+/// Rows scrolled per wheel notch, as Winamp does.
+const WHEEL_ROWS: isize = 3;
 
 /// Settings from the command line and environment.
 #[derive(Debug, Clone)]
@@ -71,6 +81,10 @@ pub struct Options {
     pub open_eq: bool,
     /// Apply this built-in preset at startup.
     pub eq_preset: Option<Preset>,
+    /// Open the playlist editor at startup, below the equalizer or the main window.
+    pub open_pl: bool,
+    /// Video ids (or links, already validated) appended to the playlist at startup.
+    pub add: Vec<String>,
 }
 
 /// Events posted to the event loop from outside it.
@@ -100,6 +114,26 @@ struct EqDrag {
     grab: f64,
 }
 
+/// A playlist window drag in progress.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum PlDrag {
+    /// The scrollbar thumb follows the pointer.
+    Scroll,
+    /// The bottom-right corner resizes the window. The size is the start size plus the
+    /// pointer's movement since the press.
+    Resize {
+        start_steps: (u32, u32),
+        start_cursor: PhysicalPosition<f64>,
+    },
+    /// Selected rows follow the pointer. `index` is the row pressed, `last` the row under the
+    /// pointer, and `moved` whether the selection has moved at all.
+    Rows {
+        index: usize,
+        last: usize,
+        moved: bool,
+    },
+}
+
 struct App {
     opts: Options,
     skin: Skin,
@@ -114,6 +148,20 @@ struct App {
     eq_drag: Option<EqDrag>,
     /// The main window's outer position and inner size, as last seen. The equalizer docks to it.
     main_rect: Option<(PhysicalPosition<i32>, PhysicalSize<u32>)>,
+    pl: Option<SkinnedWindow>,
+    pl_visible: bool,
+    pl_state: PlaylistWindowState,
+    playlist: Playlist,
+    /// The playlist row the pointer pressed, and the hit it was pressed on.
+    pl_press: Option<PlHit>,
+    pl_drag: Option<PlDrag>,
+    /// The last row press, for double-click detection.
+    pl_click: Option<(usize, Instant)>,
+    /// Random order for shuffle and randomize.
+    rng: fastrand::Rng,
+    /// Whether the current entry's end has already moved the playlist on. Cleared once the entry
+    /// is seen playing again, so a late end report cannot skip a track twice.
+    ended_done: bool,
     // Dropped before `host`, because the webview is a child of the host window.
     bridge: Option<Bridge>,
     host: Option<SharedWindow>,
@@ -169,6 +217,15 @@ pub fn run(skin: Skin, opts: Options) -> Result<(), winit::error::EventLoopError
         eq_press: None,
         eq_drag: None,
         main_rect: None,
+        pl: None,
+        pl_visible: false,
+        pl_state: PlaylistWindowState::default(),
+        playlist: Playlist::default(),
+        pl_press: None,
+        pl_drag: None,
+        pl_click: None,
+        rng: fastrand::Rng::new(),
+        ended_done: false,
         bridge: None,
         host: None,
         host_visible: false,
@@ -194,13 +251,18 @@ pub fn run(skin: Skin, opts: Options) -> Result<(), winit::error::EventLoopError
 
 /// `shot.png` → `shot-eq.png`, in the same folder.
 pub fn eq_screenshot_path(path: &Path) -> PathBuf {
+    suffixed_path(path, "eq")
+}
+
+/// `shot.png` → `shot-<suffix>.png`, in the same folder.
+pub fn suffixed_path(path: &Path, suffix: &str) -> PathBuf {
     let stem = path
         .file_stem()
         .map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_default();
     let name = match path.extension() {
-        Some(ext) => format!("{stem}-eq.{}", ext.to_string_lossy()),
-        None => format!("{stem}-eq"),
+        Some(ext) => format!("{stem}-{suffix}.{}", ext.to_string_lossy()),
+        None => format!("{stem}-{suffix}"),
     };
     path.with_file_name(name)
 }
@@ -219,7 +281,7 @@ impl App {
         }
     }
 
-    /// Requests a redraw of the main window, and of the equalizer while it is open.
+    /// Requests a redraw of the main window, and of the equalizer and playlist while open.
     fn request_redraw(&self) {
         if let Some(main) = &self.main {
             main.request_redraw();
@@ -227,6 +289,11 @@ impl App {
         if self.eq_visible {
             if let Some(eq) = &self.eq {
                 eq.request_redraw();
+            }
+        }
+        if self.pl_visible {
+            if let Some(pl) = &self.pl {
+                pl.request_redraw();
             }
         }
     }
@@ -368,16 +435,16 @@ impl App {
                         main.window.set_minimized(true);
                     }
                 }
-                MainButton::Previous => self.send(Cmd::Prev),
+                MainButton::Previous => self.prev_track(),
                 MainButton::Play => self.send(Cmd::Play),
                 MainButton::Pause => self.send(Cmd::Pause),
                 MainButton::Stop => self.send(Cmd::Stop),
-                MainButton::Next => self.send(Cmd::Next),
+                MainButton::Next => self.next_track(),
                 MainButton::Eject => self.toggle_host(),
                 MainButton::Shuffle => self.state.shuffle = !self.state.shuffle,
                 MainButton::Repeat => self.state.repeat = !self.state.repeat,
                 MainButton::EqToggle => self.toggle_eq(),
-                MainButton::PlToggle => self.state.pl_open = !self.state.pl_open,
+                MainButton::PlToggle => self.toggle_pl(),
                 MainButton::ClutterD => {
                     let on = !self.state.doubled;
                     self.set_doubled(on);
@@ -419,11 +486,11 @@ impl App {
             Key::Named(NamedKey::ArrowDown) => self.nudge_volume(-VOLUME_STEP),
             _ if event.repeat => return,
             Key::Character(c) => match c.to_ascii_lowercase().as_str() {
-                "z" => self.send(Cmd::Prev),
+                "z" => self.prev_track(),
                 "x" => self.send(Cmd::Play),
                 "c" => self.send(Cmd::Pause),
                 "v" => self.send(Cmd::Stop),
-                "b" => self.send(Cmd::Next),
+                "b" => self.next_track(),
                 "l" => self.toggle_host(),
                 _ => return,
             },
@@ -443,6 +510,9 @@ impl App {
         if let Some(eq) = self.eq.as_mut() {
             eq.set_zoom(zoom);
         }
+        if let Some(pl) = self.pl.as_mut() {
+            pl.set_zoom(zoom);
+        }
         self.request_redraw();
     }
 
@@ -461,13 +531,575 @@ impl App {
         self.log(format!("video host visible = {}", self.host_visible));
     }
 
+    // Playlist window.
+
+    /// The playlist's hit target under the pointer.
+    fn pl_hit_under_cursor(&self) -> Option<PlHit> {
+        let (x, y) = self.pl.as_ref()?.skin_pixel()?;
+        hit_test_playlist(
+            self.pl_state.size_steps,
+            self.pl_state.scroll,
+            self.playlist.len(),
+            self.pl_state.open_menu,
+            x,
+            y,
+        )
+    }
+
+    fn modifier_held(&self) -> bool {
+        self.modifiers.shift_key() || self.modifiers.control_key() || self.modifiers.super_key()
+    }
+
+    fn show_pl(&mut self) {
+        if self.pl.is_none() {
+            return;
+        }
+        self.dock_playlist();
+        if let Some(pl) = self.pl.as_ref() {
+            pl.window.set_visible(true);
+        }
+        self.pl_visible = true;
+        self.state.pl_open = true;
+        self.request_redraw();
+    }
+
+    fn hide_pl(&mut self) {
+        self.pl_visible = false;
+        self.state.pl_open = false;
+        self.pl_press = None;
+        self.pl_drag = None;
+        self.pl_state.pressed = None;
+        self.pl_state.hover = None;
+        self.pl_state.open_menu = None;
+        if let Some(pl) = self.pl.as_ref() {
+            pl.window.set_visible(false);
+        }
+        self.request_redraw();
+    }
+
+    fn toggle_pl(&mut self) {
+        if self.pl_visible {
+            self.hide_pl();
+        } else {
+            self.show_pl();
+        }
+    }
+
+    /// Where a playlist docked to a main window at `main_pos` and `main_height` sits: under the
+    /// equalizer when it is open, otherwise under the main window. Both share the main window's
+    /// left edge.
+    fn dock_point(
+        &self,
+        main_pos: PhysicalPosition<i32>,
+        main_height: u32,
+    ) -> PhysicalPosition<i32> {
+        if self.eq_visible {
+            if let Some(eq) = self.eq.as_ref() {
+                if let Ok(eq_pos) = eq.window.outer_position() {
+                    let eq_height = eq.window.inner_size().height as i32;
+                    return PhysicalPosition::new(main_pos.x, eq_pos.y + eq_height);
+                }
+            }
+        }
+        PhysicalPosition::new(main_pos.x, main_pos.y + main_height as i32)
+    }
+
+    /// Moves the playlist to its dock point for the main window as it is now.
+    fn dock_playlist(&self) {
+        let Some(main) = self.main.as_ref() else {
+            return;
+        };
+        let Ok(main_pos) = main.window.outer_position() else {
+            return;
+        };
+        let point = self.dock_point(main_pos, main.window.inner_size().height);
+        if let Some(pl) = self.pl.as_ref() {
+            pl.window.set_outer_position(point);
+        }
+    }
+
+    /// Whether the playlist is at its dock point for a main window at `main_pos` and
+    /// `main_height`. Call this before the windows move, so the equalizer is still where it was.
+    fn pl_docked_for(&self, main_pos: PhysicalPosition<i32>, main_height: u32) -> bool {
+        let Some(pl) = self.pl.as_ref() else {
+            return false;
+        };
+        let Ok(pos) = pl.window.outer_position() else {
+            return false;
+        };
+        pos == self.dock_point(main_pos, main_height)
+    }
+
+    fn pl_docked_now(&self) -> bool {
+        let Some(main) = self.main.as_ref() else {
+            return false;
+        };
+        match main.window.outer_position() {
+            Ok(pos) => self.pl_docked_for(pos, main.window.inner_size().height),
+            Err(_) => false,
+        }
+    }
+
+    /// Resizes the playlist to `steps`: the skin size changes and the window follows.
+    fn set_pl_steps(&mut self, steps: (u32, u32)) {
+        self.pl_state.size_steps = steps;
+        self.pl_state.scroll = plw::clamp_scroll(
+            self.pl_state.scroll,
+            self.playlist.len(),
+            plw::visible_rows(steps),
+        );
+        if let Some(pl) = self.pl.as_mut() {
+            pl.set_base(plw::window_size(steps));
+        }
+        self.request_redraw();
+    }
+
+    fn scroll_pl_by(&mut self, rows: isize) {
+        let max = self
+            .playlist
+            .len()
+            .saturating_sub(plw::visible_rows(self.pl_state.size_steps));
+        let next = (self.pl_state.scroll as isize + rows).clamp(0, max as isize);
+        self.pl_state.scroll = next as usize;
+        self.request_redraw();
+    }
+
+    /// Scrolls so that row `index` is visible.
+    fn show_row(&mut self, index: usize) {
+        self.pl_state.scroll = plw::scroll_to_show(
+            self.pl_state.scroll,
+            index,
+            self.playlist.len(),
+            plw::visible_rows(self.pl_state.size_steps),
+        );
+    }
+
+    /// After the list changed: keeps the scroll within the list and redraws.
+    fn pl_changed(&mut self) {
+        self.pl_state.scroll = plw::clamp_scroll(
+            self.pl_state.scroll,
+            self.playlist.len(),
+            plw::visible_rows(self.pl_state.size_steps),
+        );
+        self.request_redraw();
+    }
+
+    fn on_pl_press(&mut self) {
+        let hit = self.pl_hit_under_cursor();
+        self.pl_press = hit;
+        self.pl_state.pressed = hit;
+        let was_open = self.pl_state.open_menu;
+        // A press anywhere but on an open popup's item closes the popup.
+        if !matches!(hit, Some(PlHit::MenuItem(..))) {
+            self.pl_state.open_menu = None;
+        }
+        match hit {
+            Some(PlHit::TitleBar) => {
+                if let Some(pl) = self.pl.as_ref() {
+                    if let Err(e) = pl.window.drag_window() {
+                        eprintln!("tubeamp: playlist drag failed: {e}");
+                    }
+                }
+            }
+            Some(PlHit::Resize) => {
+                if let Some(cursor) = self.pl.as_ref().and_then(|p| p.cursor_position()) {
+                    self.pl_drag = Some(PlDrag::Resize {
+                        start_steps: self.pl_state.size_steps,
+                        start_cursor: cursor,
+                    });
+                }
+            }
+            Some(PlHit::Scrollbar) => {
+                self.pl_drag = Some(PlDrag::Scroll);
+                self.update_pl_drag();
+            }
+            Some(PlHit::Row(index)) => self.press_pl_row(index),
+            Some(PlHit::List) => {
+                if !self.modifier_held() {
+                    self.playlist.select_none();
+                }
+            }
+            Some(PlHit::Menu(menu)) => {
+                // Clicking the open button again closes it.
+                if was_open != Some(menu) {
+                    self.pl_state.open_menu = Some(menu);
+                }
+            }
+            Some(PlHit::MenuItem(menu, index)) => {
+                self.pl_state.open_menu = None;
+                self.run_pl_menu_item(menu, index);
+            }
+            _ => {}
+        }
+        self.pl_changed();
+    }
+
+    /// A press on a row selects it, the way Webamp does: a plain press on a row outside the
+    /// selection selects only that row, ctrl-press toggles it, shift-press extends from the
+    /// anchor. A second plain press on the same row within [`DOUBLE_CLICK`] plays it.
+    fn press_pl_row(&mut self, index: usize) {
+        if self.modifiers.shift_key() {
+            self.playlist.shift_click(index);
+            return;
+        }
+        if self.modifiers.control_key() || self.modifiers.super_key() {
+            self.playlist.ctrl_click(index);
+            return;
+        }
+        let now = Instant::now();
+        if let Some((last, at)) = self.pl_click {
+            if last == index && now.duration_since(at) <= DOUBLE_CLICK {
+                self.pl_click = None;
+                self.play_index(index);
+                return;
+            }
+        }
+        self.pl_click = Some((index, now));
+        if !self.playlist.is_selected(index) {
+            self.playlist.click(index);
+        }
+        self.pl_drag = Some(PlDrag::Rows {
+            index,
+            last: index,
+            moved: false,
+        });
+    }
+
+    fn on_pl_release(&mut self) {
+        let target = self.pl_press.take();
+        let hit = self.pl_hit_under_cursor();
+        self.pl_state.pressed = None;
+        if let Some(PlDrag::Rows {
+            index,
+            moved: false,
+            ..
+        }) = self.pl_drag.take()
+        {
+            // A plain click on one row of a larger selection leaves only that row selected.
+            if self.playlist.selected().len() > 1 && !self.modifier_held() {
+                self.playlist.click(index);
+            }
+        }
+        if let Some(target) = target {
+            if Some(target) == hit {
+                self.activate_pl(target);
+            }
+        }
+        self.pl_changed();
+    }
+
+    /// Runs the action of a control pressed and released on the same spot.
+    fn activate_pl(&mut self, hit: PlHit) {
+        match hit {
+            PlHit::Close => self.hide_pl(),
+            // Windowshade for the playlist comes with M5; the button is drawn but does nothing yet.
+            PlHit::Shade => {}
+            PlHit::Transport(t) => self.run_pl_transport(t),
+            PlHit::MiniTime => self.state.remaining_mode = !self.state.remaining_mode,
+            _ => {}
+        }
+    }
+
+    fn run_pl_transport(&mut self, t: PlTransport) {
+        match t {
+            PlTransport::Previous => self.prev_track(),
+            PlTransport::Play => self.send(Cmd::Play),
+            PlTransport::Pause => self.send(Cmd::Pause),
+            PlTransport::Stop => self.send(Cmd::Stop),
+            PlTransport::Next => self.next_track(),
+            PlTransport::Eject => self.toggle_host(),
+        }
+    }
+
+    /// Moves whatever the pointer is dragging: the scrollbar thumb, the resize corner, or the
+    /// selected rows.
+    fn update_pl_drag(&mut self) {
+        let Some(drag) = self.pl_drag else {
+            return;
+        };
+        match drag {
+            PlDrag::Scroll => {
+                if let Some((_, y)) = self.pl.as_ref().and_then(|p| p.skin_point()) {
+                    self.pl_state.scroll = plw::scroll_at(
+                        self.pl_state.size_steps,
+                        self.playlist.len(),
+                        y.floor() as i32,
+                    );
+                }
+            }
+            PlDrag::Resize {
+                start_steps,
+                start_cursor,
+            } => {
+                let Some(pl) = self.pl.as_ref() else {
+                    return;
+                };
+                let Some(cursor) = pl.cursor_position() else {
+                    return;
+                };
+                let factor = f64::from(pl.factor());
+                let (w0, h0) = plw::window_size(start_steps);
+                let w = f64::from(w0) + (cursor.x - start_cursor.x) / factor;
+                let h = f64::from(h0) + (cursor.y - start_cursor.y) / factor;
+                let steps = plw::steps_for_size(w.round() as i32, h.round() as i32);
+                if steps != self.pl_state.size_steps {
+                    self.log(format!(
+                        "playlist: resize to {steps:?} (w {w:.1}, h {h:.1}, factor {factor}, cursor {:.1},{:.1} from {:.1},{:.1})",
+                        cursor.x, cursor.y, start_cursor.x, start_cursor.y
+                    ));
+                    self.set_pl_steps(steps);
+                }
+            }
+            PlDrag::Rows {
+                index,
+                last,
+                moved: _,
+            } => {
+                let Some((_, y)) = self.pl.as_ref().and_then(|p| p.skin_point()) else {
+                    return;
+                };
+                let Some(target) = row_index_at(
+                    self.pl_state.size_steps,
+                    self.pl_state.scroll,
+                    self.playlist.len(),
+                    y,
+                ) else {
+                    return;
+                };
+                if target != last {
+                    self.playlist.move_selected(target as isize - last as isize);
+                    self.show_row(target);
+                    self.pl_drag = Some(PlDrag::Rows {
+                        index,
+                        last: target,
+                        moved: true,
+                    });
+                }
+            }
+        }
+        self.pl_changed();
+    }
+
+    fn pl_event(&mut self, event: WindowEvent) {
+        match event {
+            // Closing the playlist window hides it, like the equalizer.
+            WindowEvent::CloseRequested => self.hide_pl(),
+            WindowEvent::RedrawRequested => self.redraw_pl(),
+            WindowEvent::Resized(_) | WindowEvent::ScaleFactorChanged { .. } => {
+                self.request_redraw()
+            }
+            WindowEvent::Focused(focused) => {
+                self.pl_state.focused = focused;
+                self.request_redraw();
+            }
+            WindowEvent::ModifiersChanged(modifiers) => self.modifiers = modifiers.state(),
+            WindowEvent::CursorMoved { position, .. } => {
+                if let Some(pl) = self.pl.as_mut() {
+                    pl.set_cursor(Some(position));
+                }
+                if self.pl_drag.is_some() {
+                    self.update_pl_drag();
+                }
+                self.pl_state.hover = self.pl_hit_under_cursor();
+                self.request_redraw();
+            }
+            WindowEvent::CursorLeft { .. } => {
+                if let Some(pl) = self.pl.as_mut() {
+                    pl.set_cursor(None);
+                }
+                self.pl_state.hover = None;
+                self.request_redraw();
+            }
+            WindowEvent::MouseInput {
+                state,
+                button: MouseButton::Left,
+                ..
+            } => match state {
+                ElementState::Pressed => self.on_pl_press(),
+                ElementState::Released => self.on_pl_release(),
+            },
+            WindowEvent::MouseWheel { delta, .. } => {
+                let rows = match delta {
+                    MouseScrollDelta::LineDelta(_, y) => -(y.round() as isize) * WHEEL_ROWS,
+                    MouseScrollDelta::PixelDelta(p) => {
+                        -((p.y / f64::from(plw::ROW_H)).round() as isize)
+                    }
+                };
+                self.scroll_pl_by(rows);
+            }
+            WindowEvent::KeyboardInput { event, .. } => {
+                // The playlist's own keys first; everything else is the global hotkeys.
+                if self.pl_key(&event) {
+                    self.request_redraw();
+                } else {
+                    self.on_key(&event);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Keys for a focused playlist: Up and Down move the selection (with Shift they extend it),
+    /// Enter plays, Delete or Backspace removes the selected rows, and Ctrl+A selects all. Returns
+    /// whether the key was used.
+    fn pl_key(&mut self, event: &KeyEvent) -> bool {
+        if event.state != ElementState::Pressed {
+            return false;
+        }
+        if self.modifiers.control_key() {
+            let is_a = matches!(event.key_without_modifiers(), Key::Character(c) if c.eq_ignore_ascii_case("a"));
+            if is_a && !event.repeat {
+                self.playlist.select_all();
+                return true;
+            }
+            return false;
+        }
+        match event.key_without_modifiers() {
+            Key::Named(NamedKey::ArrowUp) => self.move_pl_cursor(-1),
+            Key::Named(NamedKey::ArrowDown) => self.move_pl_cursor(1),
+            Key::Named(NamedKey::Enter) if !event.repeat => {
+                let first_selected = self.playlist.selected().iter().next().copied();
+                if let Some(index) = first_selected.or(self.playlist.current()) {
+                    self.play_index(index);
+                }
+            }
+            // Mac keyboards send Backspace for the key labelled Delete.
+            Key::Named(NamedKey::Delete | NamedKey::Backspace) if !event.repeat => {
+                self.playlist.remove_selected()
+            }
+            _ => return false,
+        }
+        self.pl_changed();
+        true
+    }
+
+    /// Moves the selection cursor by `delta` rows from the anchor (or the current entry).
+    fn move_pl_cursor(&mut self, delta: isize) {
+        let len = self.playlist.len();
+        if len == 0 {
+            return;
+        }
+        let base = self.playlist.anchor().or(self.playlist.current());
+        let target = match base {
+            Some(base) => (base as isize + delta).clamp(0, len as isize - 1) as usize,
+            None if delta > 0 => 0,
+            None => len - 1,
+        };
+        if self.modifiers.shift_key() && self.playlist.anchor().is_some() {
+            self.playlist.shift_click(target);
+        } else {
+            self.playlist.click(target);
+        }
+        self.show_row(target);
+    }
+
+    /// Runs the action of popup item `index` of `menu`, if it has one.
+    fn run_pl_menu_item(&mut self, menu: PlMenu, index: usize) {
+        if let Some(action) = pl_app::action_for(menu, index) {
+            self.run_pl_action(action);
+        }
+    }
+
+    fn run_pl_action(&mut self, action: PlAction) {
+        match action {
+            PlAction::AddUrl => match pl_app::clipboard_video_id() {
+                Ok(id) => {
+                    let index = self.playlist.add(Entry::from_id(&id));
+                    self.show_row(index);
+                    self.log(format!("playlist: added {id}"));
+                }
+                Err(msg) => eprintln!("tubeamp: {msg}"),
+            },
+            PlAction::RemoveAll | PlAction::NewList => {
+                self.playlist.clear();
+                self.pl_state.scroll = 0;
+            }
+            PlAction::Crop => self.playlist.crop(),
+            PlAction::RemoveSelected => self.playlist.remove_selected(),
+            PlAction::SelectAll => self.playlist.select_all(),
+            PlAction::SelectNone => self.playlist.select_none(),
+            PlAction::InvertSelection => self.playlist.invert_selection(),
+            PlAction::Sort => self.open_sort_menu(),
+            PlAction::SaveList => self.save_list(),
+            PlAction::LoadList => self.load_list(),
+        }
+        self.pl_changed();
+    }
+
+    /// Shows the MISC ▸ SORT menu at its button. Its choices come back as `UserEvent::Menu`.
+    fn open_sort_menu(&mut self) {
+        let Some(pl) = self.pl.as_ref() else {
+            return;
+        };
+        let zoom = f64::from(pl.zoom());
+        let button = menu_button_rect(self.pl_state.size_steps, PlMenu::Misc);
+        let menu = match pl_app::build_sort_menu() {
+            Ok(menu) => menu,
+            Err(e) => {
+                eprintln!("tubeamp: could not build the sort menu: {e}");
+                return;
+            }
+        };
+        let x = f64::from(button.x) * zoom;
+        let y = f64::from(button.y) * zoom;
+        if let Err(e) = skinned::show_context_menu(&pl.window, &menu, x, y) {
+            eprintln!("tubeamp: could not show the sort menu: {e}");
+        }
+        self.request_redraw();
+    }
+
+    fn run_sort(&mut self, cmd: SortCommand) {
+        match cmd {
+            SortCommand::Title => self.playlist.sort_by_title(),
+            SortCommand::Artist => self.playlist.sort_by_artist(),
+            SortCommand::Reverse => self.playlist.reverse(),
+            SortCommand::Randomize => self.playlist.randomize(&mut self.rng),
+        }
+        self.pl_changed();
+    }
+
+    /// LIST ▸ SAVE: the playlist as a JSON array of entries.
+    fn save_list(&mut self) {
+        let Some(path) = pl_app::pick_list_to_save() else {
+            return;
+        };
+        match std::fs::write(&path, self.playlist.to_json()) {
+            Ok(()) => eprintln!("tubeamp: saved the playlist to {}", path.display()),
+            Err(e) => eprintln!("tubeamp: could not write {}: {e}", path.display()),
+        }
+    }
+
+    /// LIST ▸ LOAD: replaces the playlist with a JSON file written by SAVE.
+    fn load_list(&mut self) {
+        let Some(path) = pl_app::pick_list_to_load() else {
+            return;
+        };
+        let loaded = std::fs::read_to_string(&path)
+            .map_err(|e| e.to_string())
+            .and_then(|text| Playlist::from_json(&text).map_err(|e| e.to_string()));
+        match loaded {
+            Ok(list) => {
+                let count = list.len();
+                self.playlist = list;
+                self.pl_state.scroll = 0;
+                eprintln!("tubeamp: loaded {count} tracks from {}", path.display());
+            }
+            Err(msg) => eprintln!("tubeamp: could not load {}: {msg}", path.display()),
+        }
+    }
+
     // Equalizer window.
 
     fn toggle_eq(&mut self) {
+        // A playlist docked under the equalizer (or the main window) follows the toggle.
+        let attached = self.pl_visible && self.pl_docked_now();
         if self.eq_visible {
             self.hide_eq();
         } else {
             self.show_eq();
+        }
+        if attached {
+            self.dock_playlist();
         }
     }
 
@@ -519,25 +1151,36 @@ impl App {
             .is_some_and(|p| p.y == main_pos.y + main_size.height as i32)
     }
 
-    /// The main window moved: a docked equalizer moves with it. This is a simple attach; full
-    /// snapping comes in M5.
+    /// The main window moved: a docked equalizer and a docked playlist move with it. This is a
+    /// simple attach; full snapping comes in M5.
     fn on_main_moved(&mut self, pos: PhysicalPosition<i32>) {
         match self.main_rect {
             Some((old, size)) => {
+                let pl_attached = self.pl_visible && self.pl_docked_for(old, size.height);
+                let delta_x = pos.x - old.x;
+                let delta_y = pos.y - old.y;
                 if self.eq_visible && self.eq_docked_to(old, size) {
                     if let Some(eq_pos) = self.eq_outer_position() {
-                        let delta_x = pos.x - old.x;
-                        let delta_y = pos.y - old.y;
-                        self.move_eq(PhysicalPosition::new(eq_pos.x + delta_x, eq_pos.y + delta_y));
+                        self.move_eq(PhysicalPosition::new(
+                            eq_pos.x + delta_x,
+                            eq_pos.y + delta_y,
+                        ));
+                    }
+                }
+                if pl_attached {
+                    if let Some(pl) = self.pl.as_ref() {
+                        if let Ok(pl_pos) = pl.window.outer_position() {
+                            pl.window.set_outer_position(PhysicalPosition::new(
+                                pl_pos.x + delta_x,
+                                pl_pos.y + delta_y,
+                            ));
+                        }
                     }
                 }
                 self.main_rect = Some((pos, size));
             }
             None => {
-                self.main_rect = self
-                    .main
-                    .as_ref()
-                    .map(|m| (pos, m.window.inner_size()));
+                self.main_rect = self.main.as_ref().map(|m| (pos, m.window.inner_size()));
             }
         }
     }
@@ -552,10 +1195,14 @@ impl App {
                 .map(|p| (p, size));
             return;
         };
+        let pl_attached = self.pl_visible && self.pl_docked_for(pos, old_size.height);
         if self.eq_visible && self.eq_docked_to(pos, old_size) {
             if let Some(eq_pos) = self.eq_outer_position() {
                 self.move_eq(PhysicalPosition::new(eq_pos.x, pos.y + size.height as i32));
             }
+        }
+        if pl_attached {
+            self.dock_playlist();
         }
         self.main_rect = Some((pos, size));
     }
@@ -743,11 +1390,131 @@ impl App {
                     let level = self.state.volume;
                     self.send(Cmd::Volume { level });
                 }
+                self.follow_playlist();
             }
-            Evt::Ended => self.log("track ended".to_string()),
+            Evt::Ended => {
+                self.log("track ended".to_string());
+                self.on_track_ended();
+            }
             Evt::Error { at, msg } => eprintln!("tubeamp: YouTube Music error at {at}: {msg}"),
+            // Events added later (for example the API results) are not for this window.
+            _ => {}
         }
         self.request_redraw();
+    }
+
+    /// The current entry's video is the one that ended: move the playlist on.
+    fn on_track_ended(&mut self) {
+        let Some(current) = self.playlist.current().and_then(|i| self.playlist.get(i)) else {
+            return;
+        };
+        if self.playback.video_id.as_deref() == Some(current.video_id.as_str()) {
+            self.advance_after_end();
+        }
+    }
+
+    /// Keeps the playlist in step with the player. While the current entry's video is the one
+    /// reported, its missing metadata is filled in, and its end moves the playlist on. A report
+    /// for some other video (YouTube Music autoplaying, say) is ignored.
+    fn follow_playlist(&mut self) {
+        let Some(current) = self.playlist.current() else {
+            return;
+        };
+        let Some(video_id) = self.playlist.get(current).map(|e| e.video_id.clone()) else {
+            return;
+        };
+        if self.playback.video_id.as_deref() != Some(video_id.as_str()) {
+            return;
+        }
+        self.fill_metadata(current);
+        match self.playback.ps {
+            Some(0) => self.advance_after_end(),
+            Some(1..=3) => self.ended_done = false,
+            _ => {}
+        }
+    }
+
+    /// Copies title, artist and length from the player into entry `index`, where the entry has
+    /// none yet. A title that is only the video id counts as none.
+    fn fill_metadata(&mut self, index: usize) {
+        let title = self.playback.title.trim().to_string();
+        let author = self.playback.author.trim().to_string();
+        let duration = self.playback.duration_secs;
+        let Some(entry) = self.playlist.get_mut(index) else {
+            return;
+        };
+        if !title.is_empty() && (entry.title.trim().is_empty() || entry.title == entry.video_id) {
+            entry.title = title;
+        }
+        if entry.artist.trim().is_empty() && !author.is_empty() {
+            entry.artist = author;
+        }
+        if entry.duration_secs.is_none() && duration > 0 {
+            entry.duration_secs = Some(duration);
+        }
+    }
+
+    /// Moves the playlist on from the current entry, once per entry. The playlist picks the next
+    /// entry (shuffle and repeat included), and nothing plays when the list is finished.
+    fn advance_after_end(&mut self) {
+        if self.ended_done || self.playlist.current().is_none() {
+            return;
+        }
+        self.ended_done = true;
+        match self
+            .playlist
+            .next(self.state.shuffle, self.state.repeat, &mut self.rng)
+        {
+            Some(index) => self.play_index(index),
+            None => self.log("playlist: end of the list".to_string()),
+        }
+    }
+
+    /// Loads playlist entry `index` and makes it current.
+    fn play_index(&mut self, index: usize) {
+        let Some(video_id) = self.playlist.get(index).map(|e| e.video_id.clone()) else {
+            return;
+        };
+        self.playlist.set_current(Some(index));
+        self.show_row(index);
+        self.log(format!("playlist: play {}", index + 1));
+        self.send(Cmd::Load { video_id });
+        self.request_redraw();
+    }
+
+    /// The main window's Next button and the B key. Without a playlist it is YouTube Music's own.
+    fn next_track(&mut self) {
+        if self.playlist.is_empty() {
+            self.send(Cmd::Next);
+            return;
+        }
+        match self
+            .playlist
+            .next(self.state.shuffle, self.state.repeat, &mut self.rng)
+        {
+            Some(index) => self.play_index(index),
+            None => self.send(Cmd::Stop),
+        }
+    }
+
+    /// The main window's Previous button and the Z key. As Winamp does, more than three seconds
+    /// into a track rewinds it; at the start of the list the track restarts.
+    fn prev_track(&mut self) {
+        if self.playlist.is_empty() {
+            self.send(Cmd::Prev);
+            return;
+        }
+        if self.playback.time_secs > 3 {
+            self.send(Cmd::Seek { secs: 0.0 });
+            return;
+        }
+        match self
+            .playlist
+            .prev(self.state.shuffle, self.state.repeat, &mut self.rng)
+        {
+            Some(index) => self.play_index(index),
+            None => self.send(Cmd::Seek { secs: 0.0 }),
+        }
     }
 
     fn log_transitions(&self, before: &Playback) {
@@ -764,6 +1531,20 @@ impl App {
         if before.codec != now.codec {
             self.log(format!("codec {:?}", now.codec));
         }
+    }
+
+    /// The main marquee text. A track that is in the playlist shows its playlist number.
+    fn marquee_text(&self) -> String {
+        let number = self
+            .playlist
+            .current()
+            .filter(|&i| {
+                self.playlist
+                    .get(i)
+                    .is_some_and(|e| self.playback.video_id.as_deref() == Some(e.video_id.as_str()))
+            })
+            .map_or(labels::TRACK_NUMBER, |i| (i + 1) as u32);
+        self.playback.marquee_text_numbered(number)
     }
 
     /// Copies playback and drag state into the main window's state.
@@ -796,9 +1577,13 @@ impl App {
                 }
                 Some(Drag::Volume) => labels::volume_text(self.state.volume),
                 Some(Drag::Balance) => labels::balance_text(self.state.balance),
-                _ => p.marquee_text(),
+                _ => self.marquee_text(),
             }
         };
+        // The playlist's mini time follows the main window's time mode while playing or paused.
+        self.pl_state.mini_time_secs =
+            (self.state.status != Status::Stop).then(|| displayed_secs(&self.state));
+        self.pl_state.mini_remaining = self.state.remaining_mode;
     }
 
     fn try_start_audio(&mut self, now: Instant) {
@@ -847,6 +1632,14 @@ impl App {
         canvas
     }
 
+    /// The playlist window as it looks now, at its current size.
+    fn pl_canvas(&self) -> Canvas {
+        let (w, h) = plw::window_size(self.pl_state.size_steps);
+        let mut canvas = Canvas::new(w, h);
+        render_playlist(&self.skin, &self.playlist, &self.pl_state, &mut canvas);
+        canvas
+    }
+
     fn redraw_main(&mut self) {
         let canvas = self.main_canvas();
         if let Some(main) = self.main.as_mut() {
@@ -864,6 +1657,16 @@ impl App {
         }
     }
 
+    fn redraw_pl(&mut self) {
+        if !self.pl_visible {
+            return;
+        }
+        let canvas = self.pl_canvas();
+        if let Some(pl) = self.pl.as_mut() {
+            pl.present(&canvas);
+        }
+    }
+
     fn save_screenshot(&self) {
         let Some((_, path)) = &self.opts.screenshot else {
             return;
@@ -876,6 +1679,15 @@ impl App {
                 eqw::WIDTH * 2,
                 eqw::HEIGHT * 2,
                 &eq_path,
+            );
+        }
+        if self.pl_visible {
+            let canvas = self.pl_canvas();
+            save_one(
+                &scaled(&canvas, 2),
+                canvas.w * 2,
+                canvas.h * 2,
+                &suffixed_path(path, "pl"),
             );
         }
     }
@@ -1058,25 +1870,37 @@ impl ApplicationHandler<UserEvent> for App {
                 return;
             }
         };
-        let eq_attributes = WindowAttributes::default()
-            .with_title("TubeAmp Equalizer")
+        let (pl_w, pl_h) = plw::window_size(self.pl_state.size_steps);
+        let pl_attributes = WindowAttributes::default()
+            .with_title("TubeAmp Playlist")
             .with_decorations(false)
+            // Not resizable by the OS: the corner handle resizes it in steps (see `PlDrag::Resize`).
             .with_resizable(false)
             .with_visible(false)
-            .with_inner_size(LogicalSize::new(eqw::WIDTH * zoom, eqw::HEIGHT * zoom));
-        let eq = match SkinnedWindow::new(
-            event_loop,
-            eq_attributes,
-            (eqw::WIDTH, eqw::HEIGHT),
-            zoom,
-        ) {
-            Ok(eq) => eq,
+            .with_inner_size(LogicalSize::new(pl_w * zoom, pl_h * zoom));
+        let pl = match SkinnedWindow::new(event_loop, pl_attributes, (pl_w, pl_h), zoom) {
+            Ok(pl) => pl,
             Err(e) => {
                 eprintln!("tubeamp: {e}");
                 event_loop.exit();
                 return;
             }
         };
+        let eq_attributes = WindowAttributes::default()
+            .with_title("TubeAmp Equalizer")
+            .with_decorations(false)
+            .with_resizable(false)
+            .with_visible(false)
+            .with_inner_size(LogicalSize::new(eqw::WIDTH * zoom, eqw::HEIGHT * zoom));
+        let eq =
+            match SkinnedWindow::new(event_loop, eq_attributes, (eqw::WIDTH, eqw::HEIGHT), zoom) {
+                Ok(eq) => eq,
+                Err(e) => {
+                    eprintln!("tubeamp: {e}");
+                    event_loop.exit();
+                    return;
+                }
+            };
 
         let host_attributes = WindowAttributes::default()
             .with_title("TubeAmp Video")
@@ -1121,6 +1945,13 @@ impl ApplicationHandler<UserEvent> for App {
         if self.opts.open_eq {
             self.show_eq();
         }
+        self.pl = Some(pl);
+        for id in self.opts.add.clone() {
+            self.playlist.add(Entry::from_id(&id));
+        }
+        if self.opts.open_pl {
+            self.show_pl();
+        }
         self.request_redraw();
     }
 
@@ -1131,6 +1962,8 @@ impl ApplicationHandler<UserEvent> for App {
                 self.log(format!("menu item {id}"));
                 if let Some(cmd) = eq::command_for_id(&id) {
                     self.run_eq_command(cmd);
+                } else if let Some(cmd) = pl_app::sort_command_for_id(&id) {
+                    self.run_sort(cmd);
                 }
             }
         }
@@ -1146,6 +1979,8 @@ impl ApplicationHandler<UserEvent> for App {
             self.host_event(event);
         } else if self.eq.as_ref().is_some_and(|e| e.id() == window_id) {
             self.eq_event(event);
+        } else if self.pl.as_ref().is_some_and(|p| p.id() == window_id) {
+            self.pl_event(event);
         } else if self.main.as_ref().is_some_and(|m| m.id() == window_id) {
             self.main_event(event_loop, event);
         }

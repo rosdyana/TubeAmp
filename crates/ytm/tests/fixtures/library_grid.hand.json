@@ -1,0 +1,70 @@
+{
+  "responseContext": {"serviceTrackingParams": []},
+  "contents": {
+    "singleColumnBrowseResultsRenderer": {
+      "tabs": [
+        {
+          "tabRenderer": {
+            "title": "Library",
+            "content": {
+              "sectionListRenderer": {
+                "contents": [
+                  {
+                    "gridRenderer": {
+                      "header": {
+                        "gridHeaderRenderer": {
+                          "title": {"runs": [{"text": "Playlists"}]}
+                        }
+                      },
+                      "items": [
+                        {
+                          "musicTwoRowItemRenderer": {
+                            "thumbnailRenderer": {
+                              "musicThumbnailRenderer": {
+                                "thumbnail": {"thumbnails": [{"url": "https://example.test/liked-60.jpg", "width": 60, "height": 60}, {"url": "https://example.test/liked-544.jpg", "width": 544, "height": 544}]}
+                              }
+                            },
+                            "title": {"runs": [{"text": "Liked Music", "navigationEndpoint": {"browseEndpoint": {"browseId": "VLLM"}}}]},
+                            "subtitle": {"runs": [{"text": "Playlist"}, {"text": " • "}, {"text": "312 songs"}]},
+                            "navigationEndpoint": {"browseEndpoint": {"browseId": "VLLM"}}
+                          }
+                        },
+                        {
+                          "musicTwoRowItemRenderer": {
+                            "thumbnailRenderer": {
+                              "musicThumbnailRenderer": {
+                                "thumbnail": {"thumbnails": [{"url": "https://example.test/mix-544.jpg", "width": 544, "height": 544}]}
+                              }
+                            },
+                            "title": {"runs": [{"text": "Road trip"}]},
+                            "subtitle": {"runs": [{"text": "Playlist"}, {"text": " • "}, {"text": "Sample Author"}, {"text": " • "}, {"text": "18 songs"}]},
+                            "navigationEndpoint": {"browseEndpoint": {"browseId": "VLPLhand0trip0list", "browseEndpointContextSupportedConfigs": {"browseEndpointContextMusicConfig": {"pageType": "MUSIC_PAGE_TYPE_PLAYLIST"}}}}
+                          }
+                        },
+                        {
+                          "musicTwoRowItemRenderer": {
+                            "thumbnailRenderer": {
+                              "musicThumbnailRenderer": {
+                                "thumbnail": {"thumbnails": [{"url": "https://example.test/album-544.jpg", "width": 544, "height": 544}]}
+                              }
+                            },
+                            "title": {"runs": [{"text": "Discovery"}]},
+                            "subtitle": {"runs": [{"text": "Album"}, {"text": " • "}, {"text": "Daft Punk", "navigationEndpoint": {"browseEndpoint": {"browseId": "UCRr1xG_2WIDs18a6cIiCxeA"}}}, {"text": " • "}, {"text": "2001"}]},
+                            "navigationEndpoint": {"browseEndpoint": {"browseId": "MPREb_7ltM34kr0mH", "browseEndpointContextSupportedConfigs": {"browseEndpointContextMusicConfig": {"pageType": "MUSIC_PAGE_TYPE_ALBUM"}}}}
+                          }
+                        }
+                      ],
+                      "continuations": [
+                        {"nextContinuationData": {"continuation": "HAND_LIBRARY_TOKEN_1"}}
+                      ]
+                    }
+                  }
+                ]
+              }
+            }
+          }
+        }
+      ]
+    }
+  }
+}

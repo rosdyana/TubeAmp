@@ -21,3 +21,6 @@ tubeamp-eq = { version = "0.0.0", path = "../eq" }
 muda = "0.21"
 rfd = "0.18"
 raw-window-handle = "0.6"
+arboard = "3.7.0"
+tubeamp-playlist = { version = "0.0.0", path = "../playlist" }
+fastrand = "2"

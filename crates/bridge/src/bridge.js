@@ -2,8 +2,13 @@
 //
 // Reads the player and posts snapshots to Rust, and runs the commands Rust sends.
 // Wire format: JSON objects tagged by "t", see crates/bridge/src/proto.rs.
-//   page -> Rust: window.ipc.postMessage(JSON.stringify({t: "state" | "ended" | "error", ...}))
-//   Rust -> page: window.__tubeamp.cmd({t: "play" | "pause" | ..., ...})
+//   page -> Rust: window.ipc.postMessage(JSON.stringify({t: "state" | "ended" | "error" | "ready" | "apiresult", ...}))
+//   Rust -> page: window.__tubeamp.cmd({t: "play" | "pause" | "api" | ..., ...})
+//
+// InnerTube: {t: "api", req, endpoint, body} runs a same-origin POST to /youtubei/v1/<endpoint>
+// from inside the page, so the page's cookies and ytcfg apply. The page posts {t: "ready",
+// signed_in} once ytcfg has INNERTUBE_CONTEXT, and requests sent before that wait in a queue.
+// The answer is {t: "apiresult", req, ok, status, body}, with the raw response text in body.
 //
 // Audio is not handled here on macOS: the EQ and the analyser run in Rust on a Core Audio tap of
 // the WebKit process. There is no Web Audio graph in this file.
@@ -110,7 +115,87 @@
     }
   };
 
+  // ---- InnerTube requests ----------------------------------------------------------------------
+
+  const ytcfgGet = (key) => {
+    try {
+      return window.ytcfg && window.ytcfg.get ? window.ytcfg.get(key) : null;
+    } catch (_) {
+      return null;
+    }
+  };
+
+  // Value of a cookie by exact name, or null.
+  const cookie = (name) => {
+    for (const part of document.cookie.split(";")) {
+      const t = part.trim();
+      if (t.startsWith(name + "=")) return t.slice(name.length + 1);
+    }
+    return null;
+  };
+
+  const sha1Hex = async (text) => {
+    const digest = await crypto.subtle.digest("SHA-1", new TextEncoder().encode(text));
+    return Array.from(new Uint8Array(digest), (b) => b.toString(16).padStart(2, "0")).join("");
+  };
+
+  // The web client's Authorization header: SAPISIDHASH <ts>_<sha1("<ts> <SAPISID> <origin>")>.
+  // Null when the SAPISID cookie is not readable, which means logged-out results.
+  const authorization = async (origin) => {
+    const sid = cookie("SAPISID") || cookie("__Secure-3PAPISID");
+    if (!sid) return null;
+    const ts = Math.floor(Date.now() / 1000);
+    return `SAPISIDHASH ${ts}_${await sha1Hex(`${ts} ${sid} ${origin}`)}`;
+  };
+
+  const runApi = async (c) => {
+    const origin = location.origin;
+    let status = 0;
+    try {
+      const headers = {
+        "Content-Type": "application/json",
+        "X-Goog-AuthUser": "0",
+        "X-Origin": origin,
+      };
+      const auth = await authorization(origin);
+      if (auth) headers["Authorization"] = auth;
+      const body = { context: ytcfgGet("INNERTUBE_CONTEXT"), ...(c.body || {}) };
+      const res = await fetch(`/youtubei/v1/${c.endpoint}?prettyPrint=false`, {
+        method: "POST",
+        headers,
+        credentials: "same-origin",
+        body: JSON.stringify(body),
+      });
+      status = res.status;
+      const text = await res.text();
+      post({ t: "apiresult", req: c.req, ok: res.ok, status, body: text });
+    } catch (e) {
+      post({ t: "apiresult", req: c.req, ok: false, status, body: String(e) });
+    }
+  };
+
+  const api = { ready: false, queue: [] };
+
+  const request = (c) => {
+    if (api.ready) runApi(c);
+    else api.queue.push(c);
+  };
+
+  const waitForYtcfg = () => {
+    if (!ytcfgGet("INNERTUBE_CONTEXT")) {
+      setTimeout(waitForYtcfg, 500);
+      return;
+    }
+    api.ready = true;
+    post({ t: "ready", signed_in: !!ytcfgGet("LOGGED_IN") });
+    for (const c of api.queue.splice(0)) runApi(c);
+  };
+
   T.cmd = (c) => {
+    if (c.t === "api") {
+      request(c);
+      return;
+    }
     const p = player();
     if (!p) return;
     try {
@@ -154,4 +239,5 @@
   };
 
   tick();
+  waitForYtcfg();
 })();

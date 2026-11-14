@@ -9,3 +9,5 @@ description = "Winamp-style main window rendering (canvas, TEXT.BMP font, marque
 tubeamp-skin = { path = "../skin" }
 tubeamp-audio = { path = "../audio" }
 tubeamp-eq = { version = "0.0.0", path = "../eq" }
+fontdue = "0.9.5"
+tubeamp-playlist = { version = "0.0.0", path = "../playlist" }

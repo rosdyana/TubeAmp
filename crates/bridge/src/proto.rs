@@ -26,6 +26,14 @@ pub enum Cmd {
     Volume { level: u8 },
     /// `loadVideoById(video_id)`: load and start a video.
     Load { video_id: String },
+    /// Calls YouTube Music's InnerTube `endpoint` (e.g. `"search"`, `"browse"`, `"next"`) from
+    /// inside the page with `body` merged over the page's `INNERTUBE_CONTEXT`. Waits until the page
+    /// is ready. The answer comes back as `Evt::ApiResult` with the same `req`.
+    Api {
+        req: u64,
+        endpoint: String,
+        body: serde_json::Value,
+    },
 }
 
 /// Page → Rust, posted with `window.ipc.postMessage(JSON)`.
@@ -64,6 +72,16 @@ pub enum Evt {
         at: String,
         msg: String,
     },
+    /// The page's `ytcfg` is ready, so InnerTube requests can run. Posted once per page load.
+    Ready { signed_in: bool },
+    /// The answer to `Cmd::Api` with the same `req`. `body` is the raw response text when `ok`,
+    /// otherwise an error message. `status` is the HTTP status, or 0 when the request never got one.
+    ApiResult {
+        req: u64,
+        ok: bool,
+        status: u16,
+        body: String,
+    },
 }
 
 #[cfg(test)]
@@ -95,6 +113,31 @@ mod tests {
         round_trip_cmd(Cmd::Load {
             video_id: "kJQP7kiw5Fk".to_string(),
         });
+        round_trip_cmd(Cmd::Api {
+            req: 7,
+            endpoint: "search".to_string(),
+            body: serde_json::json!({"query": "daft punk", "params": "EgWKAQIIAWoKEAMQBBAJEAoQBQ=="}),
+        });
+    }
+
+    #[test]
+    fn api_cmd_wire_format_matches_bridge_js() {
+        let json = serde_json::to_string(&Cmd::Api {
+            req: 7,
+            endpoint: "browse".to_string(),
+            body: serde_json::json!({"browseId": "FEmusic_home"}),
+        })
+        .unwrap();
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            value,
+            serde_json::json!({
+                "t": "api",
+                "req": 7,
+                "endpoint": "browse",
+                "body": {"browseId": "FEmusic_home"}
+            })
+        );
     }
 
     #[test]
@@ -147,6 +190,41 @@ mod tests {
             at: "cmd:seek".to_string(),
             msg: "boom".to_string(),
         });
+        round_trip_evt(Evt::Ready { signed_in: true });
+        round_trip_evt(Evt::Ready { signed_in: false });
+        round_trip_evt(Evt::ApiResult {
+            req: 7,
+            ok: true,
+            status: 200,
+            body: r#"{"responseContext":{}}"#.to_string(),
+        });
+        round_trip_evt(Evt::ApiResult {
+            req: 8,
+            ok: false,
+            status: 0,
+            body: "TypeError: Failed to fetch".to_string(),
+        });
+    }
+
+    #[test]
+    fn ready_and_api_result_parse_from_bridge_js_shape() {
+        assert_eq!(
+            serde_json::from_str::<Evt>(r#"{"t":"ready","signed_in":true}"#).unwrap(),
+            Evt::Ready { signed_in: true }
+        );
+        assert_eq!(
+            serde_json::from_str::<Evt>(
+                r#"{"t":"apiresult","req":3,"ok":false,"status":403,"body":"forbidden"}"#
+            )
+            .unwrap(),
+            Evt::ApiResult {
+                req: 3,
+                ok: false,
+                status: 403,
+                body: "forbidden".to_string()
+            }
+        );
+        assert!(serde_json::from_str::<Evt>(r#"{"t":"ready"}"#).is_err());
     }
 
     #[test]

@@ -49,7 +49,7 @@ pub fn build_presets_menu() -> Result<muda::Menu, muda::Error> {
     for (i, preset) in BUILTIN.iter().enumerate() {
         load.append(&MenuItem::with_id(
             format!("{PRESET_PREFIX}{i}"),
-            preset.name,
+            crate::menu_label::escape(preset.name),
             true,
             None,
         ))?;

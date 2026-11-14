@@ -156,7 +156,7 @@ pub fn build_submenu(current: &Choice, skins: &[SkinFile]) -> Result<muda::Subme
     let menu = Submenu::new("Skins", true);
     menu.append(&CheckMenuItem::with_id(
         Choice::Default.menu_id(),
-        DEFAULT_LABEL,
+        crate::menu_label::escape(DEFAULT_LABEL),
         true,
         *current == Choice::Default,
         None,
@@ -165,7 +165,7 @@ pub fn build_submenu(current: &Choice, skins: &[SkinFile]) -> Result<muda::Subme
         let choice = Choice::File(skin.path.clone());
         menu.append(&CheckMenuItem::with_id(
             choice.menu_id(),
-            &skin.label,
+            crate::menu_label::escape(&skin.label),
             true,
             *current == choice,
             None,

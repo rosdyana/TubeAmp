@@ -1,3 +1,9 @@
+//! What the app shows and does for the OS media controls (the Now Playing entry and the media
+//! keys). On macOS the page's media session is the one Now Playing entry: the bridge sets its
+//! metadata from `Cmd::NowPlaying` and turns its actions into `Evt::Media`, which
+//! [`media_action`] maps here. Windows still uses souvlaki (SMTC), and the TODO in `Cargo.toml`
+//! says why it is unverified.
+
 //! OS media keys and Now Playing, through `souvlaki`: MPNowPlayingInfoCenter and the remote command
 //! center on macOS, the System Media Transport Controls on Windows.
 //!
@@ -11,6 +17,8 @@
 pub enum MediaAction {
     Play,
     Pause,
+    /// Windows' SMTC play/pause key. The page's media session sends play or pause instead.
+    #[cfg(target_os = "windows")]
     Toggle,
     Next,
     Previous,
@@ -23,6 +31,31 @@ pub enum MediaAction {
 
 /// The seek step for a "seek forward or backward" event that gives no amount: the arrow keys' 5 s.
 pub const DEFAULT_SEEK_SECS: f64 = 5.0;
+
+/// The app action for a media-session action the page reports (`Evt::Media`). `seek_time` is the
+/// position for `seekto`, and the offset for `seekbackward` and `seekforward`. Unknown actions, and
+/// a `seekto` without a position, give `None`.
+pub fn media_action(action: &str, seek_time: Option<f64>) -> Option<MediaAction> {
+    let finite = seek_time.filter(|secs| secs.is_finite());
+    match action {
+        "play" => Some(MediaAction::Play),
+        "pause" => Some(MediaAction::Pause),
+        "stop" => Some(MediaAction::Stop),
+        "previoustrack" => Some(MediaAction::Previous),
+        "nexttrack" => Some(MediaAction::Next),
+        "seekto" => finite.map(|secs| MediaAction::Seek(secs.max(0.0))),
+        "seekforward" | "seekbackward" => {
+            let amount = finite
+                .filter(|secs| *secs > 0.0)
+                .unwrap_or(DEFAULT_SEEK_SECS);
+            Some(MediaAction::SeekBy(seek_secs(
+                action == "seekforward",
+                amount,
+            )))
+        }
+        _ => None,
+    }
+}
 
 /// What Now Playing shows for the current track.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -92,13 +125,13 @@ pub fn seek_secs(forward: bool, amount: f64) -> f64 {
 }
 
 /// The app's own media controls, one set per main window.
-#[cfg(any(target_os = "macos", target_os = "windows"))]
+#[cfg(target_os = "windows")]
 pub struct NowPlaying {
     controls: souvlaki::MediaControls,
     sent: Sent,
 }
 
-#[cfg(any(target_os = "macos", target_os = "windows"))]
+#[cfg(target_os = "windows")]
 impl NowPlaying {
     /// Registers the controls. `on_action` runs for each media key or Now Playing request, on the
     /// thread that runs the OS callbacks (the main thread on macOS). It should only forward the
@@ -159,7 +192,7 @@ impl NowPlaying {
     }
 }
 
-#[cfg(any(target_os = "macos", target_os = "windows"))]
+#[cfg(target_os = "windows")]
 fn non_empty(text: &str) -> Option<&str> {
     let trimmed = text.trim();
     (!trimmed.is_empty()).then_some(trimmed)
@@ -175,14 +208,9 @@ fn window_handle_for_os(window: &winit::window::Window) -> Option<*mut std::ffi:
     }
 }
 
-#[cfg(target_os = "macos")]
-fn window_handle_for_os(_window: &winit::window::Window) -> Option<*mut std::ffi::c_void> {
-    None
-}
-
 /// Maps a souvlaki event to an action. Events the app does not use (volume, shuffle, open URI)
 /// give `None`.
-#[cfg(any(target_os = "macos", target_os = "windows"))]
+#[cfg(target_os = "windows")]
 fn map_event(event: souvlaki::MediaControlEvent) -> Option<MediaAction> {
     use souvlaki::{MediaControlEvent as E, SeekDirection};
     let forward = |dir: SeekDirection| matches!(dir, SeekDirection::Forward);
@@ -204,22 +232,6 @@ fn map_event(event: souvlaki::MediaControlEvent) -> Option<MediaAction> {
         E::SetPosition(position) => Some(MediaAction::Seek(position.0.as_secs_f64())),
         _ => None,
     }
-}
-
-/// Stand-in on other platforms: there are no media keys to register.
-#[cfg(not(any(target_os = "macos", target_os = "windows")))]
-pub struct NowPlaying;
-
-#[cfg(not(any(target_os = "macos", target_os = "windows")))]
-impl NowPlaying {
-    pub fn new(
-        _window: &winit::window::Window,
-        _on_action: impl Fn(MediaAction) + Send + 'static,
-    ) -> Result<NowPlaying, String> {
-        Err("media keys need macOS or Windows".to_string())
-    }
-
-    pub fn update(&mut self, _track: &Track, _state: State, _secs: u32) {}
 }
 
 #[cfg(test)]
@@ -286,5 +298,53 @@ mod tests {
         assert_eq!(seek_secs(true, 5.0), 5.0);
         assert_eq!(seek_secs(false, 5.0), -5.0);
         assert_eq!(seek_secs(false, 0.0), 0.0);
+    }
+
+    #[test]
+    fn the_transport_actions_map_to_the_app_actions() {
+        assert_eq!(media_action("play", None), Some(MediaAction::Play));
+        assert_eq!(media_action("pause", None), Some(MediaAction::Pause));
+        assert_eq!(media_action("stop", None), Some(MediaAction::Stop));
+        assert_eq!(media_action("nexttrack", None), Some(MediaAction::Next));
+        assert_eq!(media_action("previoustrack", None), Some(MediaAction::Previous));
+    }
+
+    #[test]
+    fn seek_to_takes_the_position_and_clamps_it_at_zero() {
+        assert_eq!(media_action("seekto", Some(83.5)), Some(MediaAction::Seek(83.5)));
+        assert_eq!(media_action("seekto", Some(-2.0)), Some(MediaAction::Seek(0.0)));
+        assert_eq!(media_action("seekto", None), None);
+        assert_eq!(media_action("seekto", Some(f64::NAN)), None);
+    }
+
+    #[test]
+    fn seek_forward_and_backward_use_the_offset_or_the_default_step() {
+        assert_eq!(
+            media_action("seekforward", Some(10.0)),
+            Some(MediaAction::SeekBy(10.0))
+        );
+        assert_eq!(
+            media_action("seekbackward", Some(10.0)),
+            Some(MediaAction::SeekBy(-10.0))
+        );
+        assert_eq!(
+            media_action("seekforward", None),
+            Some(MediaAction::SeekBy(DEFAULT_SEEK_SECS))
+        );
+        assert_eq!(
+            media_action("seekbackward", None),
+            Some(MediaAction::SeekBy(-DEFAULT_SEEK_SECS))
+        );
+        // An offset of zero or less is not a seek, so the default step is used.
+        assert_eq!(
+            media_action("seekbackward", Some(0.0)),
+            Some(MediaAction::SeekBy(-DEFAULT_SEEK_SECS))
+        );
+    }
+
+    #[test]
+    fn unknown_actions_map_to_nothing() {
+        assert_eq!(media_action("togglePlayPause", None), None);
+        assert_eq!(media_action("", None), None);
     }
 }

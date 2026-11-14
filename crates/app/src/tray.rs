@@ -182,7 +182,7 @@ mod native {
             if self.shown.as_ref() == Some(&labels) {
                 return;
             }
-            self.now.set_text(&labels.now);
+            self.now.set_text(crate::menu_label::escape(&labels.now));
             self.play_pause
                 .set_text(if labels.playing { "Pause" } else { "Play" });
             let _ = self

@@ -28,7 +28,9 @@ use crate::eq;
 use crate::firstrun;
 use crate::layout::Win;
 use crate::library;
-use crate::nowplaying::{MediaAction, NowPlaying, State, Track};
+#[cfg(target_os = "windows")]
+use crate::nowplaying::NowPlaying;
+use crate::nowplaying::{MediaAction, Sent, State, Track};
 use crate::skinned;
 use crate::skins::{self, Choice};
 use crate::tray::{self, Labels, Tray};
@@ -92,6 +94,10 @@ pub struct Session {
     /// Until when the tray's playback items are ignored. Set when the first-run dialog closes: the
     /// dialog is modal, so events it leaves behind must not start or stop playback.
     tray_quiet_until: Option<Instant>,
+    /// The track last sent to the page's media session (see `sync_system`).
+    now_playing: Sent,
+    /// Windows' SMTC controls (souvlaki). macOS and the others use the page's media session.
+    #[cfg(target_os = "windows")]
     media: Option<NowPlaying>,
     tray: Option<Tray>,
 }
@@ -131,6 +137,8 @@ impl Session {
             hidden: false,
             first_run,
             tray_quiet_until: None,
+            now_playing: Sent::default(),
+            #[cfg(target_os = "windows")]
             media: None,
             tray: None,
         }
@@ -482,8 +490,11 @@ impl App {
 
     // Media keys, Now Playing and the tray.
 
-    /// Registers the media controls and the tray icon. Called once the main window exists.
+    /// Registers the media controls and the tray icon. Called once the main window exists. On macOS
+    /// there is nothing to register: the page's media session is the Now Playing entry, and its
+    /// actions come back as `Evt::Media`.
     pub(super) fn start_system_integration(&mut self) {
+        #[cfg(target_os = "windows")]
         if let Some(main) = self.main.as_ref() {
             let proxy = self.proxy.clone();
             match NowPlaying::new(&main.window, move |action| {
@@ -504,6 +515,7 @@ impl App {
         match action {
             MediaAction::Play => self.send(Cmd::Play),
             MediaAction::Pause => self.send(Cmd::Pause),
+            #[cfg(target_os = "windows")]
             MediaAction::Toggle => self.send(Cmd::Toggle),
             MediaAction::Stop => self.send(Cmd::Stop),
             MediaAction::Next => self.next_track(),
@@ -516,7 +528,14 @@ impl App {
         self.request_redraw();
     }
 
+    /// Makes the next sync send the track again: a page has just loaded, and its media session
+    /// is new, so it has none of the track yet.
+    pub(super) fn forget_now_playing(&mut self) {
+        self.session.now_playing = Sent::default();
+    }
+
     /// Pushes the track and the playback state to Now Playing and the tray, when they changed.
+    /// The track goes to the page's media session (`Cmd::NowPlaying`), and on Windows to SMTC.
     pub(super) fn sync_system(&mut self, now: Instant) {
         let status = self.display_status();
         let (track, state, secs) = if self.playback.video_id.is_some() {
@@ -533,6 +552,15 @@ impl App {
         } else {
             (Track::default(), State::Stopped, 0)
         };
+        if let Some(new_track) = self.session.now_playing.update(&track, state, secs).track {
+            self.send(Cmd::NowPlaying {
+                title: new_track.title,
+                artist: new_track.artist,
+                album: String::new(),
+                artwork: new_track.cover_url,
+            });
+        }
+        #[cfg(target_os = "windows")]
         if let Some(media) = self.session.media.as_mut() {
             media.update(&track, state, secs);
         }

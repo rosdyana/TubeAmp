@@ -44,12 +44,13 @@ use winit::event::{ElementState, KeyEvent, MouseButton, MouseScrollDelta, Window
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
 use winit::keyboard::{Key, ModifiersState, NamedKey};
 use winit::platform::modifier_supplement::KeyEventExtModifierSupplement;
-use winit::window::{Fullscreen, WindowAttributes, WindowId};
+use winit::window::{WindowAttributes, WindowId};
 
-use crate::config::{Loaded, Setup};
+use crate::config::{self, Loaded, Setup};
 use crate::eq::{self, EqCommand};
 use crate::hotkeys::{self, KeyName, Shortcut, Stroke};
 use crate::layout::{self, Bx, Win, SNAP_DISTANCE};
+#[cfg(target_os = "windows")]
 use crate::nowplaying::MediaAction;
 use crate::library::{self, Action, LibCommand, Library};
 use crate::milkdrop::{self, Effect as MilkdropEffect, Msg as MilkdropMsg, MilkdropWindow};
@@ -166,7 +167,8 @@ pub enum UserEvent {
     Menu(String),
     /// A message from the Milkdrop window's page.
     Milkdrop(MilkdropMsg),
-    /// A media key or Now Playing request from the OS (see `nowplaying.rs`).
+    /// A media key or Now Playing request from the OS (Windows' SMTC, see `nowplaying.rs`).
+    #[cfg(target_os = "windows")]
     Media(MediaAction),
     /// The classic skin download finished: the file, or why it failed.
     Download(Result<PathBuf, String>),
@@ -1666,19 +1668,14 @@ impl App {
         hit_test_library(&self.library.state, x, y)
     }
 
-    /// Shows the library. The first time, it goes to the right of the main window.
+    /// Shows the library. The first time, it goes to its default place (see `default_origin`).
     fn show_library(&mut self) {
         let Some(lib) = self.lib.as_ref() else {
             return;
         };
         if !self.lib_placed {
-            if let Some(main) = self.main.as_ref() {
-                if let Ok(pos) = main.window.outer_position() {
-                    let (main_w, _) = self.window_px_size(Win::Main);
-                    let x = pos.x + main_w as i32;
-                    lib.window
-                        .set_outer_position(PhysicalPosition::new(x, pos.y));
-                }
+            if let Some((x, y)) = self.default_origin(Win::Library) {
+                self.set_window_origin(Win::Library, (x, y));
             }
             self.lib_placed = true;
         }
@@ -2117,20 +2114,73 @@ impl App {
         self.video.as_ref().map_or(1, |video| video.zoom())
     }
 
-    /// Shows the video window. The first time, it goes to the right of the main window.
+    /// Where the video window goes the first time it is shown: to the right of the main window,
+    /// top aligned with it.
+    fn video_default_origin(&self) -> Option<(f64, f64)> {
+        let (x, y) = self.window_origin(Win::Main)?;
+        let (main_w, _) = self.window_px_size(Win::Main);
+        Some((x + main_w, y))
+    }
+
+    /// Where the library goes the first time it is shown: to the right of the video window, top
+    /// aligned with it. The video window is where it is when placed, or where it goes otherwise.
+    fn library_default_origin(&self) -> Option<(f64, f64)> {
+        let (x, y) = if self.video_placed {
+            self.window_origin(Win::Video)?
+        } else {
+            self.video_default_origin()?
+        };
+        let (video_w, _) = self.window_px_size(Win::Video);
+        Some((x + video_w, y))
+    }
+
+    /// Where Milkdrop goes the first time it is shown: below the library window, left aligned with
+    /// it. The library window is where it is when placed, or where it goes otherwise.
+    fn milkdrop_default_origin(&self) -> Option<(f64, f64)> {
+        let (x, y) = if self.lib_placed {
+            self.window_origin(Win::Library)?
+        } else {
+            self.library_default_origin()?
+        };
+        let (_, lib_h) = self.window_px_size(Win::Library);
+        Some((x, y + lib_h))
+    }
+
+    /// The default origin of a window with no saved place: the video window to the right of the
+    /// main one, the library to the right of the video one, Milkdrop below the library. Each is
+    /// moved onto the main window's monitor when it would be off it. `None` for the other windows
+    /// and before the main window exists.
+    fn default_origin(&self, win: Win) -> Option<(f64, f64)> {
+        let (x, y) = match win {
+            Win::Video => self.video_default_origin()?,
+            Win::Library => self.library_default_origin()?,
+            Win::Milkdrop => self.milkdrop_default_origin()?,
+            Win::Main | Win::Eq | Win::Playlist => return None,
+        };
+        let screen = self.screen_rect();
+        let monitor = config::Rect {
+            x: screen.x.round() as i32,
+            y: screen.y.round() as i32,
+            w: screen.w.round() as i32,
+            h: screen.h.round() as i32,
+        };
+        let (w, h) = self.window_px_size(win);
+        let (x, y) = config::clamp_origin(
+            (x.round() as i32, y.round() as i32),
+            (w.round() as i32, h.round() as i32),
+            &[monitor],
+        );
+        Some((f64::from(x), f64::from(y)))
+    }
+
+    /// Shows the video window. The first time, it goes to its default place (see `default_origin`).
     fn show_video(&mut self) {
         if self.video.is_none() {
             return;
         }
         if !self.video_placed {
-            let place = self.main.as_ref().and_then(|main| {
-                let pos = main.window.outer_position().ok()?;
-                let (main_w, _) = self.window_px_size(Win::Main);
-                let x = pos.x + main_w as i32;
-                Some(PhysicalPosition::new(x, pos.y))
-            });
-            if let (Some(place), Some(video)) = (place, self.video.as_ref()) {
-                video.window.set_outer_position(place);
+            if let Some((x, y)) = self.default_origin(Win::Video) {
+                self.set_window_origin(Win::Video, (x, y));
             }
             self.video_placed = true;
         }
@@ -2203,18 +2253,26 @@ impl App {
         if let Err(e) = bridge.set_bounds(x, y, w, h) {
             eprintln!("tubeamp: could not place the YouTube Music view: {e}");
         }
+        // The video view keeps the page's CSS width at most VIDEO_CSS_WIDTH, by zooming the page
+        // in when the view is wider (see `tubeamp_bridge::video_page_zoom`). The browser view
+        // shows the page at its normal size.
+        let page_zoom = if self.video_browser {
+            1.0
+        } else {
+            tubeamp_bridge::video_page_zoom(w)
+        };
+        if let Err(e) = bridge.set_page_zoom(page_zoom) {
+            eprintln!("tubeamp: could not zoom the YouTube Music view: {e}");
+        }
     }
 
     /// Fullscreen for the video window (borderless). Esc leaves it.
     fn toggle_video_fullscreen(&mut self) {
-        let Some(video) = self.video.as_ref() else {
+        let Some(video) = self.video.as_mut() else {
             return;
         };
         self.video_fullscreen = !self.video_fullscreen;
-        let mode = self
-            .video_fullscreen
-            .then_some(Fullscreen::Borderless(None));
-        video.window.set_fullscreen(mode);
+        video.set_fullscreen(self.video_fullscreen);
         self.update_video_bounds();
         self.request_redraw();
     }
@@ -2223,19 +2281,22 @@ impl App {
     /// browser view makes the window at least 800 × 600 on screen, and leaving it restores the
     /// size it had.
     fn set_video_browser(&mut self, browser: bool) {
-        if browser && !self.video_browser {
+        let was_browser = self.video_browser;
+        // Set first: the size changes below place the page, and its zoom depends on the view.
+        self.video_browser = browser;
+        if browser && !was_browser {
             self.video_saved_size = Some((self.video_state.w, self.video_state.h));
             let zoom = self.video_zoom();
             let min_w = BROWSER_MIN.0.div_ceil(zoom);
             let min_h = BROWSER_MIN.1.div_ceil(zoom);
             let size = (self.video_state.w.max(min_w), self.video_state.h.max(min_h));
             self.set_video_size(size);
-        } else if !browser && self.video_browser {
+        } else if !browser && was_browser {
             if let Some(size) = self.video_saved_size.take() {
                 self.set_video_size(size);
             }
         }
-        self.video_browser = browser;
+        self.update_video_bounds();
         self.send(Cmd::SetViewMode { video: !browser });
     }
 
@@ -2395,13 +2456,11 @@ impl App {
 
     // Milkdrop window (the logic is in `milkdrop.rs`; these carry out what it asks of the app).
 
-    /// Shows the Milkdrop window. The first time, it goes to the right of the main window.
+    /// Shows the Milkdrop window. The first time, it goes to its default place (see `default_origin`).
     fn show_milkdrop(&mut self) {
-        let beside = self.main.as_ref().and_then(|main| {
-            let pos = main.window.outer_position().ok()?;
-            let (main_w, _) = self.window_px_size(Win::Main);
-            Some((pos.x + main_w as i32, pos.y))
-        });
+        let beside = self
+            .default_origin(Win::Milkdrop)
+            .map(|(x, y)| (x.round() as i32, y.round() as i32));
         self.milkdrop.show(beside);
         self.request_redraw();
     }
@@ -2748,12 +2807,20 @@ impl App {
                     self.toggle_video_fullscreen();
                 }
             }
+            // A media key, or a Now Playing control, from the page's media session (macOS).
+            Evt::Media { action, seek_time } => {
+                if let Some(action) = crate::nowplaying::media_action(action, *seek_time) {
+                    self.on_media_action(action);
+                }
+            }
             Evt::Ready { signed_in } => {
                 // A page that has just loaded starts in the video view, so tell it the view we
                 // are in (the page was loaded from scratch, or the view was changed earlier).
                 self.send(Cmd::SetViewMode {
                     video: !self.video_browser,
                 });
+                // The page's media session is new: the track goes to it again.
+                self.forget_now_playing();
                 let actions = self.library.on_ready(*signed_in);
                 self.apply_library(actions);
             }
@@ -3110,6 +3177,15 @@ impl App {
         if let Some(t) = self.milkdrop.next_wake() {
             wake = wake.min(t);
         }
+        for t in [
+            self.video.as_ref().and_then(|v| v.restore_wake()),
+            self.milkdrop.window().and_then(|w| w.restore_wake()),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            wake = wake.min(t);
+        }
         for t in [self.autoload_at, self.screenshot_at, self.quit_at]
             .into_iter()
             .flatten()
@@ -3142,6 +3218,12 @@ impl App {
             self.try_start_audio(now);
         }
         self.milkdrop.tick(now, self.audio.as_ref());
+        if let Some(video) = self.video.as_mut() {
+            video.apply_due_restore(now);
+        }
+        if let Some(win) = self.milkdrop.window_mut() {
+            win.apply_due_restore(now);
+        }
 
         if playing && now >= self.next_vis {
             self.step_vis();
@@ -3421,6 +3503,7 @@ impl ApplicationHandler<UserEvent> for App {
         match event {
             UserEvent::Bridge(evt) => self.on_bridge_event(evt),
             UserEvent::Milkdrop(msg) => self.on_milkdrop_msg(msg),
+            #[cfg(target_os = "windows")]
             UserEvent::Media(action) => self.on_media_action(action),
             UserEvent::Download(result) => self.on_download_done(result),
             UserEvent::FirstRun => self.first_run_prompt(),

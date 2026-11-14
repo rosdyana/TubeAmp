@@ -55,10 +55,99 @@
       });
     } catch (_) {}
   };
-  shadowMediaSession();
+  // The page's media session. On macOS (the prelude sets `__tubeamp_native_media`) TubeAmp owns
+  // it: the page's handlers and metadata are swallowed, and the bridge registers its own handlers
+  // and sets the metadata, the playback state and the position. WebKit's Now Playing entry is then
+  // the one TubeAmp shows, and the media keys go to TubeAmp's playlist. Elsewhere the page's
+  // session is only shadowed, as before.
+  const media = {
+    native: null,
+    ms: null,
+    page: null,
+    meta: null,
+    state: null,
+    hasTrack: false,
+  };
+
+  const MEDIA_ACTIONS = [
+    "play",
+    "pause",
+    "stop",
+    "previoustrack",
+    "nexttrack",
+    "seekto",
+    "seekbackward",
+    "seekforward",
+  ];
+
+  // Returns the native setters and methods of the session, once the page's are swallowed. Null
+  // when this WebKit has no such session, so the page's session is only shadowed then.
+  const takeMediaSession = (ms) => {
+    const proto = Object.getPrototypeOf(ms);
+    const own = (name) => Object.getOwnPropertyDescriptor(proto, name);
+    const metadata = own("metadata");
+    const playbackState = own("playbackState");
+    if (
+      !metadata ||
+      !metadata.set ||
+      !playbackState ||
+      !playbackState.set ||
+      typeof proto.setActionHandler !== "function" ||
+      typeof proto.setPositionState !== "function"
+    ) {
+      return null;
+    }
+    const native = {
+      metadata: metadata.set,
+      playbackState: playbackState.set,
+      setActionHandler: proto.setActionHandler,
+      setPositionState: proto.setPositionState,
+    };
+    // The page's own metadata is kept (for the cover art) but not sent to the session.
+    Object.defineProperty(ms, "metadata", {
+      configurable: true,
+      get: () => media.meta,
+      set: (value) => {
+        media.page = value;
+      },
+    });
+    Object.defineProperty(ms, "playbackState", {
+      configurable: true,
+      get: () => media.state || "none",
+      set: () => {},
+    });
+    Object.defineProperty(ms, "setActionHandler", { configurable: true, value: () => {} });
+    Object.defineProperty(ms, "setPositionState", { configurable: true, value: () => {} });
+    for (const action of MEDIA_ACTIONS) {
+      try {
+        native.setActionHandler.call(ms, action, (details) => {
+          const d = details || {};
+          const seek =
+            typeof d.seekTime === "number"
+              ? d.seekTime
+              : typeof d.seekOffset === "number"
+                ? d.seekOffset
+                : null;
+          post({ t: "media", action, seek_time: seek });
+        });
+      } catch (_) {}
+    }
+    return native;
+  };
+
+  const sessionNow = navigator.mediaSession;
+  if (sessionNow) {
+    media.ms = sessionNow;
+    media.native = window.__tubeamp_native_media === true ? takeMediaSession(sessionNow) : null;
+    if (!media.native) shadowMediaSession();
+  }
+
+  // The page's own metadata, for the cover art: the one the page set (native), or the shadow's.
+  const pageMetadata = () =>
+    media.native ? media.page : navigator.mediaSession && navigator.mediaSession.metadata;
 
   const artworkUrl = () => {
-    const meta = navigator.mediaSession && navigator.mediaSession.metadata;
+    const meta = pageMetadata();
     const art = meta && meta.artwork;
     if (!art || !art.length) return null;
     const last = art[art.length - 1];
@@ -137,10 +226,60 @@
   // Posts one snapshot now, and the end of a video once (player state 0 after something else).
   // Called by the timer and by the media events below, so the state does not depend on the timer
   // alone. A hidden webview runs its timers slowly, but the media events still arrive.
+  const setMediaState = (state) => {
+    if (media.state === state) return;
+    media.state = state;
+    try {
+      media.native.playbackState.call(media.ms, state);
+    } catch (_) {}
+  };
+
+  // Keeps the Now Playing state and position in step with the player (native media only).
+  const syncMedia = (msg) => {
+    if (!media.native) return;
+    if (!media.hasTrack) {
+      setMediaState("none");
+      return;
+    }
+    const state = msg.ps === null ? "none" : isPlaying(msg.ps) ? "playing" : "paused";
+    setMediaState(state);
+    if (state === "none") return;
+    const dur = msg.dur;
+    if (!(dur > 0) || !Number.isFinite(dur) || !Number.isFinite(msg.cur)) return;
+    const position = Math.min(Math.max(msg.cur, 0), dur);
+    try {
+      media.native.setPositionState.call(media.ms, { duration: dur, playbackRate: 1, position });
+    } catch (_) {}
+  };
+
+  // TubeAmp's track, as Rust sends it (`nowplaying`). An empty title clears the entry.
+  const applyNowPlaying = (c) => {
+    if (!media.native) return;
+    const title = String(c.title || "").trim();
+    media.hasTrack = title !== "";
+    let meta = null;
+    if (media.hasTrack && typeof MediaMetadata === "function") {
+      const src = c.artwork ? String(c.artwork) : "";
+      meta = new MediaMetadata({
+        title,
+        artist: String(c.artist || ""),
+        album: String(c.album || ""),
+        artwork: src ? [{ src }] : [],
+      });
+    }
+    media.meta = meta;
+    try {
+      media.native.metadata.call(media.ms, meta);
+    } catch (_) {}
+    // The state is sent again with the next report, as setting the metadata can reset it.
+    media.state = null;
+  };
+
   const report = () => {
     const msg = snapshot(player(), Date.now());
     const ps = msg.ps;
     post(msg);
+    syncMedia(msg);
     // YouTube reports state 0 once when a video ends. Only fire on the transition into 0.
     if (ps !== null) {
       if (ps === 0 && T.lastPs !== null && T.lastPs !== 0) post({ t: "ended" });
@@ -442,6 +581,14 @@ html.tubeamp-video #tubeamp-art.on::after {
   T.cmd = (c) => {
     if (c.t === "api") {
       request(c);
+      return;
+    }
+    if (c.t === "nowplaying") {
+      try {
+        applyNowPlaying(c);
+      } catch (e) {
+        post({ t: "error", where: "cmd:nowplaying", msg: String(e) });
+      }
       return;
     }
     if (c.t === "setviewmode") {

@@ -24,6 +24,7 @@ mod hotkeys;
 mod instance;
 mod layout;
 mod library;
+mod menu_label;
 mod milkdrop;
 mod nowplaying;
 mod player;

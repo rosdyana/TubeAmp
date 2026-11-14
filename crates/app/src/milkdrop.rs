@@ -25,7 +25,7 @@ use winit::event::{ElementState, KeyEvent, MouseButton, WindowEvent};
 use winit::event_loop::ActiveEventLoop;
 use winit::keyboard::{Key, ModifiersState, NamedKey};
 use winit::platform::modifier_supplement::KeyEventExtModifierSupplement;
-use winit::window::{Fullscreen, WindowAttributes, WindowId};
+use winit::window::{WindowAttributes, WindowId};
 use wry::http::header::CONTENT_TYPE;
 use wry::http::{Request, Response};
 use wry::{Rect, WebView, WebViewBuilder};
@@ -612,9 +612,8 @@ impl MilkdropWindow {
 
     fn set_fullscreen(&mut self, on: bool) {
         self.fullscreen = on;
-        if let Some(win) = self.win.as_ref() {
-            win.window
-                .set_fullscreen(on.then_some(Fullscreen::Borderless(None)));
+        if let Some(win) = self.win.as_mut() {
+            win.set_fullscreen(on);
         }
         self.update_bounds();
         self.request_redraw();

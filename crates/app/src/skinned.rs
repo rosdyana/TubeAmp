@@ -3,12 +3,13 @@
 
 use std::num::NonZeroU32;
 use std::rc::Rc;
+use std::time::{Duration, Instant};
 
 use softbuffer::{Context, Surface};
 use tubeamp_ui::Canvas;
-use winit::dpi::{LogicalSize, PhysicalPosition};
+use winit::dpi::{LogicalSize, PhysicalPosition, PhysicalSize};
 use winit::event_loop::ActiveEventLoop;
-use winit::window::{Window, WindowAttributes, WindowId};
+use winit::window::{Fullscreen, Window, WindowAttributes, WindowId};
 
 /// A window shared between winit, softbuffer and the app.
 pub type SharedWindow = Rc<Window>;
@@ -18,6 +19,17 @@ pub fn scaled(canvas: &Canvas, factor: u32) -> Vec<u32> {
     let mut out = vec![0u32; ((canvas.w * factor) * (canvas.h * factor)) as usize];
     canvas.scale_into(&mut out, factor);
     out
+}
+
+/// How long after leaving fullscreen the window is put back where it was. macOS animates the exit
+/// for about half a second, and a restore before it ends is undone by the animation.
+const RESTORE_AFTER_EXIT: Duration = Duration::from_millis(2500);
+
+/// Where a window was: its outer position and its inner size, in physical pixels.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Placement {
+    pub origin: PhysicalPosition<i32>,
+    pub size: PhysicalSize<u32>,
 }
 
 /// A winit window that presents skin-pixel canvases through softbuffer.
@@ -30,6 +42,12 @@ pub struct SkinnedWindow {
     base: (u32, u32),
     zoom: u32,
     cursor: Option<PhysicalPosition<f64>>,
+    /// Where the window was when it went fullscreen, until it is back out.
+    before_fullscreen: Option<Placement>,
+    /// Where the window goes back to, once the OS has left fullscreen (see `apply_due_restore`).
+    to_restore: Option<Placement>,
+    /// When the restore is due: a short while after leaving fullscreen, once the OS's exit is over.
+    restore_at: Option<Instant>,
 }
 
 impl SkinnedWindow {
@@ -56,6 +74,9 @@ impl SkinnedWindow {
             base,
             zoom,
             cursor: None,
+            before_fullscreen: None,
+            to_restore: None,
+            restore_at: None,
         })
     }
 
@@ -83,6 +104,57 @@ impl SkinnedWindow {
     pub fn set_base(&mut self, base: (u32, u32)) {
         self.base = base;
         let _ = self.window.request_inner_size(self.logical_size());
+    }
+
+    /// Enters or leaves borderless fullscreen. Entering keeps the window's placement; leaving
+    /// asks for it back (see `restore_placement`), because macOS can settle the window somewhere
+    /// else when its fullscreen exit finishes.
+    pub fn set_fullscreen(&mut self, on: bool) {
+        if on {
+            if self.window.fullscreen().is_none() {
+                self.before_fullscreen = self.placement();
+            }
+            self.window
+                .set_fullscreen(Some(Fullscreen::Borderless(None)));
+        } else {
+            self.window.set_fullscreen(None);
+            if let Some(place) = self.before_fullscreen.take() {
+                self.to_restore = Some(place);
+                self.restore_at = Some(Instant::now() + RESTORE_AFTER_EXIT);
+            }
+        }
+    }
+
+    /// Where the window is now, if the OS can say.
+    fn placement(&self) -> Option<Placement> {
+        Some(Placement {
+            origin: self.window.outer_position().ok()?,
+            size: self.window.inner_size(),
+        })
+    }
+
+    /// When the window's fullscreen restore is due, if one is pending (for the app's tick to wake
+    /// for).
+    pub fn restore_wake(&self) -> Option<Instant> {
+        self.to_restore.and(self.restore_at)
+    }
+
+    /// Puts the window back where it was before fullscreen, once `RESTORE_AFTER_EXIT` has passed
+    /// since leaving it. This runs from the app's tick, not from a window event: moving the window
+    /// inside its own resize event made winit and WebKit fail (the webview lost its window), and
+    /// the OS is still finishing its exit animation right after the event.
+    pub fn apply_due_restore(&mut self, now: Instant) {
+        let (Some(place), Some(at)) = (self.to_restore, self.restore_at) else {
+            return;
+        };
+        if now < at {
+            return;
+        }
+        self.to_restore = None;
+        self.restore_at = None;
+        // The size first: a resize moves the window's top edge, so the position is set last.
+        let _ = self.window.request_inner_size(place.size);
+        self.window.set_outer_position(place.origin);
     }
 
     /// The last pointer position over the window, in physical pixels.
@@ -171,10 +243,14 @@ pub fn show_context_menu(window: &Window, menu: &muda::Menu, x: f64, y: f64) -> 
     use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 
     let handle = window.window_handle().map_err(|e| e.to_string())?;
-    let position = Some(Position::Logical(LogicalPosition::new(x, y)));
     match handle.as_raw() {
         #[cfg(target_os = "macos")]
         RawWindowHandle::AppKit(appkit) => {
+            // muda places the menu for an unflipped view (y counts up from the bottom), but
+            // winit's view is flipped (y counts down from the top). So muda gets the y from the
+            // bottom: the view's height less `y`.
+            let height = window.inner_size().to_logical::<f64>(window.scale_factor()).height;
+            let position = Some(Position::Logical(LogicalPosition::new(x, height - y)));
             // SAFETY: the view belongs to `window`, which is alive for the whole call, and this
             // runs on the main thread that owns the AppKit view.
             unsafe { menu.show_context_menu_for_nsview(appkit.ns_view.as_ptr(), position) };
@@ -182,6 +258,7 @@ pub fn show_context_menu(window: &Window, menu: &muda::Menu, x: f64, y: f64) -> 
         }
         #[cfg(target_os = "windows")]
         RawWindowHandle::Win32(win32) => {
+            let position = Some(Position::Logical(LogicalPosition::new(x, y)));
             // SAFETY: the HWND belongs to `window`, which is alive for the whole call.
             unsafe { menu.show_context_menu_for_hwnd(win32.hwnd.get(), position) };
             Ok(())

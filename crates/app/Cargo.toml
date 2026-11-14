@@ -36,6 +36,10 @@ ureq = { version = "3", default-features = false, features = ["rustls"] }
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "0.6"
 
-[target.'cfg(any(target_os = "macos", target_os = "windows"))'.dependencies]
+[target.'cfg(target_os = "windows")'.dependencies]
+# TODO(windows): Now Playing still goes through SMTC here. Unverified on Windows since the macOS
+# Now Playing moved to the page's media session (see `crates/bridge/src/bridge.js`).
 souvlaki = "0.9"
+
+[target.'cfg(any(target_os = "macos", target_os = "windows"))'.dependencies]
 tray-icon = "0.26"

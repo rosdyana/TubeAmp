@@ -40,6 +40,15 @@ pub enum Cmd {
         endpoint: String,
         body: serde_json::Value,
     },
+    /// Sets the Now Playing entry to TubeAmp's track: the page's `navigator.mediaSession.metadata`
+    /// (macOS only; the page ignores it elsewhere). An empty `title` clears it. `artwork` is a
+    /// cover URL, when there is one.
+    NowPlaying {
+        title: String,
+        artist: String,
+        album: String,
+        artwork: Option<String>,
+    },
 }
 
 /// Page → Rust, posted with `window.ipc.postMessage(JSON)`.
@@ -114,6 +123,16 @@ pub enum Evt {
         status: u16,
         body: String,
     },
+    /// A media-session action from the OS (a media key, Control Center, the Now Playing menu), as
+    /// the bridge's handler got it. `action` is the MediaSession action name: `play`, `pause`,
+    /// `stop`, `previoustrack`, `nexttrack`, `seekto`, `seekbackward` or `seekforward`. `seek_time`
+    /// is the position for `seekto`, and the offset for `seekbackward` and `seekforward`, when the
+    /// event gives one.
+    Media {
+        action: String,
+        #[serde(default)]
+        seek_time: Option<f64>,
+    },
 }
 
 #[cfg(test)]
@@ -156,6 +175,83 @@ mod tests {
             endpoint: "search".to_string(),
             body: serde_json::json!({"query": "daft punk", "params": "EgWKAQIIAWoKEAMQBBAJEAoQBQ=="}),
         });
+        round_trip_cmd(Cmd::NowPlaying {
+            title: "Despacito".to_string(),
+            artist: "Luis Fonsi".to_string(),
+            album: String::new(),
+            artwork: Some("https://lh3.googleusercontent.com/cover=w226".to_string()),
+        });
+        round_trip_cmd(Cmd::NowPlaying {
+            title: String::new(),
+            artist: String::new(),
+            album: String::new(),
+            artwork: None,
+        });
+    }
+
+    #[test]
+    fn now_playing_wire_format_matches_bridge_js() {
+        assert_eq!(
+            serde_json::to_string(&Cmd::NowPlaying {
+                title: "T".to_string(),
+                artist: "A".to_string(),
+                album: "".to_string(),
+                artwork: Some("https://example.invalid/c.jpg".to_string()),
+            })
+            .unwrap(),
+            r#"{"t":"nowplaying","title":"T","artist":"A","album":"","artwork":"https://example.invalid/c.jpg"}"#
+        );
+        assert_eq!(
+            serde_json::to_string(&Cmd::NowPlaying {
+                title: "T".to_string(),
+                artist: "A".to_string(),
+                album: "".to_string(),
+                artwork: None,
+            })
+            .unwrap(),
+            r#"{"t":"nowplaying","title":"T","artist":"A","album":"","artwork":null}"#
+        );
+        assert!(serde_json::from_str::<Cmd>(r#"{"t":"nowplaying","title":"T"}"#).is_err());
+    }
+
+    #[test]
+    fn media_evt_round_trips_with_and_without_a_seek_time() {
+        round_trip_evt(Evt::Media {
+            action: "play".to_string(),
+            seek_time: None,
+        });
+        round_trip_evt(Evt::Media {
+            action: "seekto".to_string(),
+            seek_time: Some(83.5),
+        });
+    }
+
+    #[test]
+    fn media_evt_wire_format_matches_bridge_js() {
+        assert_eq!(
+            serde_json::from_str::<Evt>(r#"{"t":"media","action":"nexttrack"}"#).unwrap(),
+            Evt::Media {
+                action: "nexttrack".to_string(),
+                seek_time: None,
+            }
+        );
+        assert_eq!(
+            serde_json::from_str::<Evt>(r#"{"t":"media","action":"seekto","seek_time":12.5}"#)
+                .unwrap(),
+            Evt::Media {
+                action: "seekto".to_string(),
+                seek_time: Some(12.5),
+            }
+        );
+        assert_eq!(
+            serde_json::from_str::<Evt>(r#"{"t":"media","action":"seekforward","seek_time":null}"#)
+                .unwrap(),
+            Evt::Media {
+                action: "seekforward".to_string(),
+                seek_time: None,
+            }
+        );
+        assert!(serde_json::from_str::<Evt>(r#"{"t":"media"}"#).is_err());
     }
 
     #[test]
@@ -273,6 +369,10 @@ mod tests {
             ok: false,
             status: 0,
             body: "TypeError: Failed to fetch".to_string(),
+        });
+        round_trip_evt(Evt::Media {
+            action: "stop".to_string(),
+            seek_time: None,
         });
     }
 

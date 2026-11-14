@@ -17,3 +17,7 @@ tubeamp-bridge = { path = "../bridge" }
 winit = "0.30.13"
 softbuffer = "0.4"
 image = { version = "0.25", default-features = false, features = ["png"] }
+tubeamp-eq = { version = "0.0.0", path = "../eq" }
+muda = "0.21"
+rfd = "0.18"
+raw-window-handle = "0.6"

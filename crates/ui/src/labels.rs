@@ -49,6 +49,35 @@ pub fn balance_text(balance: i8) -> String {
     }
 }
 
+/// While dragging a band slider: `EQ: 60HZ +3.5 DB` (Webamp `getEqText`). `hz` is the band's
+/// centre frequency and `db` its gain.
+pub fn eq_band_text(hz: u32, db: f32) -> String {
+    let label = if hz < 1000 {
+        format!("{hz}HZ")
+    } else {
+        format!("{}KHZ", hz / 1000)
+    };
+    format!("EQ: {label} {} DB", signed_tenths(db))
+}
+
+/// While dragging the preamp: `EQ: Preamp +12 DB` (Webamp `getEqText`).
+pub fn eq_preamp_text(db: f32) -> String {
+    format!("EQ: Preamp {} DB", signed_tenths(db))
+}
+
+/// Rounds to one decimal the way Webamp does (`Math.round(x * 10) / 10`, then `Number`), with a
+/// `+` sign for positive values. Whole numbers print without a decimal point, so `+12` and `0`.
+fn signed_tenths(db: f32) -> String {
+    let scaled = (f64::from(db) * 10.0 + 0.5).floor() / 10.0;
+    // Math.round can produce -0 for small negatives; print that as a plain zero.
+    let value = if scaled == 0.0 { 0.0 } else { scaled };
+    if value > 0.0 {
+        format!("+{value}")
+    } else {
+        format!("{value}")
+    }
+}
+
 /// `mm:ss` with zero-padded minutes (Webamp `getTimeStr(t, false)`).
 pub fn time_padded(secs: u32) -> String {
     format!("{:02}:{:02}", secs / 60, secs % 60)
@@ -95,6 +124,24 @@ mod tests {
         assert_eq!(balance_text(-30), "Balance: 30% Left");
         assert_eq!(balance_text(45), "Balance: 45% Right");
         assert_eq!(balance_text(-100), "Balance: 100% Left");
+    }
+
+    #[test]
+    fn eq_band_text_matches_webamp() {
+        assert_eq!(eq_band_text(60, 3.5), "EQ: 60HZ +3.5 DB");
+        assert_eq!(eq_band_text(16000, -12.0), "EQ: 16KHZ -12 DB");
+        assert_eq!(eq_band_text(1000, 0.0), "EQ: 1KHZ 0 DB");
+        assert_eq!(eq_band_text(170, 0.25), "EQ: 170HZ +0.3 DB");
+        assert_eq!(eq_band_text(310, -0.25), "EQ: 310HZ -0.2 DB");
+        assert_eq!(eq_band_text(14000, 12.0), "EQ: 14KHZ +12 DB");
+    }
+
+    #[test]
+    fn eq_preamp_text_matches_webamp() {
+        assert_eq!(eq_preamp_text(12.0), "EQ: Preamp +12 DB");
+        assert_eq!(eq_preamp_text(-6.04), "EQ: Preamp -6 DB");
+        assert_eq!(eq_preamp_text(-0.04), "EQ: Preamp 0 DB");
+        assert_eq!(eq_preamp_text(0.0), "EQ: Preamp 0 DB");
     }
 
     #[test]

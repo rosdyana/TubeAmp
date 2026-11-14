@@ -1,6 +1,21 @@
-//! Demo content for the headless `--render-main` render.
+//! Demo content for the headless `--render-main` and `--render-eq` renders.
 
-use tubeamp_ui::{MainState, Status};
+use tubeamp_eq::{EqSettings, Preset};
+use tubeamp_ui::{EqWindowState, MainState, Status};
+
+/// The equalizer state for `--render-eq`: flat, or the given built-in preset, focused.
+pub fn eq_demo_state(preset: Option<&Preset>) -> EqWindowState {
+    let mut settings = EqSettings::default();
+    if let Some(p) = preset {
+        settings.preamp = p.preamp;
+        settings.bands = p.bands;
+    }
+    EqWindowState {
+        settings,
+        focused: true,
+        ..EqWindowState::default()
+    }
+}
 
 pub const DEMO_TITLE: &str = "TubeAmp - YouTube Music in a classic skin";
 pub const DEMO_DURATION_SECS: u32 = 245;

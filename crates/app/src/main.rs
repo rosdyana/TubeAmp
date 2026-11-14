@@ -2,13 +2,18 @@
 //!
 //! - `tubeamp [--skin PATH.wsz] [--zoom N]` opens the main window and the hidden video host.
 //! - `tubeamp --render-main SKIN.wsz OUT.png [--zoom N]` renders the demo state to a PNG and exits.
+//! - `tubeamp --render-eq SKIN.wsz OUT.png [--zoom N] [--eq-preset NAME]` renders the equalizer.
 //!
 //! Test hooks: `--screenshot-after SECS OUT.png` saves the live main window (2×) and keeps running,
-//! `--quit-after SECS` exits after a while, `TUBEAMP_AUTOLOAD=<videoId>` loads a video six seconds
-//! after start, and `TUBEAMP_LOG=1` prints bridge events and state changes to stderr.
+//! and the equalizer too (`OUT-eq.png`) while it is open. `--open-eq` opens the equalizer at
+//! startup, `--eq-preset NAME` applies a built-in preset at startup, `--quit-after SECS` exits
+//! after a while, `TUBEAMP_AUTOLOAD=<videoId>` loads a video six seconds after start, and
+//! `TUBEAMP_LOG=1` prints bridge events and state changes to stderr.
 
 mod demo;
+mod eq;
 mod player;
+mod skinned;
 mod window;
 
 use std::error::Error;
@@ -16,8 +21,10 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Duration;
 
+use tubeamp_eq::{presets, Preset};
 use tubeamp_skin::Skin;
-use tubeamp_ui::{render_main, Canvas, MainState, HEIGHT, WIDTH};
+use tubeamp_ui::eq_window as eqw;
+use tubeamp_ui::{render_eq, render_main, Canvas, MainState, HEIGHT, WIDTH};
 
 /// The built-in default skin (TubeAmp Classic), embedded at build time.
 const DEFAULT_SKIN: &[u8] = include_bytes!(concat!(
@@ -27,11 +34,16 @@ const DEFAULT_SKIN: &[u8] = include_bytes!(concat!(
 
 const USAGE: &str = "usage:
   tubeamp [--skin PATH.wsz] [--zoom N] [--screenshot-after SECS OUT.png] [--quit-after SECS]
+          [--open-eq] [--eq-preset NAME]
   tubeamp --render-main SKIN.wsz OUT.png [--zoom N]
+  tubeamp --render-eq SKIN.wsz OUT.png [--zoom N] [--eq-preset NAME]
 
   --zoom N                 integer scale of the 275x116 window (1..=8, default 1)
-  --screenshot-after S F   save the live main window (2x) to F after S seconds
+  --screenshot-after S F   save the live main window (2x) to F after S seconds, and the
+                           equalizer (2x) to F-eq.png when it is open
   --quit-after S           exit after S seconds
+  --open-eq                open the equalizer window below the main window at startup
+  --eq-preset NAME         apply a built-in EQ preset (e.g. \"Rock\") at startup or in a render
 
 environment:
   TUBEAMP_AUTOLOAD=ID      load YouTube video ID six seconds after start
@@ -44,9 +56,12 @@ const RENDER_TIME_SECS: u32 = 83;
 struct Args {
     skin: Option<PathBuf>,
     render: Option<(PathBuf, PathBuf)>,
+    render_eq: Option<(PathBuf, PathBuf)>,
     zoom: Option<u32>,
     screenshot: Option<(Duration, PathBuf)>,
     quit_after: Option<Duration>,
+    open_eq: bool,
+    eq_preset: Option<Preset>,
     help: bool,
 }
 
@@ -78,6 +93,20 @@ fn parse_args(mut args: impl Iterator<Item = String>) -> Result<Args, String> {
                 let skin = next_path(&mut args, "--render-main")?;
                 let png = next_path(&mut args, "--render-main")?;
                 out.render = Some((skin, png));
+            }
+            "--render-eq" => {
+                let skin = next_path(&mut args, "--render-eq")?;
+                let png = next_path(&mut args, "--render-eq")?;
+                out.render_eq = Some((skin, png));
+            }
+            "--open-eq" => out.open_eq = true,
+            "--eq-preset" => {
+                let name = args.next().ok_or("--eq-preset needs a preset name")?;
+                let preset = presets::find(&name).ok_or_else(|| {
+                    let known: Vec<&str> = tubeamp_eq::BUILTIN.iter().map(|p| p.name).collect();
+                    format!("unknown EQ preset \"{name}\"; known presets: {}", known.join(", "))
+                })?;
+                out.eq_preset = Some(*preset);
             }
             "--zoom" => {
                 let value = args.next().ok_or("--zoom needs a value")?;
@@ -140,6 +169,17 @@ fn run() -> Result<(), Box<dyn Error>> {
         return Ok(());
     }
 
+    if let Some((skin_path, png_path)) = args.render_eq {
+        let skin = Skin::load_path(&skin_path)?;
+        let state = demo::eq_demo_state(args.eq_preset.as_ref());
+        let mut canvas = Canvas::new(eqw::WIDTH, eqw::HEIGHT);
+        render_eq(&skin, &state, &mut canvas);
+        let pixels = skinned::scaled(&canvas, zoom);
+        save_png(&pixels, eqw::WIDTH * zoom, eqw::HEIGHT * zoom, &png_path)?;
+        println!("wrote {}", png_path.display());
+        return Ok(());
+    }
+
     let skin = match args.skin {
         Some(path) => Skin::load_path(&path)?,
         None => Skin::load(DEFAULT_SKIN)?,
@@ -152,6 +192,8 @@ fn run() -> Result<(), Box<dyn Error>> {
             .ok()
             .filter(|id| !id.trim().is_empty()),
         log: std::env::var_os("TUBEAMP_LOG").is_some(),
+        open_eq: args.open_eq,
+        eq_preset: args.eq_preset,
     };
     window::run(skin, options)?;
     Ok(())

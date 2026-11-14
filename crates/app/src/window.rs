@@ -1,32 +1,37 @@
-//! The main window: winit events, softbuffer presentation, the YouTube Music bridge, the audio
-//! tap and the visualiser, wired together.
+//! The windows and their event loop: the main window and the equalizer window (both skinned, see
+//! `skinned.rs`), the YouTube Music bridge, the audio tap, the EQ and the visualiser, wired
+//! together.
 //!
 //! The bridge webview lives in a hidden host window. The Eject button and the L key show it.
 
-use std::num::NonZeroU32;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
-use softbuffer::{Context, Surface};
 use tubeamp_audio::vis::{Vis, VisFrame};
 use tubeamp_audio::{params as eq_params, AudioEngine, AudioError};
 use tubeamp_bridge::{Bridge, Cmd, Evt};
+use tubeamp_eq::model::ZERO_VALUE;
+use tubeamp_eq::{Preset, BANDS_HZ, BUILTIN};
 use tubeamp_skin::Skin;
+use tubeamp_ui::eq_window as eqw;
 use tubeamp_ui::main_window::{BALANCE, POSITION, VOLUME};
 use tubeamp_ui::{
-    hit_test_main, labels, marquee_period_px, render_main, render_vis, sliders, Canvas, MainButton,
-    MainHit, MainState, Status, HEIGHT, WIDTH,
+    hit_test_eq, hit_test_main, labels, marquee_period_px, press_grab, render_eq, render_main,
+    render_vis, sliders, slider_value_at, Canvas, EqHit, EqSlider, EqWindowState, MainButton,
+    MainHit, MainState, Status, HEIGHT, PRESETS_BTN, WIDTH,
 };
 use winit::application::ApplicationHandler;
-use winit::dpi::{LogicalSize, PhysicalPosition};
+use winit::dpi::{LogicalSize, PhysicalPosition, PhysicalSize};
 use winit::event::{ElementState, KeyEvent, MouseButton, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
 use winit::keyboard::{Key, ModifiersState, NamedKey};
 use winit::platform::modifier_supplement::KeyEventExtModifierSupplement;
-use winit::window::{Window, WindowAttributes, WindowId};
+use winit::window::{WindowAttributes, WindowId};
 
+use crate::eq::{self, EqCommand};
 use crate::player::{Playback, FALLBACK_KHZ};
+use crate::skinned::{scaled, SharedWindow, SkinnedWindow};
 
 /// Marquee step: one character cell, as in Webamp's `Marquee.tsx`.
 const MARQUEE_STEP_PX: u32 = 5;
@@ -48,14 +53,13 @@ const VOLUME_STEP: i32 = 2;
 const HOST_WIDTH: f64 = 480.0;
 const HOST_HEIGHT: f64 = 360.0;
 
-type SharedWindow = Rc<Window>;
-
 /// Settings from the command line and environment.
 #[derive(Debug, Clone)]
 pub struct Options {
     /// Integer scale of the main window (1 or 2; 2 is double size).
     pub zoom: u32,
-    /// Save the live main window (2×) to this PNG after the delay, then keep running.
+    /// Save the live windows (2×) after the delay, then keep running. The equalizer goes to
+    /// `OUT-eq.png` and is written only while it is open.
     pub screenshot: Option<(Duration, PathBuf)>,
     /// Exit after this long.
     pub quit_after: Option<Duration>,
@@ -63,6 +67,10 @@ pub struct Options {
     pub autoload: Option<String>,
     /// Print bridge events and state changes to stderr.
     pub log: bool,
+    /// Open the equalizer window at startup, below the main window.
+    pub open_eq: bool,
+    /// Apply this built-in preset at startup.
+    pub eq_preset: Option<Preset>,
 }
 
 /// Events posted to the event loop from outside it.
@@ -70,6 +78,8 @@ pub struct Options {
 pub enum UserEvent {
     /// A message from `bridge.js`.
     Bridge(Evt),
+    /// A PRESETS menu item was chosen. The payload is its menu id.
+    Menu(String),
 }
 
 /// A slider or seek drag in progress.
@@ -83,16 +93,27 @@ enum Drag {
     Balance,
 }
 
+/// An equalizer slider drag in progress. `grab` is the pointer's offset inside the thumb.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct EqDrag {
+    slider: EqSlider,
+    grab: f64,
+}
+
 struct App {
     opts: Options,
     skin: Skin,
     proxy: EventLoopProxy<UserEvent>,
-    zoom: u32,
     state: MainState,
     playback: Playback,
-    window: Option<SharedWindow>,
-    context: Option<Context<SharedWindow>>,
-    surface: Option<Surface<SharedWindow, SharedWindow>>,
+    main: Option<SkinnedWindow>,
+    eq: Option<SkinnedWindow>,
+    eq_visible: bool,
+    eq_state: EqWindowState,
+    eq_press: Option<EqHit>,
+    eq_drag: Option<EqDrag>,
+    /// The main window's outer position and inner size, as last seen. The equalizer docks to it.
+    main_rect: Option<(PhysicalPosition<i32>, PhysicalSize<u32>)>,
     // Dropped before `host`, because the webview is a child of the host window.
     bridge: Option<Bridge>,
     host: Option<SharedWindow>,
@@ -105,7 +126,6 @@ struct App {
     vis_frame: VisFrame,
     samples: Vec<f32>,
     modifiers: ModifiersState,
-    cursor: Option<PhysicalPosition<f64>>,
     press_target: Option<MainHit>,
     drag: Option<Drag>,
     volume_synced: bool,
@@ -124,11 +144,17 @@ pub fn run(skin: Skin, opts: Options) -> Result<(), winit::error::EventLoopError
     let screenshot_at = opts.screenshot.as_ref().map(|(after, _)| started + *after);
     let quit_at = opts.quit_after.map(|after| started + after);
     let autoload_at = opts.autoload.as_ref().map(|_| started + AUTOLOAD_DELAY);
+
+    // PRESETS menu items arrive as menu events. Forward them into the event loop.
+    let menu_proxy = event_loop.create_proxy();
+    muda::MenuEvent::set_event_handler(Some(move |event: muda::MenuEvent| {
+        let _ = menu_proxy.send_event(UserEvent::Menu(event.id.0));
+    }));
+
     let mut app = App {
         opts,
         skin,
         proxy: event_loop.create_proxy(),
-        zoom,
         state: MainState {
             doubled: zoom == 2,
             // YouTube Music starts at full volume; the slider is the source of truth from here.
@@ -136,9 +162,13 @@ pub fn run(skin: Skin, opts: Options) -> Result<(), winit::error::EventLoopError
             ..MainState::default()
         },
         playback: Playback::default(),
-        window: None,
-        context: None,
-        surface: None,
+        main: None,
+        eq: None,
+        eq_visible: false,
+        eq_state: EqWindowState::default(),
+        eq_press: None,
+        eq_drag: None,
+        main_rect: None,
         bridge: None,
         host: None,
         host_visible: false,
@@ -150,7 +180,6 @@ pub fn run(skin: Skin, opts: Options) -> Result<(), winit::error::EventLoopError
         vis_frame: VisFrame::default(),
         samples: Vec::new(),
         modifiers: ModifiersState::empty(),
-        cursor: None,
         press_target: None,
         drag: None,
         volume_synced: false,
@@ -163,22 +192,23 @@ pub fn run(skin: Skin, opts: Options) -> Result<(), winit::error::EventLoopError
     event_loop.run_app(&mut app)
 }
 
-/// Centres `size` pixels within `total`, cropping if it does not fit.
-/// Returns `(offset, visible)`. Shared by presentation and cursor mapping.
-fn fit(total: u32, size: u32) -> (u32, u32) {
-    let visible = size.min(total);
-    ((total - visible) / 2, visible)
+/// `shot.png` → `shot-eq.png`, in the same folder.
+pub fn eq_screenshot_path(path: &Path) -> PathBuf {
+    let stem = path
+        .file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let name = match path.extension() {
+        Some(ext) => format!("{stem}-eq.{}", ext.to_string_lossy()),
+        None => format!("{stem}-eq"),
+    };
+    path.with_file_name(name)
 }
 
-/// Copies a `sw` × `sh` frame into the centre of a `pw` × `ph` buffer, black elsewhere.
-fn present(dst: &mut [u32], pw: u32, ph: u32, src: &[u32], sw: u32, sh: u32) {
-    dst.fill(0);
-    let (ox, cw) = fit(pw, sw);
-    let (oy, ch) = fit(ph, sh);
-    let stride = pw as usize;
-    for (row, src_row) in src.chunks_exact(sw as usize).take(ch as usize).enumerate() {
-        let start = (oy as usize + row) * stride + ox as usize;
-        dst[start..start + cw as usize].copy_from_slice(&src_row[..cw as usize]);
+fn save_one(pixels: &[u32], width: u32, height: u32, path: &Path) {
+    match crate::save_png(pixels, width, height, path) {
+        Ok(()) => eprintln!("tubeamp: wrote {}", path.display()),
+        Err(e) => eprintln!("tubeamp: could not write {}: {e}", path.display()),
     }
 }
 
@@ -189,19 +219,15 @@ impl App {
         }
     }
 
-    fn logical_size(&self) -> LogicalSize<u32> {
-        LogicalSize::new(WIDTH * self.zoom, HEIGHT * self.zoom)
-    }
-
-    /// Integer scale from main-window pixels to physical pixels: round(scale factor) × zoom.
-    fn factor(&self) -> u32 {
-        let scale = self.window.as_ref().map_or(1.0, |w| w.scale_factor());
-        (scale.round().max(1.0) as u32) * self.zoom
-    }
-
+    /// Requests a redraw of the main window, and of the equalizer while it is open.
     fn request_redraw(&self) {
-        if let Some(window) = &self.window {
-            window.request_redraw();
+        if let Some(main) = &self.main {
+            main.request_redraw();
+        }
+        if self.eq_visible {
+            if let Some(eq) = &self.eq {
+                eq.request_redraw();
+            }
         }
     }
 
@@ -215,41 +241,25 @@ impl App {
         }
     }
 
-    /// Pointer position in main-window pixels, not clamped to the window. Drags use this so they
-    /// keep tracking past the edge.
-    fn main_point(&self) -> Option<(f64, f64)> {
-        let pos = self.cursor?;
-        let size = self.window.as_ref()?.inner_size();
-        let f = self.factor();
-        let (ox, _) = fit(size.width, WIDTH * f);
-        let (oy, _) = fit(size.height, HEIGHT * f);
-        Some((
-            (pos.x - f64::from(ox)) / f64::from(f),
-            (pos.y - f64::from(oy)) / f64::from(f),
-        ))
-    }
-
-    /// Pointer position in main-window pixels, or `None` outside the window.
-    fn cursor_main(&self) -> Option<(i32, i32)> {
-        let (x, y) = self.main_point()?;
-        if x < 0.0 || y < 0.0 || x >= f64::from(WIDTH) || y >= f64::from(HEIGHT) {
-            return None;
-        }
-        Some((x as i32, y as i32))
-    }
-
-    fn hit_under_cursor(&self) -> Option<MainHit> {
-        let (x, y) = self.cursor_main()?;
+    /// The main window's hit target under the pointer.
+    fn main_hit(&self) -> Option<MainHit> {
+        let (x, y) = self.main.as_ref()?.skin_pixel()?;
         hit_test_main(x, y)
     }
 
+    /// The equalizer's hit target under the pointer.
+    fn eq_hit_under_cursor(&self) -> Option<EqHit> {
+        let (x, y) = self.eq.as_ref()?.skin_pixel()?;
+        hit_test_eq(x, y)
+    }
+
     fn on_press(&mut self) {
-        let hit = self.hit_under_cursor();
+        let hit = self.main_hit();
         self.press_target = hit;
         match hit {
             Some(MainHit::TitleBar) => {
-                if let Some(window) = &self.window {
-                    if let Err(e) = window.drag_window() {
+                if let Some(main) = &self.main {
+                    if let Err(e) = main.window.drag_window() {
                         eprintln!("tubeamp: window drag failed: {e}");
                     }
                 }
@@ -274,7 +284,7 @@ impl App {
 
     /// Moves the active slider drag to the pointer.
     fn update_drag(&mut self) {
-        let Some((x, _)) = self.main_point() else {
+        let Some((x, _)) = self.main.as_ref().and_then(|m| m.skin_point()) else {
             return;
         };
         match self.drag {
@@ -335,7 +345,7 @@ impl App {
 
     fn on_release(&mut self, el: &ActiveEventLoop) {
         let target = self.press_target.take();
-        let hit = self.hit_under_cursor();
+        let hit = self.main_hit();
         self.state.pressed = None;
         if let Some(Drag::Position { percent }) = self.drag.take() {
             self.seek_percent(percent);
@@ -354,8 +364,8 @@ impl App {
             MainHit::Button(button) => match button {
                 MainButton::Close => el.exit(),
                 MainButton::Minimize => {
-                    if let Some(window) = &self.window {
-                        window.set_minimized(true);
+                    if let Some(main) = &self.main {
+                        main.window.set_minimized(true);
                     }
                 }
                 MainButton::Previous => self.send(Cmd::Prev),
@@ -366,7 +376,7 @@ impl App {
                 MainButton::Eject => self.toggle_host(),
                 MainButton::Shuffle => self.state.shuffle = !self.state.shuffle,
                 MainButton::Repeat => self.state.repeat = !self.state.repeat,
-                MainButton::EqToggle => self.state.eq_open = !self.state.eq_open,
+                MainButton::EqToggle => self.toggle_eq(),
                 MainButton::PlToggle => self.state.pl_open = !self.state.pl_open,
                 MainButton::ClutterD => {
                     let on = !self.state.doubled;
@@ -422,11 +432,16 @@ impl App {
         self.request_redraw();
     }
 
+    /// Doubles (or halves) both windows. The docked equalizer follows the main window's new
+    /// bottom edge in `on_main_resized`.
     fn set_doubled(&mut self, on: bool) {
-        self.zoom = if on { 2 } else { 1 };
+        let zoom = if on { 2 } else { 1 };
         self.state.doubled = on;
-        if let Some(window) = &self.window {
-            let _ = window.request_inner_size(self.logical_size());
+        if let Some(main) = self.main.as_mut() {
+            main.set_zoom(zoom);
+        }
+        if let Some(eq) = self.eq.as_mut() {
+            eq.set_zoom(zoom);
         }
         self.request_redraw();
     }
@@ -444,6 +459,275 @@ impl App {
             }
         }
         self.log(format!("video host visible = {}", self.host_visible));
+    }
+
+    // Equalizer window.
+
+    fn toggle_eq(&mut self) {
+        if self.eq_visible {
+            self.hide_eq();
+        } else {
+            self.show_eq();
+        }
+    }
+
+    /// Shows the equalizer directly below the main window, at the main window's left edge.
+    fn show_eq(&mut self) {
+        let Some(main) = self.main.as_ref() else {
+            return;
+        };
+        if let Ok(pos) = main.window.outer_position() {
+            let height = main.window.inner_size().height as i32;
+            self.move_eq(PhysicalPosition::new(pos.x, pos.y + height));
+        }
+        let Some(eq) = self.eq.as_ref() else {
+            return;
+        };
+        eq.window.set_visible(true);
+        self.eq_visible = true;
+        self.state.eq_open = true;
+        self.request_redraw();
+    }
+
+    fn hide_eq(&mut self) {
+        self.eq_visible = false;
+        self.state.eq_open = false;
+        self.eq_press = None;
+        self.eq_drag = None;
+        self.eq_state.pressed = None;
+        self.eq_state.dragging = None;
+        if let Some(eq) = self.eq.as_ref() {
+            eq.window.set_visible(false);
+        }
+        self.request_redraw();
+    }
+
+    fn move_eq(&self, pos: PhysicalPosition<i32>) {
+        if let Some(eq) = self.eq.as_ref() {
+            eq.window.set_outer_position(pos);
+        }
+    }
+
+    fn eq_outer_position(&self) -> Option<PhysicalPosition<i32>> {
+        self.eq.as_ref()?.window.outer_position().ok()
+    }
+
+    /// Whether the equalizer's top edge sits exactly on the bottom edge of a main window at
+    /// `main_pos` with `main_size`.
+    fn eq_docked_to(&self, main_pos: PhysicalPosition<i32>, main_size: PhysicalSize<u32>) -> bool {
+        self.eq_outer_position()
+            .is_some_and(|p| p.y == main_pos.y + main_size.height as i32)
+    }
+
+    /// The main window moved: a docked equalizer moves with it. This is a simple attach; full
+    /// snapping comes in M5.
+    fn on_main_moved(&mut self, pos: PhysicalPosition<i32>) {
+        match self.main_rect {
+            Some((old, size)) => {
+                if self.eq_visible && self.eq_docked_to(old, size) {
+                    if let Some(eq_pos) = self.eq_outer_position() {
+                        let delta_x = pos.x - old.x;
+                        let delta_y = pos.y - old.y;
+                        self.move_eq(PhysicalPosition::new(eq_pos.x + delta_x, eq_pos.y + delta_y));
+                    }
+                }
+                self.main_rect = Some((pos, size));
+            }
+            None => {
+                self.main_rect = self
+                    .main
+                    .as_ref()
+                    .map(|m| (pos, m.window.inner_size()));
+            }
+        }
+    }
+
+    /// The main window changed size (zoom): a docked equalizer keeps its top on the new bottom.
+    fn on_main_resized(&mut self, size: PhysicalSize<u32>) {
+        let Some((pos, old_size)) = self.main_rect else {
+            self.main_rect = self
+                .main
+                .as_ref()
+                .and_then(|m| m.window.outer_position().ok())
+                .map(|p| (p, size));
+            return;
+        };
+        if self.eq_visible && self.eq_docked_to(pos, old_size) {
+            if let Some(eq_pos) = self.eq_outer_position() {
+                self.move_eq(PhysicalPosition::new(eq_pos.x, pos.y + size.height as i32));
+            }
+        }
+        self.main_rect = Some((pos, size));
+    }
+
+    fn on_eq_press(&mut self) {
+        let hit = self.eq_hit_under_cursor();
+        self.eq_press = hit;
+        self.eq_state.pressed = hit;
+        match hit {
+            Some(EqHit::TitleBar) => {
+                if let Some(eq) = self.eq.as_ref() {
+                    if let Err(e) = eq.window.drag_window() {
+                        eprintln!("tubeamp: equalizer drag failed: {e}");
+                    }
+                }
+            }
+            Some(EqHit::Slider(slider)) => {
+                if let Some((x, y)) = self.eq.as_ref().and_then(|e| e.skin_point()) {
+                    let grab = press_grab(slider, &self.eq_state.settings, x, y);
+                    self.eq_drag = Some(EqDrag { slider, grab });
+                    self.eq_state.dragging = Some(slider);
+                    self.update_eq_drag();
+                }
+            }
+            _ => {}
+        }
+        self.request_redraw();
+    }
+
+    fn on_eq_release(&mut self) {
+        let target = self.eq_press.take();
+        let hit = self.eq_hit_under_cursor();
+        self.eq_state.pressed = None;
+        self.eq_drag = None;
+        self.eq_state.dragging = None;
+        if let Some(target) = target {
+            if Some(target) == hit {
+                self.activate_eq(target);
+            }
+        }
+        self.request_redraw();
+    }
+
+    fn activate_eq(&mut self, hit: EqHit) {
+        match hit {
+            EqHit::Close => self.hide_eq(),
+            EqHit::On => self.toggle_power(),
+            EqHit::Auto => self.toggle_auto(),
+            EqHit::Presets => self.open_presets_menu(),
+            EqHit::TitleBar | EqHit::Slider(_) => {}
+        }
+    }
+
+    /// Moves the slider being dragged to the pointer. The value goes straight to the audio.
+    fn update_eq_drag(&mut self) {
+        let Some(drag) = self.eq_drag else {
+            return;
+        };
+        let Some((_, y)) = self.eq.as_ref().and_then(|e| e.skin_point()) else {
+            return;
+        };
+        let value = slider_value_at(drag.slider, y, drag.grab);
+        self.set_slider(drag.slider, value);
+        self.request_redraw();
+    }
+
+    fn set_slider(&mut self, slider: EqSlider, value: u8) {
+        let settings = &mut self.eq_state.settings;
+        match slider {
+            EqSlider::Preamp => {
+                settings.preamp = value;
+                eq_params().set_preamp(value);
+            }
+            EqSlider::Band(i) => {
+                settings.bands[i] = value;
+                eq_params().set_band(i, value);
+            }
+        }
+    }
+
+    /// The main window's marquee while an equalizer slider is dragged (Webamp's `EQ:` text).
+    fn eq_marquee(&self, slider: EqSlider) -> String {
+        let settings = &self.eq_state.settings;
+        match slider {
+            EqSlider::Preamp => labels::eq_preamp_text(settings.preamp_db()),
+            EqSlider::Band(i) => labels::eq_band_text(BANDS_HZ[i] as u32, settings.band_db(i)),
+        }
+    }
+
+    /// ON: the bypass switch. The audio tap applies the curve only while this is on.
+    fn toggle_power(&mut self) {
+        let on = !self.eq_state.settings.on;
+        self.eq_state.settings.on = on;
+        eq_params().set_on(on);
+        self.request_redraw();
+    }
+
+    /// AUTO only stores the flag for now. TODO: per-track auto presets are a later feature.
+    fn toggle_auto(&mut self) {
+        self.eq_state.settings.auto = !self.eq_state.settings.auto;
+        self.request_redraw();
+    }
+
+    /// Shows the PRESETS menu at the button. Its choices come back as `UserEvent::Menu`.
+    fn open_presets_menu(&mut self) {
+        let Some(eq) = self.eq.as_ref() else {
+            return;
+        };
+        let zoom = eq.zoom() as i32;
+        let x = f64::from(PRESETS_BTN.x * zoom);
+        let y = f64::from((PRESETS_BTN.y + PRESETS_BTN.h) * zoom);
+        if let Err(e) = eq::show_presets_menu(&eq.window, x, y) {
+            eprintln!("tubeamp: could not show the PRESETS menu: {e}");
+        }
+        self.request_redraw();
+    }
+
+    fn run_eq_command(&mut self, cmd: EqCommand) {
+        match cmd {
+            EqCommand::Builtin(i) => {
+                let preset = BUILTIN[i];
+                self.apply_curve(preset.preamp, preset.bands);
+            }
+            EqCommand::Reset => self.apply_curve(ZERO_VALUE, [ZERO_VALUE; 10]),
+            EqCommand::LoadEqf => self.load_eqf(),
+            EqCommand::SaveEqf => self.save_eqf(),
+        }
+        self.request_redraw();
+    }
+
+    /// Replaces the preamp and bands, and pushes them to the audio. ON and AUTO stay as they are.
+    fn apply_curve(&mut self, preamp: u8, bands: [u8; 10]) {
+        self.eq_state.settings.preamp = preamp;
+        self.eq_state.settings.bands = bands;
+        self.apply_eq_settings();
+    }
+
+    fn apply_eq_settings(&self) {
+        eq_params().set(&self.eq_state.settings);
+    }
+
+    fn load_eqf(&mut self) {
+        let Some(path) = eq::pick_eqf_to_load() else {
+            return;
+        };
+        let loaded = std::fs::read(&path)
+            .map_err(|e| format!("could not read {}: {e}", path.display()))
+            .and_then(|bytes| {
+                eq::first_entry(&bytes).map_err(|e| format!("{}: {e}", path.display()))
+            });
+        match loaded {
+            Ok(entry) => {
+                self.apply_curve(entry.preamp, entry.bands);
+                eprintln!(
+                    "tubeamp: loaded EQ preset \"{}\" from {}",
+                    entry.name,
+                    path.display()
+                );
+            }
+            Err(msg) => eprintln!("tubeamp: {msg}"),
+        }
+    }
+
+    fn save_eqf(&mut self) {
+        let Some(path) = eq::pick_eqf_to_save() else {
+            return;
+        };
+        let bytes = eq::eqf_bytes(&eq::entry_name(&path), &self.eq_state.settings);
+        match std::fs::write(&path, bytes) {
+            Ok(()) => eprintln!("tubeamp: saved EQ preset to {}", path.display()),
+            Err(e) => eprintln!("tubeamp: could not write {}: {e}", path.display()),
+        }
     }
 
     fn on_bridge_event(&mut self, evt: Evt) {
@@ -503,13 +787,17 @@ impl App {
                 0.0
             };
         }
-        self.state.title = match self.drag {
-            Some(Drag::Position { percent }) if p.duration_secs > 0 => {
-                labels::seek_text(p.duration_secs, percent)
+        self.state.title = if let Some(drag) = self.eq_drag {
+            self.eq_marquee(drag.slider)
+        } else {
+            match self.drag {
+                Some(Drag::Position { percent }) if p.duration_secs > 0 => {
+                    labels::seek_text(p.duration_secs, percent)
+                }
+                Some(Drag::Volume) => labels::volume_text(self.state.volume),
+                Some(Drag::Balance) => labels::balance_text(self.state.balance),
+                _ => p.marquee_text(),
             }
-            Some(Drag::Volume) => labels::volume_text(self.state.volume),
-            Some(Drag::Balance) => labels::balance_text(self.state.balance),
-            _ => p.marquee_text(),
         };
     }
 
@@ -544,50 +832,35 @@ impl App {
         }
     }
 
-    fn render_frame(&self, factor: u32) -> Vec<u32> {
+    /// The main window as it looks now, at skin size.
+    fn main_canvas(&self) -> Canvas {
         let mut canvas = Canvas::new(WIDTH, HEIGHT);
         render_main(&self.skin, &self.state, &mut canvas);
         render_vis(&self.skin, &self.state, &self.vis_frame, &mut canvas);
-        let mut out = vec![0u32; ((WIDTH * factor) * (HEIGHT * factor)) as usize];
-        canvas.scale_into(&mut out, factor);
-        out
+        canvas
     }
 
-    fn redraw(&mut self) {
-        let Some(window) = self.window.clone() else {
-            return;
-        };
-        let size = window.inner_size();
-        let (Some(pw), Some(ph)) = (NonZeroU32::new(size.width), NonZeroU32::new(size.height))
-        else {
-            return;
-        };
-        let f = self.factor();
-        let frame = self.render_frame(f);
-        let Some(surface) = self.surface.as_mut() else {
-            return;
-        };
-        if let Err(e) = surface.resize(pw, ph) {
-            eprintln!("tubeamp: surface resize failed: {e}");
+    /// The equalizer window as it looks now, at skin size.
+    fn eq_canvas(&self) -> Canvas {
+        let mut canvas = Canvas::new(eqw::WIDTH, eqw::HEIGHT);
+        render_eq(&self.skin, &self.eq_state, &mut canvas);
+        canvas
+    }
+
+    fn redraw_main(&mut self) {
+        let canvas = self.main_canvas();
+        if let Some(main) = self.main.as_mut() {
+            main.present(&canvas);
+        }
+    }
+
+    fn redraw_eq(&mut self) {
+        if !self.eq_visible {
             return;
         }
-        let mut buffer = match surface.buffer_mut() {
-            Ok(buffer) => buffer,
-            Err(e) => {
-                eprintln!("tubeamp: could not map the window buffer: {e}");
-                return;
-            }
-        };
-        present(
-            &mut buffer,
-            size.width,
-            size.height,
-            &frame,
-            WIDTH * f,
-            HEIGHT * f,
-        );
-        if let Err(e) = buffer.present() {
-            eprintln!("tubeamp: present failed: {e}");
+        let canvas = self.eq_canvas();
+        if let Some(eq) = self.eq.as_mut() {
+            eq.present(&canvas);
         }
     }
 
@@ -595,10 +868,15 @@ impl App {
         let Some((_, path)) = &self.opts.screenshot else {
             return;
         };
-        let pixels = self.render_frame(2);
-        match crate::save_png(&pixels, WIDTH * 2, HEIGHT * 2, path) {
-            Ok(()) => eprintln!("tubeamp: wrote {}", path.display()),
-            Err(e) => eprintln!("tubeamp: could not write {}: {e}", path.display()),
+        save_one(&scaled(&self.main_canvas(), 2), WIDTH * 2, HEIGHT * 2, path);
+        if self.eq_visible {
+            let eq_path = eq_screenshot_path(path);
+            save_one(
+                &scaled(&self.eq_canvas(), 2),
+                eqw::WIDTH * 2,
+                eqw::HEIGHT * 2,
+                &eq_path,
+            );
         }
     }
 
@@ -645,7 +923,7 @@ impl App {
             }
             self.refresh_display();
             self.request_redraw();
-            let active = playing || self.drag.is_some();
+            let active = playing || self.drag.is_some() || self.eq_drag.is_some();
             self.next_frame = now + if active { FRAME_ACTIVE } else { FRAME_IDLE };
         }
 
@@ -679,38 +957,122 @@ impl App {
             _ => {}
         }
     }
+
+    fn main_event(&mut self, event_loop: &ActiveEventLoop, event: WindowEvent) {
+        match event {
+            WindowEvent::CloseRequested => event_loop.exit(),
+            WindowEvent::RedrawRequested => self.redraw_main(),
+            WindowEvent::Resized(size) => {
+                self.on_main_resized(size);
+                self.request_redraw();
+            }
+            WindowEvent::Moved(pos) => self.on_main_moved(pos),
+            WindowEvent::ScaleFactorChanged { .. } => self.request_redraw(),
+            WindowEvent::Focused(focused) => {
+                self.state.focused = focused;
+                self.request_redraw();
+            }
+            WindowEvent::ModifiersChanged(modifiers) => self.modifiers = modifiers.state(),
+            WindowEvent::CursorMoved { position, .. } => {
+                if let Some(main) = self.main.as_mut() {
+                    main.set_cursor(Some(position));
+                }
+                if self.drag.is_some() {
+                    self.update_drag();
+                }
+            }
+            WindowEvent::CursorLeft { .. } => {
+                if let Some(main) = self.main.as_mut() {
+                    main.set_cursor(None);
+                }
+            }
+            WindowEvent::MouseInput {
+                state,
+                button: MouseButton::Left,
+                ..
+            } => match state {
+                ElementState::Pressed => self.on_press(),
+                ElementState::Released => self.on_release(event_loop),
+            },
+            WindowEvent::KeyboardInput { event, .. } => self.on_key(&event),
+            _ => {}
+        }
+    }
+
+    fn eq_event(&mut self, event: WindowEvent) {
+        match event {
+            // The equalizer has no native close button. Closing it hides it, like its title button.
+            WindowEvent::CloseRequested => self.hide_eq(),
+            WindowEvent::RedrawRequested => self.redraw_eq(),
+            WindowEvent::Resized(_) | WindowEvent::ScaleFactorChanged { .. } => {
+                self.request_redraw()
+            }
+            WindowEvent::Focused(focused) => {
+                self.eq_state.focused = focused;
+                self.request_redraw();
+            }
+            WindowEvent::ModifiersChanged(modifiers) => self.modifiers = modifiers.state(),
+            WindowEvent::CursorMoved { position, .. } => {
+                if let Some(eq) = self.eq.as_mut() {
+                    eq.set_cursor(Some(position));
+                }
+                if self.eq_drag.is_some() {
+                    self.update_eq_drag();
+                }
+            }
+            WindowEvent::CursorLeft { .. } => {
+                if let Some(eq) = self.eq.as_mut() {
+                    eq.set_cursor(None);
+                }
+            }
+            WindowEvent::MouseInput {
+                state,
+                button: MouseButton::Left,
+                ..
+            } => match state {
+                ElementState::Pressed => self.on_eq_press(),
+                ElementState::Released => self.on_eq_release(),
+            },
+            WindowEvent::KeyboardInput { event, .. } => self.on_key(&event),
+            _ => {}
+        }
+    }
 }
 
 impl ApplicationHandler<UserEvent> for App {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
-        if self.window.is_some() {
+        if self.main.is_some() {
             return;
         }
-        let attributes = WindowAttributes::default()
+        let zoom = self.opts.zoom;
+        let main_attributes = WindowAttributes::default()
             .with_title("TubeAmp")
             .with_decorations(false)
             .with_resizable(false)
-            .with_inner_size(self.logical_size());
-        let window: SharedWindow = match event_loop.create_window(attributes) {
-            Ok(window) => Rc::new(window),
+            .with_inner_size(LogicalSize::new(WIDTH * zoom, HEIGHT * zoom));
+        let main = match SkinnedWindow::new(event_loop, main_attributes, (WIDTH, HEIGHT), zoom) {
+            Ok(main) => main,
             Err(e) => {
-                eprintln!("tubeamp: could not create the window: {e}");
+                eprintln!("tubeamp: {e}");
                 event_loop.exit();
                 return;
             }
         };
-        let context = match Context::new(window.clone()) {
-            Ok(context) => context,
+        let eq_attributes = WindowAttributes::default()
+            .with_title("TubeAmp Equalizer")
+            .with_decorations(false)
+            .with_resizable(false)
+            .with_visible(false)
+            .with_inner_size(LogicalSize::new(eqw::WIDTH * zoom, eqw::HEIGHT * zoom));
+        let eq = match SkinnedWindow::new(
+            event_loop,
+            eq_attributes,
+            (eqw::WIDTH, eqw::HEIGHT),
+            zoom,
+        ) {
+            Ok(eq) => eq,
             Err(e) => {
-                eprintln!("tubeamp: could not create the softbuffer context: {e}");
-                event_loop.exit();
-                return;
-            }
-        };
-        let surface = match Surface::new(&context, window.clone()) {
-            Ok(surface) => surface,
-            Err(e) => {
-                eprintln!("tubeamp: could not create the softbuffer surface: {e}");
+                eprintln!("tubeamp: {e}");
                 event_loop.exit();
                 return;
             }
@@ -740,18 +1102,37 @@ impl ApplicationHandler<UserEvent> for App {
             }
         };
 
-        self.window = Some(window);
-        self.context = Some(context);
-        self.surface = Some(surface);
+        self.main_rect = main
+            .window
+            .outer_position()
+            .ok()
+            .map(|p| (p, main.window.inner_size()));
+        self.main = Some(main);
+        self.eq = Some(eq);
         self.host = Some(host);
         self.bridge = Some(bridge);
         self.host_visible = false;
+
+        // The audio starts from the flat curve, or from the preset named on the command line.
+        self.apply_eq_settings();
+        if let Some(preset) = self.opts.eq_preset {
+            self.apply_curve(preset.preamp, preset.bands);
+        }
+        if self.opts.open_eq {
+            self.show_eq();
+        }
         self.request_redraw();
     }
 
     fn user_event(&mut self, _event_loop: &ActiveEventLoop, event: UserEvent) {
         match event {
             UserEvent::Bridge(evt) => self.on_bridge_event(evt),
+            UserEvent::Menu(id) => {
+                self.log(format!("menu item {id}"));
+                if let Some(cmd) = eq::command_for_id(&id) {
+                    self.run_eq_command(cmd);
+                }
+            }
         }
     }
 
@@ -763,40 +1144,28 @@ impl ApplicationHandler<UserEvent> for App {
     ) {
         if self.host.as_ref().is_some_and(|h| h.id() == window_id) {
             self.host_event(event);
-            return;
-        }
-        match event {
-            WindowEvent::CloseRequested => event_loop.exit(),
-            WindowEvent::RedrawRequested => self.redraw(),
-            WindowEvent::Resized(_) | WindowEvent::ScaleFactorChanged { .. } => {
-                self.request_redraw()
-            }
-            WindowEvent::Focused(focused) => {
-                self.state.focused = focused;
-                self.request_redraw();
-            }
-            WindowEvent::ModifiersChanged(modifiers) => self.modifiers = modifiers.state(),
-            WindowEvent::CursorMoved { position, .. } => {
-                self.cursor = Some(position);
-                if self.drag.is_some() {
-                    self.update_drag();
-                }
-            }
-            WindowEvent::CursorLeft { .. } => self.cursor = None,
-            WindowEvent::MouseInput {
-                state,
-                button: MouseButton::Left,
-                ..
-            } => match state {
-                ElementState::Pressed => self.on_press(),
-                ElementState::Released => self.on_release(event_loop),
-            },
-            WindowEvent::KeyboardInput { event, .. } => self.on_key(&event),
-            _ => {}
+        } else if self.eq.as_ref().is_some_and(|e| e.id() == window_id) {
+            self.eq_event(event);
+        } else if self.main.as_ref().is_some_and(|m| m.id() == window_id) {
+            self.main_event(event_loop, event);
         }
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
         self.tick(event_loop);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn eq_screenshot_goes_next_to_the_main_one() {
+        assert_eq!(
+            eq_screenshot_path(Path::new("out/m3.png")),
+            PathBuf::from("out/m3-eq.png")
+        );
+        assert_eq!(eq_screenshot_path(Path::new("m3")), PathBuf::from("m3-eq"));
     }
 }

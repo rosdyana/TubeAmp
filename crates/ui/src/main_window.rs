@@ -5,7 +5,9 @@
 //! `js/components/MainWindow/*.tsx` (MIT, © Jordan Eldredge).
 
 use crate::canvas::{Canvas, Rect};
+use crate::sliders::{BALANCE_TRAVEL, POSITION_TRAVEL, VOLUME_TRAVEL};
 use crate::text::{draw_text, marquee_frame};
+use crate::vis::{VisMode, VIS_RECT};
 use tubeamp_skin::{Sheet, Skin};
 
 /// Main window width in pixels (1×).
@@ -49,6 +51,10 @@ pub struct MainState {
     pub marquee_offset: u32,
     /// The control currently held down, drawn with its pressed sprite.
     pub pressed: Option<MainButton>,
+    /// Whether the window is in double-size mode (lights the D button).
+    pub doubled: bool,
+    /// What the vis area shows.
+    pub vis_mode: VisMode,
 }
 
 impl Default for MainState {
@@ -72,6 +78,8 @@ impl Default for MainState {
             focused: false,
             marquee_offset: 0,
             pressed: None,
+            doubled: false,
+            vis_mode: VisMode::default(),
         }
     }
 }
@@ -114,6 +122,8 @@ pub enum MainHit {
     Kbps,
     Khz,
     MonoStereo,
+    /// The visualiser area (clicking it cycles the mode).
+    Vis,
 }
 
 // Element rectangles (window pixels), from css/main-window.css.
@@ -134,11 +144,11 @@ const MARQUEE: Rect = Rect::new(111, 24, 154, 12);
 const KBPS: Rect = Rect::new(111, 43, 15, 6);
 const KHZ: Rect = Rect::new(156, 43, 10, 6);
 const MONO_STEREO: Rect = Rect::new(212, 41, 57, 12);
-const VOLUME: Rect = Rect::new(107, 57, 68, 13);
-const BALANCE: Rect = Rect::new(177, 57, 38, 13);
+pub const VOLUME: Rect = Rect::new(107, 57, 68, 13);
+pub const BALANCE: Rect = Rect::new(177, 57, 38, 13);
 const EQ_TOGGLE: Rect = Rect::new(219, 58, 23, 12);
 const PL_TOGGLE: Rect = Rect::new(242, 58, 23, 12);
-const POSITION: Rect = Rect::new(16, 72, 248, 10);
+pub const POSITION: Rect = Rect::new(16, 72, 248, 10);
 const PREVIOUS: Rect = Rect::new(16, 88, 23, 18);
 const PLAY: Rect = Rect::new(39, 88, 23, 18);
 const PAUSE: Rect = Rect::new(62, 88, 23, 18);
@@ -161,6 +171,7 @@ const HIT_TABLE: &[(Rect, MainHit)] = &[
     (CLUTTER_V, MainHit::Button(MainButton::ClutterV)),
     (TIME, MainHit::Time),
     (MARQUEE, MainHit::Marquee),
+    (VIS_RECT, MainHit::Vis),
     (KBPS, MainHit::Kbps),
     (KHZ, MainHit::Khz),
     (MONO_STEREO, MainHit::MonoStereo),
@@ -178,11 +189,6 @@ const HIT_TABLE: &[(Rect, MainHit)] = &[
     (SHUFFLE, MainHit::Button(MainButton::Shuffle)),
     (REPEAT, MainHit::Button(MainButton::Repeat)),
 ];
-
-/// Thumb travel (input width minus thumb width) for each slider.
-const VOLUME_TRAVEL: u32 = 65 - 14;
-const BALANCE_TRAVEL: u32 = 38 - 14;
-const POSITION_TRAVEL: u32 = 248 - 29;
 
 /// Absolute left edges of the four digits (minutes tens/units, seconds tens/units).
 const DIGIT_X: [i32; 4] = [48, 60, 78, 90];
@@ -294,7 +300,7 @@ fn draw_part(
 
 /// Draws the whole main window in Webamp's layout, from the background up.
 ///
-/// The visualiser area (24, 43) is intentionally left as background for now.
+/// The visualiser area (24, 43) is left as background here. [`crate::render_vis`] draws it on top.
 pub fn render_main(skin: &Skin, st: &MainState, canvas: &mut Canvas) {
     draw(skin, canvas, Sheet::Main, "MAIN_WINDOW_BACKGROUND", 0, 0);
     draw_titlebar(skin, st, canvas);
@@ -411,6 +417,17 @@ fn draw_clutterbar(skin: &Skin, st: &MainState, canvas: &mut Canvas) {
         if is_down(st, button) {
             draw(skin, canvas, Sheet::Titlebar, name, rect.x, rect.y);
         }
+    }
+    // D stays lit while the window is doubled.
+    if st.doubled {
+        draw(
+            skin,
+            canvas,
+            Sheet::Titlebar,
+            "MAIN_CLUTTER_BAR_BUTTON_D_SELECTED",
+            CLUTTER_D.x,
+            CLUTTER_D.y,
+        );
     }
 }
 
@@ -1196,6 +1213,34 @@ mod tests {
         assert_eq!(
             hit_test_main(14, 50),
             Some(MainHit::Button(MainButton::ClutterD))
+        );
+    }
+
+    #[test]
+    fn hit_test_finds_the_visualiser_area() {
+        assert_eq!(hit_test_main(24, 43), Some(MainHit::Vis));
+        assert_eq!(hit_test_main(99, 58), Some(MainHit::Vis));
+        assert_eq!(hit_test_main(100, 58), None);
+    }
+
+    #[test]
+    fn doubled_window_lights_the_d_button() {
+        let skin = testkit::synthetic_skin();
+        let off = render(&skin, &base_state());
+        let on = render(
+            &skin,
+            &MainState {
+                doubled: true,
+                ..base_state()
+            },
+        );
+        let sprite = skin
+            .sprite(Sheet::Titlebar, "MAIN_CLUTTER_BAR_BUTTON_D_SELECTED")
+            .expect("D selected sprite");
+        assert_eq!(px(&on, CLUTTER_D.x, CLUTTER_D.y), sprite.pixel(0, 0));
+        assert_ne!(
+            px(&off, CLUTTER_D.x, CLUTTER_D.y),
+            px(&on, CLUTTER_D.x, CLUTTER_D.y)
         );
     }
 

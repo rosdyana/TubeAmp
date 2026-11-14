@@ -1,12 +1,9 @@
-//! Winamp-style main window rendering for TubeAmp.
-//!
-//! - [`canvas`]: the 1× pixel buffer and sprite blitting.
-//! - [`text`]: TEXT.BMP font rendering and the marquee.
-//! - [`main_window`]: the 275×116 main window (rendering and hit testing).
-
 pub mod canvas;
+pub mod labels;
 pub mod main_window;
+pub mod sliders;
 pub mod text;
+pub mod vis;
 
 pub use canvas::{Canvas, Rect};
 pub use main_window::{
@@ -14,3 +11,4 @@ pub use main_window::{
     Status, HEIGHT, WIDTH,
 };
 pub use text::{draw_text, marquee_frame, marquee_period_px};
+pub use vis::{render_vis, VisMode, VIS_RECT};

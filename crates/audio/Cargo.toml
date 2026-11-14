@@ -1,0 +1,14 @@
+[package]
+name = "tubeamp-audio"
+version = "0.0.0"
+edition = "2021"
+publish = false
+description = "TubeAmp audio: macOS Core Audio process tap feeding the EQ, lock-free sample ring, Winamp-style visualiser analyser"
+
+[dependencies]
+tubeamp-eq = { path = "../eq" }
+rtrb = "0.4.1"
+rustfft = "6.4.1"
+
+[build-dependencies]
+cc = "1"

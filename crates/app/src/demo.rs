@@ -1,4 +1,4 @@
-//! Demo content shown by the M1 main window until playback is wired up.
+//! Demo content for the headless `--render-main` render.
 
 use tubeamp_ui::{MainState, Status};
 
@@ -28,21 +28,11 @@ pub fn demo_state(time_secs: u32, marquee_offset: u32, focused: bool) -> MainSta
 }
 
 /// Sets the elapsed time and the matching position (time / duration).
-pub fn set_time(st: &mut MainState, time_secs: u32) {
+fn set_time(st: &mut MainState, time_secs: u32) {
     st.time_secs = time_secs;
     st.position = if st.duration_secs == 0 {
         0.0
     } else {
         time_secs as f32 / st.duration_secs as f32
     };
-}
-
-/// Advances the demo clock by one second, wrapping at the end of the track.
-pub fn advance_clock(st: &mut MainState) {
-    let next = if st.time_secs >= st.duration_secs {
-        0
-    } else {
-        st.time_secs + 1
-    };
-    set_time(st, next);
 }

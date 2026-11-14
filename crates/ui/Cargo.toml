@@ -3,7 +3,8 @@ name = "tubeamp-ui"
 version = "0.0.0"
 edition = "2021"
 publish = false
-description = "Winamp-style main window rendering (canvas, TEXT.BMP font, marquee, hit testing)"
+description = "Winamp-style main window rendering (canvas, TEXT.BMP font, marquee, visualiser, slider math, hit testing)"
 
 [dependencies]
 tubeamp-skin = { path = "../skin" }
+tubeamp-audio = { path = "../audio" }

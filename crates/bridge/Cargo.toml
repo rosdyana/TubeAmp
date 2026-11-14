@@ -1,0 +1,12 @@
+[package]
+name = "tubeamp-bridge"
+version = "0.0.0"
+edition = "2021"
+publish = false
+description = "TubeAmp bridge: wry webview on music.youtube.com, bridge.js injection, Cmd/Evt protocol"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+winit = "0.30.13"
+wry = "0.57"

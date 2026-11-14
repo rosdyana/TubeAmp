@@ -1,24 +1,35 @@
-//! TubeAmp desktop player. M1 shows the classic Winamp main window.
+//! TubeAmp desktop player: YouTube Music in a classic Winamp 2.x skin.
 //!
-//! - `tubeamp [--skin PATH.wsz] [--zoom N]` opens the frameless window.
-//! - `tubeamp --render-main SKIN.wsz OUT.png [--zoom N]` renders the demo state
-//!   at 83 s to a PNG and exits without creating a window.
+//! - `tubeamp [--skin PATH.wsz] [--zoom N]` opens the main window and the hidden video host.
+//! - `tubeamp --render-main SKIN.wsz OUT.png [--zoom N]` renders the demo state to a PNG and exits.
+//!
+//! Test hooks: `--screenshot-after SECS OUT.png` saves the live main window (2×) and keeps running,
+//! `--quit-after SECS` exits after a while, `TUBEAMP_AUTOLOAD=<videoId>` loads a video six seconds
+//! after start, and `TUBEAMP_LOG=1` prints bridge events and state changes to stderr.
 
 mod demo;
+mod player;
 mod window;
 
 use std::error::Error;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::time::Duration;
 
 use tubeamp_skin::{testkit, Skin};
 use tubeamp_ui::{render_main, Canvas, MainState, HEIGHT, WIDTH};
 
 const USAGE: &str = "usage:
-  tubeamp [--skin PATH.wsz] [--zoom N]
+  tubeamp [--skin PATH.wsz] [--zoom N] [--screenshot-after SECS OUT.png] [--quit-after SECS]
   tubeamp --render-main SKIN.wsz OUT.png [--zoom N]
 
-  --zoom N   integer scale of the 275x116 window (1..=8, default 1)";
+  --zoom N                 integer scale of the 275x116 window (1..=8, default 1)
+  --screenshot-after S F   save the live main window (2x) to F after S seconds
+  --quit-after S           exit after S seconds
+
+environment:
+  TUBEAMP_AUTOLOAD=ID      load YouTube video ID six seconds after start
+  TUBEAMP_LOG=1            print bridge events and state changes to stderr";
 
 /// Time shown by the headless render, in seconds (01:23).
 const RENDER_TIME_SECS: u32 = 83;
@@ -28,6 +39,8 @@ struct Args {
     skin: Option<PathBuf>,
     render: Option<(PathBuf, PathBuf)>,
     zoom: Option<u32>,
+    screenshot: Option<(Duration, PathBuf)>,
+    quit_after: Option<Duration>,
     help: bool,
 }
 
@@ -35,6 +48,19 @@ fn next_path(args: &mut impl Iterator<Item = String>, flag: &str) -> Result<Path
     args.next()
         .map(PathBuf::from)
         .ok_or_else(|| format!("{flag} needs a value"))
+}
+
+fn next_seconds(args: &mut impl Iterator<Item = String>, flag: &str) -> Result<Duration, String> {
+    let value = args
+        .next()
+        .ok_or_else(|| format!("{flag} needs a number of seconds"))?;
+    let secs: f64 = value
+        .parse()
+        .map_err(|_| format!("invalid seconds for {flag}: {value}"))?;
+    if !secs.is_finite() || secs < 0.0 {
+        return Err(format!("{flag} needs a non-negative number, got {value}"));
+    }
+    Ok(Duration::from_secs_f64(secs))
 }
 
 fn parse_args(mut args: impl Iterator<Item = String>) -> Result<Args, String> {
@@ -57,6 +83,12 @@ fn parse_args(mut args: impl Iterator<Item = String>) -> Result<Args, String> {
                 }
                 out.zoom = Some(zoom);
             }
+            "--screenshot-after" => {
+                let after = next_seconds(&mut args, "--screenshot-after")?;
+                let png = next_path(&mut args, "--screenshot-after")?;
+                out.screenshot = Some((after, png));
+            }
+            "--quit-after" => out.quit_after = Some(next_seconds(&mut args, "--quit-after")?),
             "-h" | "--help" => out.help = true,
             other => return Err(format!("unknown argument: {other}")),
         }
@@ -109,7 +141,16 @@ fn run() -> Result<(), Box<dyn Error>> {
             testkit::synthetic_skin()
         }
     };
-    window::run(skin, zoom)?;
+    let options = window::Options {
+        zoom,
+        screenshot: args.screenshot,
+        quit_after: args.quit_after,
+        autoload: std::env::var("TUBEAMP_AUTOLOAD")
+            .ok()
+            .filter(|id| !id.trim().is_empty()),
+        log: std::env::var_os("TUBEAMP_LOG").is_some(),
+    };
+    window::run(skin, options)?;
     Ok(())
 }
 

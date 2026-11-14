@@ -3,7 +3,7 @@ name = "tubeamp"
 version = "0.0.0"
 edition = "2021"
 publish = false
-description = "TubeAmp: YouTube Music player in a classic Winamp skin (M1: main window)"
+description = "TubeAmp: YouTube Music player in a classic Winamp skin (M2: interactive main window, bridge, audio tap)"
 
 [[bin]]
 name = "tubeamp"
@@ -12,6 +12,8 @@ path = "src/main.rs"
 [dependencies]
 tubeamp-skin = { path = "../skin" }
 tubeamp-ui = { path = "../ui" }
+tubeamp-audio = { path = "../audio" }
+tubeamp-bridge = { path = "../bridge" }
 winit = "0.30.13"
 softbuffer = "0.4"
 image = { version = "0.25", default-features = false, features = ["png"] }

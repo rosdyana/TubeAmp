@@ -1,0 +1,162 @@
+//! macOS audio engine: Core Audio process tap (see `tap.m`) + EQ in the IOProc.
+
+use std::ffi::{c_int, c_void};
+use std::sync::atomic::{AtomicBool, Ordering};
+
+use tubeamp_eq::EqProcessor;
+
+use crate::{AudioError, PARAMS};
+
+type IoCallback = extern "C" fn(*const f32, u32, *mut f32, u32, u32, *mut c_void);
+
+extern "C" {
+    fn ta_create(owner: c_int, verbose: c_int, out_sr: *mut f64) -> c_int;
+    fn ta_start(cb: IoCallback, user: *mut c_void) -> c_int;
+    fn ta_stop();
+}
+
+/// Ring capacity in samples (about 0.7 s at 48 kHz). Overflow drops the newest samples.
+const RING_CAPACITY: usize = 1 << 15;
+
+/// Only one tap can exist at a time (the C side keeps global state).
+static RUNNING: AtomicBool = AtomicBool::new(false);
+
+/// State owned by the audio callback. Allocated before the IOProc starts and freed after it stops.
+struct Callback {
+    eq: EqProcessor,
+    tx: rtrb::Producer<f32>,
+}
+
+/// Runs on the Core Audio thread. Must not allocate or block.
+extern "C" fn on_audio(
+    inp: *const f32,
+    in_ch: u32,
+    out: *mut f32,
+    out_ch: u32,
+    frames: u32,
+    user: *mut c_void,
+) {
+    let (ic, oc, n) = (
+        in_ch.max(1) as usize,
+        out_ch.max(1) as usize,
+        frames as usize,
+    );
+    if n == 0 || inp.is_null() || out.is_null() || user.is_null() {
+        return;
+    }
+    // SAFETY: `user` is the `Callback` boxed in `start_inner`. It stays alive until `ta_stop`
+    // has returned, and `ta_stop` is the only thing that stops this callback.
+    let cb = unsafe { &mut *(user as *mut Callback) };
+    // SAFETY: the C side passes buffers of `frames * channels` interleaved floats (it clamps
+    // `frames` to both buffers), and `ic`/`oc` are the channel counts it reported.
+    let input = unsafe { std::slice::from_raw_parts(inp, n * ic) };
+    let output = unsafe { std::slice::from_raw_parts_mut(out, n * oc) };
+    cb.eq.process(&PARAMS, input, ic, output, oc, n);
+    for frame in output.chunks_exact(oc) {
+        let left = frame[0];
+        let right = if oc > 1 { frame[1] } else { left };
+        // A full ring drops the sample; the UI only needs a recent window.
+        let _ = cb.tx.push(0.5 * (left + right));
+    }
+}
+
+fn map_error(code: c_int, stage: &'static str) -> AudioError {
+    match code {
+        -10 => AudioError::NoOwnedProcess,
+        code => AudioError::Core { stage, code },
+    }
+}
+
+/// The running tap. Dropping it stops the device.
+pub struct AudioEngine {
+    rx: rtrb::Consumer<f32>,
+    sample_rate: u32,
+    callback: *mut Callback,
+}
+
+impl AudioEngine {
+    /// Starts the tap on our WebKit audio process. Fails with
+    /// [`AudioError::NoOwnedProcess`] until YouTube Music has started playing, so callers
+    /// should retry.
+    pub fn start() -> Result<AudioEngine, AudioError> {
+        if RUNNING.swap(true, Ordering::SeqCst) {
+            return Err(AudioError::AlreadyRunning);
+        }
+        let result = start_inner();
+        if result.is_err() {
+            RUNNING.store(false, Ordering::SeqCst);
+        }
+        result
+    }
+
+    /// Device sample rate in Hz, as read before the IOProc started.
+    pub fn sample_rate(&self) -> u32 {
+        self.sample_rate
+    }
+
+    /// Replaces `out` with the mono post-EQ samples produced since the last call.
+    pub fn drain_samples(&mut self, out: &mut Vec<f32>) {
+        out.clear();
+        let available = self.rx.slots();
+        if available == 0 {
+            return;
+        }
+        if let Ok(chunk) = self.rx.read_chunk(available) {
+            let (first, second) = chunk.as_slices();
+            out.extend_from_slice(first);
+            out.extend_from_slice(second);
+            chunk.commit_all();
+        }
+    }
+}
+
+fn start_inner() -> Result<AudioEngine, AudioError> {
+    let verbose = c_int::from(std::env::var_os("TUBEAMP_LOG").is_some());
+    let owner = c_int::try_from(std::process::id()).unwrap_or(0);
+
+    let mut sr = 0.0f64;
+    // SAFETY: `sr` is a valid out-pointer for the duration of the call.
+    let rc = unsafe { ta_create(owner, verbose, &mut sr) };
+    if rc != 0 {
+        // SAFETY: `ta_stop` is idempotent and frees anything a failed `ta_create` left behind.
+        unsafe { ta_stop() };
+        return Err(map_error(rc, "create"));
+    }
+    let sample_rate = sr.round() as u32;
+
+    // Build the DSP for the real device rate before any callback can run.
+    let (tx, rx) = rtrb::RingBuffer::<f32>::new(RING_CAPACITY);
+    let callback = Box::into_raw(Box::new(Callback {
+        eq: EqProcessor::new(sr as f32),
+        tx,
+    }));
+
+    // SAFETY: `callback` stays valid until `AudioEngine::drop` (or the failure branch below)
+    // frees it, and both call `ta_stop` first.
+    let rc = unsafe { ta_start(on_audio, callback as *mut c_void) };
+    if rc != 0 {
+        // SAFETY: `ta_stop` returns before the callback is freed, so nothing still uses it.
+        unsafe {
+            ta_stop();
+            drop(Box::from_raw(callback));
+        }
+        return Err(map_error(rc, "start"));
+    }
+    Ok(AudioEngine {
+        rx,
+        sample_rate,
+        callback,
+    })
+}
+
+impl Drop for AudioEngine {
+    fn drop(&mut self) {
+        // SAFETY: `ta_stop` returns only after the IOProc has stopped, so the callback state
+        // can be freed afterwards and is never used again.
+        unsafe {
+            ta_stop();
+            drop(Box::from_raw(self.callback));
+        }
+        RUNNING.store(false, Ordering::SeqCst);
+    }
+}

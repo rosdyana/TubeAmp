@@ -37,7 +37,7 @@ pub fn render() -> Canvas {
     pip(&mut c, 148, 42, &ICON_CLOSE, true, INK);
 
     // Bottom left piece (0,42) 125×38: panel, five normal buttons, info well.
-    bottom_panel(&mut c, 0, 42, 125, 38, true);
+    bottom_panel(&mut c, 0, 42, 125, 38, true, false);
     let icons = [
         Icon::Glyph(&FULLSCREEN),
         Icon::Text("1X"),
@@ -52,11 +52,11 @@ pub fn render() -> Canvas {
     well(&mut c, 92, 124, 52, 67, true, false);
 
     // Bottom fill (127,81) 25×38 and the well across it.
-    bottom_panel(&mut c, 127, 81, 25, 38, false);
+    bottom_panel(&mut c, 127, 81, 25, 38, false, false);
     well(&mut c, 127, 151, 91, 106, false, false);
 
     // Bottom right piece (0,81) 125×38: the well's end, and the resize grip.
-    bottom_panel(&mut c, 0, 81, 125, 38, true);
+    bottom_panel(&mut c, 0, 81, 125, 38, false, true);
     well(&mut c, 0, 100, 91, 106, false, true);
     resize_grip(&mut c, 124, 118);
     c
@@ -91,18 +91,18 @@ fn side_right(c: &mut Canvas, x: i32, y: i32, h: i32) {
     c.fill(x + 7, y, 1, h, METAL_LO);
 }
 
-/// A bottom panel: gradient body with a highlight on top and a shadow below. `edge` adds a dark
-/// outer edge on the left (left piece) or right (right piece) side, chosen by `x`.
-fn bottom_panel(c: &mut Canvas, x: i32, y: i32, w: i32, h: i32, edge: bool) {
+/// A bottom panel: gradient body with a highlight on top and a shadow below. `edge_left` and
+/// `edge_right` add a dark outer edge on that side. Only the window's outer edges get one, so the
+/// pieces meet the fill without a seam.
+fn bottom_panel(c: &mut Canvas, x: i32, y: i32, w: i32, h: i32, edge_left: bool, edge_right: bool) {
     c.vgrad(x, y + 1, w, h - 2, BODY_TOP, BODY_BOT);
     c.fill(x, y, w, 1, METAL_HI);
     c.fill(x, y + h - 1, w, 1, METAL_LO);
-    if edge {
-        if x == 0 {
-            c.fill(x, y, 1, h, METAL_LO);
-        } else {
-            c.fill(x + w - 1, y, 1, h, METAL_LO);
-        }
+    if edge_left {
+        c.fill(x, y, 1, h, METAL_LO);
+    }
+    if edge_right {
+        c.fill(x + w - 1, y, 1, h, METAL_LO);
     }
 }
 

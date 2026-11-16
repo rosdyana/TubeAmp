@@ -20,7 +20,10 @@ const PRELUDE: &str = if cfg!(target_os = "macos") {
     "window.__tubeamp_page_audio = true;"
 };
 const YTM_URL: &str = "https://music.youtube.com/";
-/// A desktop Safari user agent, which YouTube Music serves with the full player.
+/// A desktop Safari user agent, which YouTube Music serves with the full player. macOS only: there
+/// the engine is WebKit, so it matches. Elsewhere the engine's own user agent is kept (Edge on
+/// WebView2). A Safari agent on Chromium fails YouTube's browser check, and the stream stops after
+/// about 30 seconds.
 const USER_AGENT: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.5 Safari/605.1.15";
 /// The widest CSS viewport the video view lays the page out at. A wider webview is zoomed in
 /// instead (see [`video_page_zoom`]): YouTube Music switches to a different layout above about
@@ -41,9 +44,11 @@ impl Bridge {
     /// every event posted by `bridge.js`, on the thread that runs the event loop.
     pub fn new(host: &Window, sink: impl Fn(Evt) + 'static) -> Result<Bridge, wry::Error> {
         let size = host.inner_size().to_logical::<f64>(host.scale_factor());
-        let webview = WebViewBuilder::new()
-            .with_url(YTM_URL)
-            .with_user_agent(USER_AGENT)
+        let mut builder = WebViewBuilder::new().with_url(YTM_URL);
+        if cfg!(target_os = "macos") {
+            builder = builder.with_user_agent(USER_AGENT);
+        }
+        let webview = builder
             .with_autoplay(true)
             .with_initialization_script(format!("{PRELUDE}\n{BRIDGE_JS}"))
             .with_ipc_handler(move |req| match serde_json::from_str::<Evt>(req.body()) {

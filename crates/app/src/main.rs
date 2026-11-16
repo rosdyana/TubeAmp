@@ -8,12 +8,17 @@
 //! - `tubeamp --render-library SKIN.wsz OUT.png [--zoom N] [--fixture PATH.json]` renders the media
 //!   library from a captured response (search_daft_punk.json by default), without the network.
 //!
+//! On Windows a release build is a GUI app (no console window). Debug builds keep the console for
+//! the logs (`TUBEAMP_LOG=1`) and the `--render-*` output.
+//!
 //! Test hooks: `--screenshot-after SECS OUT.png` saves the live main window (2×) and keeps running,
 //! and the equalizer (`OUT-eq.png`) and playlist (`OUT-pl.png`) too while they are open. `--open-eq`
 //! opens the equalizer at startup, `--open-pl` opens the playlist editor, `--add ID1,ID2` appends
 //! videos to the playlist at startup, `--eq-preset NAME` applies a built-in preset at startup,
 //! `--quit-after SECS` exits after a while, `TUBEAMP_AUTOLOAD=<videoId>` loads a video six seconds
 //! after start, and `TUBEAMP_LOG=1` prints bridge events and state changes to stderr.
+
+#![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
 mod api;
 mod config;

@@ -18,6 +18,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use tubeamp_audio::vis::{Vis, VisFrame};
+#[cfg(target_os = "macos")]
 use tubeamp_audio::guard::{denial_suspected, DENIAL_WINDOW};
 use tubeamp_audio::{params as eq_params, AudioEngine, AudioError, Capture, CaptureEvent};
 use tubeamp_bridge::{Bridge, Cmd, Evt};
@@ -84,8 +85,10 @@ const FRAME_IDLE: Duration = Duration::from_millis(250);
 /// How often to retry the audio tap while playing.
 const AUDIO_RETRY: Duration = Duration::from_secs(2);
 /// The marquee message when the tap is silent while the page plays (no System Audio Recording).
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 const AUDIO_OFF_NOTICE: &str = "EQ OFF: ALLOW SYSTEM AUDIO RECORDING FOR TUBEAMP";
 /// How long that message stays in the marquee.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 const AUDIO_OFF_SHOWN: Duration = Duration::from_secs(8);
 /// The marquee note while the tap's start takes longer than `AUDIO_STARTING_AFTER`. A start can
 /// wait on the System Audio Recording prompt, so the user needs to see that it is in progress.
@@ -184,6 +187,9 @@ pub enum UserEvent {
     Download(Result<PathBuf, String>),
     /// Asks the first-run question (posted once, when there is no config yet).
     FirstRun,
+    /// The first-run question's answer (Windows asks it on a worker thread).
+    #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+    FirstRunAnswer(crate::firstrun::Answer),
 }
 
 /// A slider or seek drag in progress.
@@ -344,6 +350,10 @@ struct App {
     audio_retry_at: Instant,
     /// When the page began reporting playing (`ps == 1`), or `None` while it does not.
     playing_since: Option<Instant>,
+    /// The EQ version last sent to the page's Web Audio graph (not macOS). `None` until it is sent,
+    /// and again after the page reloads (see `sync_page_eq`).
+    #[cfg(not(target_os = "macos"))]
+    page_eq_version: Option<u64>,
     vis: Vis,
     vis_frame: VisFrame,
     samples: Vec<f32>,
@@ -446,6 +456,8 @@ pub fn run(skin: Skin, opts: Options) -> Result<(), winit::error::EventLoopError
         audio_note_shown: false,
         audio_retry_at: started,
         playing_since: None,
+        #[cfg(not(target_os = "macos"))]
+        page_eq_version: None,
         vis: Vis::new(),
         vis_frame: VisFrame::default(),
         samples: Vec::new(),
@@ -2756,6 +2768,7 @@ impl App {
     /// The tap was silent while the page played, so it is torn down. Dropping the engine stops the
     /// device, and YouTube Music's own output plays again (the EQ is bypassed). The marquee says
     /// what to allow. No automatic retry follows: see `retry_audio_capture`.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     fn audio_tap_silent(&mut self) {
         eprintln!(
             "tubeamp: the audio tap is silent while YouTube Music plays; tearing it down (EQ off). \
@@ -2825,6 +2838,26 @@ impl App {
         eq_params().set(&self.eq_state.settings);
     }
 
+    /// Sends the EQ to the page's Web Audio graph when it has changed (not macOS, where the tap
+    /// does the EQ). Every change goes through `eq_params()`, which counts its changes, so this one
+    /// check covers them all. `Evt::Ready` clears the count, so a reloaded page gets the EQ again.
+    #[cfg(not(target_os = "macos"))]
+    fn sync_page_eq(&mut self) {
+        let p = eq_params();
+        let v = p.version();
+        if Some(v) == self.page_eq_version {
+            return;
+        }
+        let s = p.get();
+        self.send(Cmd::Eq {
+            on: s.on,
+            preamp_db: s.preamp_db(),
+            bands_db: std::array::from_fn(|i| s.band_db(i)),
+            balance: p.balance(),
+        });
+        self.page_eq_version = Some(v);
+    }
+
     fn load_eqf(&mut self) {
         let Some(path) = eq::pick_eqf_to_load() else {
             return;
@@ -2859,7 +2892,10 @@ impl App {
     }
 
     fn on_bridge_event(&mut self, evt: Evt) {
-        self.log(format!("event {evt:?}"));
+        // Samples arrive about 47 times a second: they are not logged.
+        if !matches!(evt, Evt::Samples { .. }) {
+            self.log(format!("event {evt:?}"));
+        }
         match &evt {
             Evt::State { .. } => {
                 let now = Instant::now();
@@ -2917,12 +2953,22 @@ impl App {
                     self.on_media_action(action);
                 }
             }
+            // Post-EQ samples from the page's Web Audio graph. macOS gets its samples from the tap.
+            #[cfg(not(target_os = "macos"))]
+            Evt::Samples { rate, data } => tubeamp_audio::feed_page_samples(*rate, data),
+            #[cfg(target_os = "macos")]
+            Evt::Samples { .. } => {}
             Evt::Ready { signed_in } => {
                 // A page that has just loaded starts in the video view, so tell it the view we
                 // are in (the page was loaded from scratch, or the view was changed earlier).
                 self.send(Cmd::SetViewMode {
                     video: !self.video_browser,
                 });
+                // A reloaded page has lost its EQ graph, so the EQ is sent again (not macOS).
+                #[cfg(not(target_os = "macos"))]
+                {
+                    self.page_eq_version = None;
+                }
                 // The page's media session is new: the track goes to it again.
                 self.forget_now_playing();
                 let actions = self.library.on_ready(*signed_in);
@@ -2938,7 +2984,10 @@ impl App {
                 self.apply_library(actions);
             }
         }
-        self.request_redraw();
+        // Samples only feed the analyser, which the frame timer redraws.
+        if !matches!(evt, Evt::Samples { .. }) {
+            self.request_redraw();
+        }
     }
 
     /// The current entry's video is the one that ended: move the playlist on.
@@ -3355,17 +3404,24 @@ impl App {
             (false, _) => None,
         };
         self.poll_audio(now);
-        let suspect = self.capture.engine().is_some_and(|engine| {
-            denial_suspected(
-                now,
-                engine.last_sound_at(),
-                self.playing_since,
-                self.state.volume > 0,
-                DENIAL_WINDOW,
-            )
-        });
-        if suspect {
-            self.audio_tap_silent();
+        #[cfg(not(target_os = "macos"))]
+        self.sync_page_eq();
+        // The silence check is for macOS's System Audio Recording permission (see `guard`). Elsewhere
+        // the page plays the audio, and there is no tap that could be denied.
+        #[cfg(target_os = "macos")]
+        {
+            let suspect = self.capture.engine().is_some_and(|engine| {
+                denial_suspected(
+                    now,
+                    engine.last_sound_at(),
+                    self.playing_since,
+                    self.state.volume > 0,
+                    DENIAL_WINDOW,
+                )
+            });
+            if suspect {
+                self.audio_tap_silent();
+            }
         }
         if playing && self.capture.can_start() && !self.audio_given_up && now >= self.audio_retry_at
         {
@@ -3661,6 +3717,7 @@ impl ApplicationHandler<UserEvent> for App {
             UserEvent::Media(action) => self.on_media_action(action),
             UserEvent::Download(result) => self.on_download_done(result),
             UserEvent::FirstRun => self.first_run_prompt(),
+            UserEvent::FirstRunAnswer(answer) => self.on_first_run_answer(answer),
             UserEvent::Menu(id) => {
                 self.log(format!("menu item {id}"));
                 if self.on_session_menu(event_loop, &id) {

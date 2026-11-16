@@ -95,6 +95,16 @@ impl EqParams {
         self.on.store(on, Ordering::Relaxed);
         self.bump();
     }
+
+    /// Change counter, bumped by every setter. A reader that sees a new value knows something changed.
+    pub fn version(&self) -> u64 {
+        self.version.load(Ordering::Acquire)
+    }
+
+    /// Balance in -100..=100, as last set.
+    pub fn balance(&self) -> i8 {
+        self.balance.load(Ordering::Relaxed)
+    }
 }
 
 impl Default for EqParams {

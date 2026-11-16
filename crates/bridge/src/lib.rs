@@ -9,13 +9,15 @@ use wry::dpi::{LogicalPosition, LogicalSize};
 use wry::{Rect, WebView, WebViewBuilder};
 
 const BRIDGE_JS: &str = include_str!("bridge.js");
-/// Runs before `bridge.js`. On macOS it makes the page's media session TubeAmp's, so that WebKit's
-/// Now Playing entry is the single one (see `takeMediaSession` in `bridge.js`). Elsewhere the page's
-/// session is left as it was.
-const NATIVE_MEDIA_PRELUDE: &str = if cfg!(target_os = "macos") {
+/// Runs before `bridge.js`, and sets the flag the page reads. On macOS it is
+/// `window.__tubeamp_native_media`, which makes the page's media session TubeAmp's, so that WebKit's
+/// Now Playing entry is the single one (see `takeMediaSession` in `bridge.js`). Elsewhere it is
+/// `window.__tubeamp_page_audio`, which turns on the page's Web Audio EQ graph (see `ensureGraph` in
+/// `bridge.js`); the page's media session is left as it was.
+const PRELUDE: &str = if cfg!(target_os = "macos") {
     "window.__tubeamp_native_media = true;"
 } else {
-    ""
+    "window.__tubeamp_page_audio = true;"
 };
 const YTM_URL: &str = "https://music.youtube.com/";
 /// A desktop Safari user agent, which YouTube Music serves with the full player.
@@ -43,7 +45,7 @@ impl Bridge {
             .with_url(YTM_URL)
             .with_user_agent(USER_AGENT)
             .with_autoplay(true)
-            .with_initialization_script(format!("{NATIVE_MEDIA_PRELUDE}\n{BRIDGE_JS}"))
+            .with_initialization_script(format!("{PRELUDE}\n{BRIDGE_JS}"))
             .with_ipc_handler(move |req| match serde_json::from_str::<Evt>(req.body()) {
                 Ok(evt) => sink(evt),
                 Err(e) => eprintln!("tubeamp: unrecognised bridge message ({e}): {}", req.body()),

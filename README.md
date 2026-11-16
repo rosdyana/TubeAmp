@@ -41,7 +41,7 @@ When asked, allow **System Audio Recording**. The equalizer and visualizers need
 
 ### Windows
 
-Work in progress. Releases include a `TubeAmp-*-windows-x64.zip`, but the Windows audio and EQ path is not finished yet.
+Work in progress. Releases include a `TubeAmp-*-windows-x64.zip`. On Windows the equalizer and the visualizers run in the YouTube Music page through Web Audio.
 
 ## First steps
 

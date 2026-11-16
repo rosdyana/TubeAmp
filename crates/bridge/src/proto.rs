@@ -49,6 +49,16 @@ pub enum Cmd {
         album: String,
         artwork: Option<String>,
     },
+    /// The EQ for the page's Web Audio graph (Windows only; the page ignores it on macOS, where the
+    /// tap does the EQ in Rust). `preamp_db` and `bands_db` are the settings in dB (see
+    /// `tubeamp_eq::value_to_db`), with `bands_db` in `BANDS_HZ` order. `balance` is -100..=100 with
+    /// the sign of `EqParams::set_balance`.
+    Eq {
+        on: bool,
+        preamp_db: f32,
+        bands_db: [f32; 10],
+        balance: i8,
+    },
 }
 
 /// Page → Rust, posted with `window.ipc.postMessage(JSON)`.
@@ -133,6 +143,9 @@ pub enum Evt {
         #[serde(default)]
         seek_time: Option<f64>,
     },
+    /// Post-EQ mono samples from the page's Web Audio graph (Windows only; macOS never gets these).
+    /// `rate` is the graph's sample rate in Hz, and `data` is a block of samples in -1..=1.
+    Samples { rate: u32, data: Vec<f32> },
 }
 
 #[cfg(test)]
@@ -187,6 +200,42 @@ mod tests {
             album: String::new(),
             artwork: None,
         });
+        round_trip_cmd(Cmd::Eq {
+            on: true,
+            preamp_db: -3.5,
+            bands_db: [0.0, 1.5, -2.0, 0.0, 6.0, 0.0, 0.0, 0.0, 0.0, -12.0],
+            balance: -40,
+        });
+    }
+
+    #[test]
+    fn eq_wire_format_matches_bridge_js() {
+        let mut bands_db = [0.0f32; 10];
+        bands_db[4] = 6.0;
+        assert_eq!(
+            serde_json::to_string(&Cmd::Eq {
+                on: true,
+                preamp_db: -3.5,
+                bands_db,
+                balance: -40,
+            })
+            .unwrap(),
+            r#"{"t":"eq","on":true,"preamp_db":-3.5,"bands_db":[0.0,0.0,0.0,0.0,6.0,0.0,0.0,0.0,0.0,0.0],"balance":-40}"#
+        );
+        assert!(serde_json::from_str::<Cmd>(r#"{"t":"eq","on":true}"#).is_err());
+    }
+
+    #[test]
+    fn samples_wire_format_matches_bridge_js() {
+        assert_eq!(
+            serde_json::from_str::<Evt>(r#"{"t":"samples","rate":48000,"data":[0.5,-0.25]}"#)
+                .unwrap(),
+            Evt::Samples {
+                rate: 48000,
+                data: vec![0.5, -0.25],
+            }
+        );
+        assert!(serde_json::from_str::<Evt>(r#"{"t":"samples","rate":48000}"#).is_err());
     }
 
     #[test]
@@ -373,6 +422,10 @@ mod tests {
         round_trip_evt(Evt::Media {
             action: "stop".to_string(),
             seek_time: None,
+        });
+        round_trip_evt(Evt::Samples {
+            rate: 44100,
+            data: vec![0.0, 0.5, -1.0],
         });
     }
 

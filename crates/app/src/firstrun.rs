@@ -124,7 +124,8 @@ pub fn answer_from_result(result: &rfd::MessageDialogResult) -> Answer {
     }
 }
 
-/// Asks the first-run question.
+/// Asks the first-run question. This blocks until the dialog closes; on Windows the caller runs it
+/// on a worker thread (see `first_run_prompt`).
 pub fn ask() -> Answer {
     let result = rfd::MessageDialog::new()
         .set_title(PROMPT_TITLE)

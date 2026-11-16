@@ -2,8 +2,8 @@
 //
 // Reads the player and posts snapshots to Rust, and runs the commands Rust sends.
 // Wire format: JSON objects tagged by "t", see crates/bridge/src/proto.rs.
-//   page -> Rust: window.ipc.postMessage(JSON.stringify({t: "state" | "ended" | "error" | "ready" | "apiresult" | "key" | "escape", ...}))
-//   Rust -> page: window.__tubeamp.cmd({t: "play" | "pause" | "api" | ..., ...})
+//   page -> Rust: window.ipc.postMessage(JSON.stringify({t: "state" | "ended" | "error" | "ready" | "apiresult" | "key" | "escape" | "samples", ...}))
+//   Rust -> page: window.__tubeamp.cmd({t: "play" | "pause" | "api" | "eq" | ..., ...})
 //
 // InnerTube: {t: "api", req, endpoint, body} runs a same-origin POST to /youtubei/v1/<endpoint>
 // from inside the page, so the page's cookies and ytcfg apply. The page posts {t: "ready",
@@ -15,7 +15,10 @@
 // a page without one (sign-in, say) always shows in full. See applyView below.
 //
 // Audio is not handled here on macOS: the EQ and the analyser run in Rust on a Core Audio tap of
-// the WebKit process. There is no Web Audio graph in this file.
+// the WebKit process, and no Web Audio graph is built. Elsewhere (the prelude sets
+// __tubeamp_page_audio) this file runs the EQ as a Web Audio graph on the video element, and posts
+// the post-EQ samples as {t: "samples", rate, data} for the analyser. {t: "eq", ...} sets the EQ.
+// See ensureGraph below.
 //
 // Media session: the page's navigator.mediaSession is shadowed below, so WebKit does not publish
 // its own Now Playing entry or handle media keys itself. TubeAmp's entry (see nowplaying.rs) is the
@@ -165,12 +168,153 @@
     keepRoot: null,
     markedAt: 0,
     eventAt: 0,
+    audio: {
+      ctx: null,
+      input: null,
+      filters: null,
+      split: null,
+      gl: null,
+      gr: null,
+      merge: null,
+      limiter: null,
+      tap: null,
+      sources: new WeakSet(),
+      eq: null,
+      lastErr: null,
+    },
   });
 
-  // TODO(windows): attach the Web Audio EQ graph here, once the Windows backend lands:
-  //   createMediaElementSource(video) -> preamp gain -> 10 peaking biquads -> balance
-  //   -> analyser -> destination. macOS never calls this, because the Core Audio tap does the DSP.
-  // function attachAudioGraph(video) {}
+  // ---- Web Audio EQ (not macOS) ----------------------------------------------------------------
+  // Off macOS (the prelude sets __tubeamp_page_audio) the EQ is a Web Audio graph on the video
+  // element, with the chain of dsp.rs:
+  //   video -> preamp gain -> 10 peaking biquads -> balance -> soft limiter -> destination
+  // A ScriptProcessor after the limiter copies the post-EQ samples out for Rust (`samples`), which
+  // feeds the analyser and Milkdrop. macOS never builds this graph: the Core Audio tap does the DSP.
+  const pageAudio = window.__tubeamp_page_audio === true;
+  // The bands of tubeamp_eq::BANDS_HZ, and dsp.rs's BAND_Q and LIMIT_KNEE.
+  const EQ_FREQS = [60, 170, 310, 600, 1000, 3000, 6000, 12000, 14000, 16000];
+  const EQ_Q = 1.41;
+  const LIMIT_KNEE = 0.89;
+
+  // dsp.rs's soft limiter, sampled over -1..1 (the WaveShaper's input range): the identity up to
+  // the knee, then it approaches 1 without reaching it, and keeps the sign.
+  const limiterCurve = () => {
+    const n = 2049;
+    const k = 1 - LIMIT_KNEE;
+    const curve = new Float32Array(n);
+    for (let i = 0; i < n; i++) {
+      const x = (i / (n - 1)) * 2 - 1;
+      const a = Math.abs(x);
+      const y = a <= LIMIT_KNEE ? a : Math.min(LIMIT_KNEE + k * Math.tanh((a - LIMIT_KNEE) / k), 1);
+      curve[i] = x < 0 ? -y : y;
+    }
+    return curve;
+  };
+
+  // Builds the graph once. T.audio.ctx is set last, so it is only set for a complete graph.
+  const ensureGraph = () => {
+    const audio = T.audio;
+    if (audio.ctx) return;
+    const ctx = new AudioContext();
+    const input = ctx.createGain();
+    // Always stereo from here on, so a mono track still reaches both sides of the balance split.
+    input.channelCount = 2;
+    input.channelCountMode = "explicit";
+    input.channelInterpretation = "speakers";
+    const filters = EQ_FREQS.map((frequency) => {
+      const f = ctx.createBiquadFilter();
+      f.type = "peaking";
+      f.frequency.value = frequency;
+      f.Q.value = EQ_Q;
+      f.gain.value = 0;
+      return f;
+    });
+    const split = ctx.createChannelSplitter(2);
+    const gl = ctx.createGain();
+    const gr = ctx.createGain();
+    const merge = ctx.createChannelMerger(2);
+    const limiter = ctx.createWaveShaper();
+    limiter.curve = limiterCurve();
+    limiter.oversample = "none";
+
+    input.connect(filters[0]);
+    for (let i = 1; i < filters.length; i++) filters[i - 1].connect(filters[i]);
+    filters[filters.length - 1].connect(split);
+    split.connect(gl, 0);
+    split.connect(gr, 1);
+    gl.connect(merge, 0, 0);
+    gr.connect(merge, 0, 1);
+    merge.connect(limiter);
+    limiter.connect(ctx.destination);
+
+    // Blocks of 1024 frames, driven by the audio clock, so Rust gets a gap-free stream. Sent only
+    // while the video plays. The mute gain keeps the node pulled without adding sound.
+    const tap = ctx.createScriptProcessor(1024, 2, 1);
+    tap.onaudioprocess = (e) => {
+      const v = T.video;
+      if (!v || v.paused) return;
+      const buf = e.inputBuffer;
+      const l = buf.getChannelData(0);
+      const r = buf.numberOfChannels > 1 ? buf.getChannelData(1) : l;
+      const data = new Array(l.length);
+      for (let i = 0; i < l.length; i++) {
+        data[i] = Math.round(((l[i] + r[i]) / 2) * 10000) / 10000;
+      }
+      post({ t: "samples", rate: ctx.sampleRate, data });
+    };
+    limiter.connect(tap);
+    const mute = ctx.createGain();
+    mute.gain.value = 0;
+    tap.connect(mute);
+    mute.connect(ctx.destination);
+
+    Object.assign(audio, { ctx, input, filters, split, gl, gr, merge, limiter, tap });
+  };
+
+  const resumeAudio = () => {
+    const ctx = T.audio.ctx;
+    if (ctx) ctx.resume().catch(() => {});
+  };
+
+  // Posts an audio failure once per message, so a repeated failure does not flood the log.
+  const audioError = (e) => {
+    const msg = String(e);
+    if (msg === T.audio.lastErr) return;
+    T.audio.lastErr = msg;
+    post({ t: "error", where: "audio", msg });
+  };
+
+  // Routes the element through the graph. The element is only rerouted once the source exists,
+  // so when this fails the element plays as it did before.
+  const attachAudio = (v) => {
+    const audio = T.audio;
+    if (!pageAudio || audio.sources.has(v)) return;
+    try {
+      ensureGraph();
+      audio.ctx.createMediaElementSource(v).connect(audio.input);
+      audio.sources.add(v);
+      v.addEventListener("play", resumeAudio);
+      resumeAudio();
+      applyEq();
+    } catch (e) {
+      audioError(e);
+    }
+  };
+
+  // The last EQ command as the graph's gains. Off means flat filters and unity preamp, as in
+  // dsp.rs. Balance applies either way, as it does there.
+  const applyEq = () => {
+    const audio = T.audio;
+    if (!audio.ctx || !audio.eq) return;
+    const c = audio.eq;
+    const t = audio.ctx.currentTime;
+    const glide = (param, value) => param.setTargetAtTime(value, t, 0.01);
+    glide(audio.input.gain, c.on ? 10 ** (c.preamp_db / 20) : 1);
+    audio.filters.forEach((f, i) => glide(f.gain, c.on ? c.bands_db[i] : 0));
+    const bal = c.balance / 100;
+    glide(audio.gl.gain, bal > 0 ? 1 - bal : 1);
+    glide(audio.gr.gain, bal < 0 ? 1 + bal : 1);
+  };
 
   const player = () => document.getElementById("movie_player");
 
@@ -297,6 +441,7 @@
     const v = document.querySelector("video");
     if (!v || T.video === v) return;
     T.video = v;
+    attachAudio(v);
     v.addEventListener("error", () => {
       const e = v.error;
       post({ t: "error", where: "video", msg: e ? `code ${e.code}: ${e.message}` : "unknown" });
@@ -597,6 +742,16 @@ html.tubeamp-video #tubeamp-art.on::after {
         applyView();
       } catch (e) {
         post({ t: "error", where: "cmd:setviewmode", msg: String(e) });
+      }
+      return;
+    }
+    if (c.t === "eq") {
+      if (!pageAudio) return;
+      T.audio.eq = c;
+      try {
+        applyEq();
+      } catch (e) {
+        post({ t: "error", where: "cmd:eq", msg: String(e) });
       }
       return;
     }

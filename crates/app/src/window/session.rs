@@ -761,9 +761,28 @@ impl App {
         }
     }
 
-    /// The first-run question, asked once. Yes starts the download.
+    /// Asks the first-run question. On Windows it is asked on a worker thread: a `MessageBoxW`
+    /// opened inside the winit callback stays hidden (its modal loop never sees an idle queue) and
+    /// freezes every window, while a box on its own thread shows at once. The answer comes back as
+    /// `UserEvent::FirstRunAnswer`.
     pub(super) fn first_run_prompt(&mut self) {
-        let answer = firstrun::ask();
+        #[cfg(target_os = "windows")]
+        {
+            let proxy = self.proxy.clone();
+            std::thread::spawn(move || {
+                let answer = firstrun::ask();
+                let _ = proxy.send_event(UserEvent::FirstRunAnswer(answer));
+            });
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            let answer = firstrun::ask();
+            self.on_first_run_answer(answer);
+        }
+    }
+
+    /// Acts on the first-run answer.
+    pub(super) fn on_first_run_answer(&mut self, answer: firstrun::Answer) {
         self.session.tray_quiet_until = Some(Instant::now() + TRAY_QUIET_AFTER_DIALOG);
         match answer {
             firstrun::Answer::Yes => {

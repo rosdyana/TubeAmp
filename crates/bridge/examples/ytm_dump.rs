@@ -364,7 +364,8 @@ impl ApplicationHandler<Evt> for Capture {
             | Evt::Escape
             | Evt::Key { .. }
             | Evt::Error { .. }
-            | Evt::Media { .. } => {}
+            | Evt::Media { .. }
+            | Evt::Samples { .. } => {}
         }
     }
 

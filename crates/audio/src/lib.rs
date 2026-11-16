@@ -2,8 +2,9 @@
 //!
 //! - [`AudioEngine`] taps the audio of YouTube Music's WebKit process (macOS 14.2+, Core Audio
 //!   process tap), runs the Winamp EQ in the audio callback and hands the post-EQ mono samples
-//!   to the UI thread through a lock-free ring. Other platforms get a stub whose `start` fails
-//!   with [`AudioError::Unsupported`] (Windows will use in-page Web Audio, later).
+//!   to the UI thread through a lock-free ring. Elsewhere (Windows) the EQ runs in the page's Web
+//!   Audio graph, and the page posts its post-EQ samples back: [`feed_page_samples`] takes them,
+//!   and the [`AudioEngine`] there only reads them (see `page.rs`).
 //! - [`params`] is the shared EQ state (preamp, bands, balance). It is a plain static, so the UI
 //!   can change it before the engine starts.
 //! - [`vis`] is the platform-independent spectrum/oscilloscope analyser for the main window.
@@ -63,6 +64,6 @@ mod macos;
 pub use macos::AudioEngine;
 
 #[cfg(not(target_os = "macos"))]
-mod stub;
+mod page;
 #[cfg(not(target_os = "macos"))]
-pub use stub::AudioEngine;
+pub use page::{feed_page_samples, AudioEngine};

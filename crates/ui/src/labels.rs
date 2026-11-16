@@ -7,6 +7,9 @@ pub const TRACK_NUMBER: u32 = 1;
 /// Text shown when nothing is loaded.
 pub const IDLE_TEXT: &str = "TubeAmp";
 
+/// Marquee text while YouTube shows an ad. Plain letters, since the skin font has no `*`.
+pub const AD_TEXT: &str = "ADVERTISEMENT";
+
 /// `1. Artist - Title (m:ss)`. The artist is omitted when unknown. `None` when there is no title.
 pub fn now_playing(author: &str, title: &str, duration_secs: u32) -> Option<String> {
     now_playing_numbered(TRACK_NUMBER, author, title, duration_secs)

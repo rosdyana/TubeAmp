@@ -764,6 +764,8 @@ pub const MAIN_LIBRARY: &str = "main.library";
 pub const MAIN_VIDEO: &str = "main.video";
 /// The O menu's Retry audio capture item: tries the audio tap again after a denial.
 pub const MAIN_RETRY_AUDIO: &str = "main.retry_audio";
+/// The O menu's Auto-skip ads item: clicks YouTube's Skip button on ads (a check item).
+pub const MAIN_SKIP_ADS: &str = "main.skip_ads";
 
 /// Maps a menu id from the library's menus to its command.
 pub fn command_for_id(id: &str) -> Option<LibCommand> {

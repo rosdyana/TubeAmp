@@ -62,6 +62,8 @@ pub struct Config {
     pub last_played: Option<LastPlayed>,
     /// Whether the first-run question about the classic skin has been answered.
     pub classic_skin_answered: bool,
+    /// Click YouTube's Skip button on ads as soon as it is offered.
+    pub skip_ads: bool,
 }
 
 impl Default for Config {
@@ -75,6 +77,7 @@ impl Default for Config {
             playlist: PlaylistPrefs::default(),
             last_played: None,
             classic_skin_answered: false,
+            skip_ads: true,
         }
     }
 }
@@ -419,6 +422,7 @@ mod tests {
             secs: 83.25,
         });
         config.classic_skin_answered = true;
+        config.skip_ads = false;
         config
     }
 
@@ -462,6 +466,18 @@ mod tests {
         );
         let again = toml::to_string_pretty(&config).expect("serialize");
         assert!(again.contains("[windows.milkdrop]"), "{again}");
+    }
+
+    #[test]
+    fn skip_ads_defaults_to_on_for_older_files() {
+        assert!(Config::default().skip_ads);
+        let config = parse_config("skin = \"default\"\n").expect("parse");
+        assert!(config.skip_ads);
+        let off = parse_config("skip_ads = false\n").expect("parse");
+        assert!(!off.skip_ads);
+        let text = toml::to_string_pretty(&off).expect("serialize");
+        assert_eq!(parse_config(&text).expect("parse"), off);
+        assert!(text.contains("skip_ads = false"), "{text}");
     }
 
     #[test]

@@ -13,6 +13,8 @@
 // View: {t: "setviewmode", video} switches between the video view (only the player's <video>
 // fills the webview) and the full page. The video view is applied only while a player exists, so
 // a page without one (sign-in, say) always shows in full. See applyView below.
+// Ads: {t: "skipads", on} makes the page report YouTube's own Skip button when it is offered, as
+// {t: "adskip", x, y} (Rust then sends a trusted click there); state snapshots carry `ad`.
 //
 // Audio is not handled here on macOS: the EQ and the analyser run in Rust on a Core Audio tap of
 // the WebKit process, and no Web Audio graph is built. Elsewhere (the prelude sets
@@ -165,6 +167,10 @@
     video: null,
     timer: null,
     viewMode: true,
+    skipAds: false,
+    skipAt: 0,
+    adCovered: false,
+    adObserver: null,
     keepRoot: null,
     markedAt: 0,
     eventAt: 0,
@@ -326,6 +332,65 @@
     }
   };
 
+  // ---- Ads -------------------------------------------------------------------------------------
+
+  // While YouTube shows an ad, the player has one of these classes. The Skip button is inside the
+  // player, and only shown once YouTube offers it, so this clicks only what YouTube itself offers.
+  const adShowing = (p) =>
+    !!p && (p.classList.contains("ad-showing") || p.classList.contains("ad-interrupting"));
+  const SKIP_SELECTORS = [
+    ".ytp-skip-ad-button",
+    ".ytp-ad-skip-button-modern",
+    ".ytp-ad-skip-button",
+    ".ytp-ad-skip-button-slot button",
+  ];
+
+  // The most often a skip is posted. A click that misses is tried again after this.
+  const SKIP_GAP_MS = 1500;
+
+  // A short description of an element for the log, such as "div.ytp-overlay".
+  const describe = (el) => {
+    if (!el) return "no element";
+    const cls = typeof el.className === "string" ? el.className.trim().split(/\s+/)[0] : "";
+    return el.tagName.toLowerCase() + (cls ? "." + cls : "");
+  };
+
+  // While an ad shows and T.skipAds is on, posts the centre of YouTube's visible Skip button as
+  // {t: "adskip", x, y}. Rust then sends a trusted click there: YouTube pauses the ad for a script
+  // click, so no click() here. The button must be hit-testable at its centre (the video view makes
+  // the page's elements visibility hidden, which elementFromPoint skips, so VIEW_CSS shows them).
+  // If something else covers the button, that is reported once per ad.
+  const trySkipAd = () =>
+    attempt(() => {
+      const p = player();
+      if (!adShowing(p)) {
+        T.adCovered = false;
+        return;
+      }
+      if (!T.skipAds) return;
+      const now = Date.now();
+      if (now - T.skipAt < SKIP_GAP_MS) return;
+      for (const sel of SKIP_SELECTORS) {
+        const btn = p.querySelector(sel);
+        if (!btn || getComputedStyle(btn).display === "none") continue;
+        const r = btn.getBoundingClientRect();
+        if (!(r.width > 0 && r.height > 0)) continue;
+        const x = r.left + r.width / 2;
+        const y = r.top + r.height / 2;
+        const hit = document.elementFromPoint(x, y);
+        if (!hit || (hit !== btn && !btn.contains(hit))) {
+          if (!T.adCovered) {
+            T.adCovered = true;
+            post({ t: "error", where: "adskip", msg: `covered by ${describe(hit)}` });
+          }
+          return;
+        }
+        T.skipAt = now;
+        post({ t: "adskip", x, y });
+        return;
+      }
+    });
+
   // Nominal bitrate (kbps) of YouTube's audio itags. The stats-for-nerds object does not report
   // the audio bitrate, only the connection bandwidth, so this is the bitrate of the format.
   const AUDIO_KBPS = { 139: 48, 140: 128, 141: 256, 249: 50, 250: 70, 251: 160 };
@@ -362,6 +427,7 @@
       kbps: T.stats.kbps,
       codec: T.stats.codec,
       thumbnail: attempt(artworkUrl),
+      ad: !!attempt(() => adShowing(p)),
     };
   };
 
@@ -420,6 +486,7 @@
   };
 
   const report = () => {
+    trySkipAd();
     const msg = snapshot(player(), Date.now());
     const ps = msg.ps;
     post(msg);
@@ -457,6 +524,26 @@
     });
   };
 
+  // A MutationObserver on the player, set up once when the player first exists. An ad's class and
+  // its Skip button appear as DOM mutations, so the click does not wait for the next tick. The
+  // observer does nothing unless skipping is on and an ad is showing.
+  const watchAds = () => {
+    const p = player();
+    if (!p || T.adObserver) return;
+    T.adObserver = new MutationObserver(() => {
+      attempt(() => {
+        if (!T.skipAds || !adShowing(p)) return;
+        trySkipAd();
+      });
+    });
+    T.adObserver.observe(p, {
+      attributes: true,
+      attributeFilter: ["class", "style"],
+      childList: true,
+      subtree: true,
+    });
+  };
+
   // ---- View ------------------------------------------------------------------------------------
 
   // The video view hides everything with `visibility` (keeps layout, so nothing reflows), then
@@ -470,6 +557,7 @@ html.tubeamp-video,
 html.tubeamp-video body { background: #000 !important; overflow: hidden !important; }
 html.tubeamp-video body * { visibility: hidden !important; }
 html.tubeamp-video [${KEEP}] { visibility: visible !important; background: transparent !important; }
+${SKIP_SELECTORS.map((s) => `html.tubeamp-video ${s}, html.tubeamp-video ${s} *`).join(",\n")} { visibility: visible !important; }
 html.tubeamp-video #movie_player,
 html.tubeamp-video video {
   position: fixed !important; top: 0 !important; left: 0 !important;
@@ -639,6 +727,7 @@ html.tubeamp-video #tubeamp-art.on::after {
     try {
       applyView();
       watchVideo();
+      watchAds();
       ps = report();
     } catch (e) {
       post({ t: "error", where: "tick", msg: String(e) });
@@ -743,6 +832,11 @@ html.tubeamp-video #tubeamp-art.on::after {
       } catch (e) {
         post({ t: "error", where: "cmd:setviewmode", msg: String(e) });
       }
+      return;
+    }
+    if (c.t === "skipads") {
+      T.skipAds = !!c.on;
+      trySkipAd();
       return;
     }
     if (c.t === "eq") {

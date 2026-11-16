@@ -94,6 +94,50 @@ impl Bridge {
     pub fn occlusion_detection_off(&self) -> bool {
         self.occlusion_detection_off
     }
+
+    /// Clicks at (`x`, `y`), in CSS pixels of the page's viewport, as a trusted user click: a mouse
+    /// move, press and release through WebView2's DevTools protocol (`Input.dispatchMouseEvent`).
+    /// The page sees a real click, which a script `click()` is not. Windows only.
+    #[cfg(target_os = "windows")]
+    pub fn trusted_click(&self, x: f64, y: f64) -> Result<(), String> {
+        use webview2_com::CallDevToolsProtocolMethodCompletedHandler;
+        use windows::core::HSTRING;
+        use wry::WebViewExtWindows;
+
+        if !x.is_finite() || !y.is_finite() {
+            return Err("click position is not finite".to_string());
+        }
+        let core = self.webview.webview();
+        let method = HSTRING::from("Input.dispatchMouseEvent");
+        let steps = [
+            ("mouseMoved", "none", false),
+            ("mousePressed", "left", true),
+            ("mouseReleased", "left", true),
+        ];
+        for (kind, button, counted) in steps {
+            let mut params = serde_json::json!({"type": kind, "x": x, "y": y, "button": button});
+            if counted {
+                params["clickCount"] = serde_json::json!(1);
+            }
+            let params = HSTRING::from(params.to_string());
+            // The result is not needed: the call only has to be queued in order.
+            let handler = CallDevToolsProtocolMethodCompletedHandler::create(Box::new(
+                |_: windows::core::Result<()>, _: String| Ok(()),
+            ));
+            // SAFETY: `core` is the live ICoreWebView2 of this webview, and the method name,
+            // parameters and handler are all alive for the duration of the call. WebView2 copies
+            // the strings, and calls the handler later on the UI thread, which is this thread.
+            unsafe { core.CallDevToolsProtocolMethod(&method, &params, &handler) }
+                .map_err(|e| format!("{kind}: {e}"))?;
+        }
+        Ok(())
+    }
+
+    /// Off Windows there is no trusted click: the call fails, and the caller reports it.
+    #[cfg(not(target_os = "windows"))]
+    pub fn trusted_click(&self, _x: f64, _y: f64) -> Result<(), String> {
+        Err("trusted clicks need Windows".to_string())
+    }
 }
 
 /// The page zoom for a webview `width` logical px wide in the video view: 1.0 up to

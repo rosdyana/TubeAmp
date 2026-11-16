@@ -2958,11 +2958,18 @@ impl App {
             Evt::Samples { rate, data } => tubeamp_audio::feed_page_samples(*rate, data),
             #[cfg(target_os = "macos")]
             Evt::Samples { .. } => {}
+            // The page found YouTube's Skip button on an ad: a trusted click clicks it (Windows).
+            Evt::AdSkip { x, y } => self.on_ad_skip(*x, *y),
             Evt::Ready { signed_in } => {
                 // A page that has just loaded starts in the video view, so tell it the view we
                 // are in (the page was loaded from scratch, or the view was changed earlier).
                 self.send(Cmd::SetViewMode {
                     video: !self.video_browser,
+                });
+                // The page starts with the ad skip off, so the setting is sent to each new page.
+                // The skip is Windows only: the page does nothing else with it.
+                self.send(Cmd::SkipAds {
+                    on: cfg!(target_os = "windows") && self.session.base.skip_ads,
                 });
                 // A reloaded page has lost its EQ graph, so the EQ is sent again (not macOS).
                 #[cfg(not(target_os = "macos"))]
@@ -2989,6 +2996,26 @@ impl App {
             self.request_redraw();
         }
     }
+
+    /// The page found YouTube's Skip button on an ad, at (`x`, `y`). With auto-skip on, a trusted
+    /// click goes there: YouTube pauses an ad for a script click, so the click has to be trusted.
+    #[cfg(target_os = "windows")]
+    fn on_ad_skip(&mut self, x: f64, y: f64) {
+        if !self.session.base.skip_ads {
+            return;
+        }
+        let Some(bridge) = self.bridge.as_ref() else {
+            return;
+        };
+        match bridge.trusted_click(x, y) {
+            Ok(()) => self.log(format!("ad skip clicked at ({x}, {y})")),
+            Err(e) => eprintln!("tubeamp: ad skip click failed: {e}"),
+        }
+    }
+
+    /// Off Windows the page is never asked to skip, so there is nothing to click.
+    #[cfg(not(target_os = "windows"))]
+    fn on_ad_skip(&mut self, _x: f64, _y: f64) {}
 
     /// The current entry's video is the one that ended: move the playlist on.
     fn on_track_ended(&mut self) {
@@ -3117,6 +3144,9 @@ impl App {
         }
         if before.codec != now.codec {
             self.log(format!("codec {:?}", now.codec));
+        }
+        if before.ad != now.ad {
+            self.log(format!("ad {}", if now.ad { "showing" } else { "over" }));
         }
     }
 

@@ -31,6 +31,8 @@ pub struct Playback {
     pub codec: Option<String>,
     /// Cover art URL from the page's media session, for Now Playing.
     pub thumbnail: Option<String>,
+    /// True while YouTube shows an ad. The marquee says so.
+    pub ad: bool,
     /// The position from the last state update, in seconds (not rounded).
     cur_secs: f64,
     /// When the last state update arrived.
@@ -50,6 +52,7 @@ impl Default for Playback {
             kbps: None,
             codec: None,
             thumbnail: None,
+            ad: false,
             cur_secs: 0.0,
             updated_at: None,
         }
@@ -87,9 +90,11 @@ impl Playback {
             kbps,
             codec,
             thumbnail,
+            ad,
         } = evt
         {
             self.thumbnail = thumbnail.clone();
+            self.ad = *ad;
             self.video_id = video_id.clone();
             self.title = title.clone().unwrap_or_default();
             self.author = author.clone().unwrap_or_default();
@@ -138,6 +143,9 @@ impl Playback {
     /// The marquee text with the track's playlist number (1 for a track that is not in the
     /// playlist).
     pub fn marquee_text_numbered(&self, number: u32) -> String {
+        if self.ad {
+            return labels::AD_TEXT.to_string();
+        }
         labels::now_playing_numbered(number, &self.author, &self.title, self.duration_secs)
             .unwrap_or_else(|| labels::IDLE_TEXT.to_string())
     }
@@ -231,7 +239,38 @@ mod tests {
             kbps: None,
             codec: None,
             thumbnail: None,
+            ad: false,
         }
+    }
+
+    #[test]
+    fn an_ad_shows_the_advertisement_marquee() {
+        let mut p = Playback::default();
+        p.apply(&state(Some(1)), t0());
+        assert_eq!(
+            p.marquee_text_numbered(labels::TRACK_NUMBER),
+            "1. Luis Fonsi & Daddy Yankee - Despacito (3:49)"
+        );
+        let ad = Evt::State {
+            video_id: None,
+            title: None,
+            author: None,
+            cur: None,
+            dur: None,
+            ps: Some(-1),
+            kbps: None,
+            codec: None,
+            thumbnail: None,
+            ad: true,
+        };
+        p.apply(&ad, t0());
+        assert_eq!(p.marquee_text_numbered(labels::TRACK_NUMBER), labels::AD_TEXT);
+        assert_eq!(p.status, Status::Stop);
+        p.apply(&state(Some(1)), t0());
+        assert_eq!(
+            p.marquee_text_numbered(labels::TRACK_NUMBER),
+            "1. Luis Fonsi & Daddy Yankee - Despacito (3:49)"
+        );
     }
 
     #[test]
@@ -319,6 +358,7 @@ mod tests {
             kbps: Some(160.4),
             codec: Some("opus".to_string()),
             thumbnail: None,
+            ad: false,
         };
         p.apply(&reported, t0());
         assert_eq!(p.kbps_for_display(), Some(160));
@@ -359,6 +399,7 @@ mod tests {
             kbps: None,
             codec: None,
             thumbnail: None,
+            ad: false,
         };
         p.apply(&evt, at);
         assert_eq!(p.time_at(at + Duration::from_secs(20)), 30);

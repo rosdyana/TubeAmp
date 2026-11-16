@@ -3569,7 +3569,7 @@ dependencies = [
 
 [[package]]
 name = "tubeamp"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "arboard",
  "directories",
@@ -3616,6 +3616,8 @@ dependencies = [
  "serde",
  "serde_json",
  "tubeamp-ytm",
+ "webview2-com",
+ "windows",
  "winit",
  "wry",
 ]

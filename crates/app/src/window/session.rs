@@ -65,7 +65,7 @@ const NAMED_WINDOWS: [(&str, Win); 6] = [
 pub struct Session {
     setup: Setup,
     /// The settings as loaded, updated on the first-run answer. Its unknown entries are kept.
-    base: Config,
+    pub(super) base: Config,
     /// The playlist read at startup, taken once by `restore_session`.
     pending_playlist: Option<Playlist>,
     /// The settings and playlist as last written (or loaded), to tell when they changed.
@@ -588,6 +588,12 @@ impl App {
             self.apply_choice(choice);
         } else {
             match id {
+                library::MAIN_SKIP_ADS => {
+                    self.session.base.skip_ads = !self.session.base.skip_ads;
+                    self.send(Cmd::SkipAds {
+                        on: cfg!(target_os = "windows") && self.session.base.skip_ads,
+                    });
+                }
                 skins::GET_CLASSIC => self.get_classic_skin(),
                 skins::OPEN_FOLDER => self.open_skins_folder(),
                 skins::LOAD_SKIN => {
@@ -640,9 +646,17 @@ impl App {
 
     // Skins.
 
-    /// The main window's O menu: Media Library, Video, then the Skins submenu.
+    /// The main window's O menu: Media Library, Video, Auto-skip ads (Windows), then the Skins submenu.
     pub(super) fn main_menu(&self) -> Result<muda::Menu, muda::Error> {
         let menu = library::build_main_menu()?;
+        #[cfg(target_os = "windows")]
+        menu.append(&muda::CheckMenuItem::with_id(
+            library::MAIN_SKIP_ADS,
+            "Auto-skip ads",
+            true,
+            self.session.base.skip_ads,
+            None,
+        ))?;
         let list = self
             .skins_folder()
             .map(|dir| skins::list(&dir))

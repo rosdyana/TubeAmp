@@ -32,6 +32,9 @@ pub enum Cmd {
     /// Switches the page between the video view and the full YouTube Music page. `video: true`
     /// shows only the player's video, filling the view. `false` shows the whole page (browser mode).
     SetViewMode { video: bool },
+    /// Tells the page whether to click YouTube's own "Skip" button on ads as soon as it is offered
+    /// (`on: true`). Unskippable ads still play in full. The page starts with it off.
+    SkipAds { on: bool },
     /// Calls YouTube Music's InnerTube `endpoint` (e.g. `"search"`, `"browse"`, `"next"`) from
     /// inside the page with `body` merged over the page's `INNERTUBE_CONTEXT`. Waits until the page
     /// is ready. The answer comes back as `Evt::ApiResult` with the same `req`.
@@ -91,6 +94,9 @@ pub enum Evt {
         /// Cover art URL from the page's media session artwork, when the page has one.
         #[serde(default)]
         thumbnail: Option<String>,
+        /// True while YouTube shows an ad in the player.
+        #[serde(default)]
+        ad: bool,
     },
     /// The current video reached its end (player state 0).
     Ended,
@@ -146,6 +152,10 @@ pub enum Evt {
     /// Post-EQ mono samples from the page's Web Audio graph (Windows only; macOS never gets these).
     /// `rate` is the graph's sample rate in Hz, and `data` is a block of samples in -1..=1.
     Samples { rate: u32, data: Vec<f32> },
+    /// YouTube offered the Skip button on an ad, and the page is skipping it (`on` on). `x` and `y`
+    /// are the centre of the button in CSS pixels of the page's viewport. Rust answers with a trusted
+    /// click there (Windows only), since YouTube ignores a script click.
+    AdSkip { x: f64, y: f64 },
 }
 
 #[cfg(test)]
@@ -176,6 +186,8 @@ mod tests {
         round_trip_cmd(Cmd::Volume { level: 75 });
         round_trip_cmd(Cmd::SetViewMode { video: true });
         round_trip_cmd(Cmd::SetViewMode { video: false });
+        round_trip_cmd(Cmd::SkipAds { on: true });
+        round_trip_cmd(Cmd::SkipAds { on: false });
         round_trip_cmd(Cmd::Load {
             video_id: "kJQP7kiw5Fk".to_string(),
         });
@@ -376,6 +388,34 @@ mod tests {
     }
 
     #[test]
+    fn skip_ads_wire_format_matches_bridge_js() {
+        assert_eq!(
+            serde_json::to_string(&Cmd::SkipAds { on: true }).unwrap(),
+            r#"{"t":"skipads","on":true}"#
+        );
+        assert_eq!(
+            serde_json::from_str::<Cmd>(r#"{"t":"skipads","on":false}"#).unwrap(),
+            Cmd::SkipAds { on: false }
+        );
+        assert!(serde_json::from_str::<Cmd>(r#"{"t":"skipads"}"#).is_err());
+    }
+
+    #[test]
+    fn state_ad_flag_defaults_to_false_and_parses_true() {
+        match serde_json::from_str::<Evt>(r#"{"t":"state","ps":1}"#).expect("parse") {
+            Evt::State { ad, .. } => assert!(!ad),
+            other => panic!("unexpected {other:?}"),
+        }
+        match serde_json::from_str::<Evt>(r#"{"t":"state","ps":-1,"ad":true}"#).expect("parse") {
+            Evt::State { ad, ps, .. } => {
+                assert!(ad);
+                assert_eq!(ps, Some(-1));
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[test]
     fn every_evt_round_trips() {
         round_trip_evt(Evt::State {
             video_id: Some("kJQP7kiw5Fk".to_string()),
@@ -387,6 +427,7 @@ mod tests {
             kbps: Some(128.0),
             codec: Some("opus".to_string()),
             thumbnail: Some("https://lh3.googleusercontent.com/cover=w226".to_string()),
+            ad: false,
         });
         round_trip_evt(Evt::State {
             video_id: None,
@@ -398,6 +439,19 @@ mod tests {
             kbps: None,
             codec: None,
             thumbnail: None,
+            ad: false,
+        });
+        round_trip_evt(Evt::State {
+            video_id: None,
+            title: None,
+            author: None,
+            cur: None,
+            dur: None,
+            ps: Some(-1),
+            kbps: None,
+            codec: None,
+            thumbnail: None,
+            ad: true,
         });
         round_trip_evt(Evt::Ended);
         round_trip_evt(Evt::Escape);
@@ -427,6 +481,16 @@ mod tests {
             rate: 44100,
             data: vec![0.0, 0.5, -1.0],
         });
+        round_trip_evt(Evt::AdSkip { x: 312.5, y: 48.0 });
+    }
+
+    #[test]
+    fn adskip_wire_format_matches_bridge_js() {
+        assert_eq!(
+            serde_json::from_str::<Evt>(r#"{"t":"adskip","x":312.5,"y":48}"#).unwrap(),
+            Evt::AdSkip { x: 312.5, y: 48.0 }
+        );
+        assert!(serde_json::from_str::<Evt>(r#"{"t":"adskip","x":1}"#).is_err());
     }
 
     #[test]
